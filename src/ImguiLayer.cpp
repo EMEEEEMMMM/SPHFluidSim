@@ -4,6 +4,7 @@
 #include "imgui_impl_opengl3.h"
 
 #include <iostream>
+#include <cstdio>
 
 ImGuiLayer::ImGuiLayer(GLFWwindow* window, const char* glslVersion) {
     IMGUI_CHECKVERSION();
@@ -64,6 +65,14 @@ bool ImGuiLayer::RenderViewport(FrameBuffer* framebuffer) {
         uint32_t textureID = framebuffer->GetColorAttachment();
         ImGui::Image(reinterpret_cast<void*>(static_cast<uintptr_t>(textureID)), 
                      viewPortSize, {0, 1}, {1, 0});
+
+        // Overlay: FPS top-left, tank label right below it.
+        char fpsBuf[64];
+        snprintf(fpsBuf, sizeof(fpsBuf), "%.0f FPS", m_FPS);
+        ImGui::SetCursorPos(ImVec2(8.0f, 30.0f));
+        ImGui::TextColored(ImVec4(1.0f, 0.9f, 0.3f, 1.0f), "%s", fpsBuf);
+        ImGui::SetCursorPos(ImVec2(8.0f, 40.0f));
+        ImGui::TextColored(ImVec4(0.75f, 0.85f, 1.0f, 1.0f), "%s", m_TankLabel.c_str());
     }
     ImGui::End();
 
@@ -82,6 +91,10 @@ void ImGuiLayer::RenderUI() {
         if (SwitchProjection) {
             SwitchProjection();
         }
+    }
+    ImGui::Separator();
+    if (OnSimulationUI) {
+        OnSimulationUI();
     }
     ImGui::End();
 }

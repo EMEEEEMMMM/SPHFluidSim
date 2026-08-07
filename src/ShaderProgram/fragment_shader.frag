@@ -1,8 +1,10 @@
 #version 330 core
+in vec3 vColor;
 out vec4 FragColor;
 
-in vec3 vertexColor;
-
 void main(){
-    FragColor = vec4(vertexColor, 1.0);   
+    // turn the square point into a circle
+    vec2 c = gl_PointCoord - vec2(0.5);
+    if (dot(c, c) > 0.25) discard;
+    FragColor = vec4(vColor, 1.0);
 }

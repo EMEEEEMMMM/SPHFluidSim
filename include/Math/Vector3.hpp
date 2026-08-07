@@ -25,11 +25,24 @@ namespace Math {
             return *this;
         }
         inline Vector3 operator*(float s) const { return {x * s, y * s, z * s}; }
+        inline Vector3 operator*=(float s) {
+            this->x *= s;
+            this->y *= s;
+            this->z *= s;
+            return *this;
+        }
+        inline Vector3 operator/(float s) const { return {x / s, y / s, z / s}; }
+        inline Vector3 operator-() const { return {-x, -y, -z}; }
+        inline bool operator==(const Vector3& v) const { return x == v.x && y == v.y && z == v.z; }
+        inline bool operator!=(const Vector3& v) const { return !(*this == v); }
 
         inline float dot(const Vector3& v) const { return x * v.x + y * v.y + z * v.z; }
         inline Vector3 cross(const Vector3& v) const {
             return { y * v.z - z * v.y, z * v.x - x * v.z, x * v.y - y * v.x };
         }
+
+        inline float operator[](int i) const { return (i == 0) ? x : ((i == 1) ? y : z); }
+        inline float& operator[](int i) { return (i == 0) ? x : ((i == 1) ? y : z); }
 
         inline float length() const { return std::sqrt(x * x + y * y + z * z); }
 
@@ -38,6 +51,8 @@ namespace Math {
             return (len > 0.0f) ? *this * (1.0f / len) : Vector3(0, 0, 0);
         }
     };
+
+    inline Vector3 operator*(float s, const Vector3& v) { return v * s; }
 }
 
 #endif
