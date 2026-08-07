@@ -12,7 +12,7 @@ The solver, the surface reconstruction and the rendering follow the paper's refe
 - **Water surface reconstruction** (Akinci et al. 2012): color-field surface particles, distance-to-weighted-centroid scalar field `phi = |x - xbar| - r`, Marching Cubes lookup tables with shared-edge intersection reuse (watertight, crack-free), opaque fresnel water shader (deep-blue gradient + sun glint)
 - **Parallelism** (Ihmsen et al. 2011 style): SoA spatial hash built in 3 passes — atomic count -> prefix sum -> atomic scatter; no locks, cache-friendly neighbor slices; reconstruction runs on a background thread (never stalls the render loop)
 - **ImGui control panel**: pause / single step / reset, resolution presets, solver parameters, surface parameters, particles/surface/both view modes, FPS + tank label overlay (top-left)
-- **Headless mode**: offline simulation -> offscreen render -> BMP frames -> mp4 video (ffmpeg auto-detected)
+- **Headless mode**: offline simulation -> offscreen render -> ffmpeg streaming encode (frames piped straight to the encoder, no BMPs on disk; ~500 MB mp4 instead of ~90 GB of BMPs for a 14400-frame 1080p run)
 
 ---
 
@@ -38,6 +38,16 @@ IISPH.exe
 
 ## Headless mode (offline video)
 Make sure that ffmpeg is installed on your computer.
+
+Frames are streamed directly into ffmpeg over a pipe (rawvideo), so **no BMP
+files are written** and the only disk usage is the final mp4. BMP frames are
+only written with `--no-video` (debug / manual encode) or `--keep-frames`.
+
+```powershell
+IISPH/build/IISPH.exe --headless --seconds 10 --output dam_break
+# -> dam_break/output.mp4 only (no dam_break/frames/)
+```
+
 ### Options
 
 | option | default | description |
@@ -47,14 +57,14 @@ Make sure that ffmpeg is installed on your computer.
 | `--seconds S` | — | video length in seconds (frames = `S * fps`; overrides `--frames`) |
 | `--fps N` | 30 | video frame rate |
 | `-r WxH` | 1280x720 | render resolution |
-| `--output PATH` | `out` | output directory (`frames/` + `output.mp4`) |
+| `--output PATH` | `out` | output directory (`output.mp4`, or `frames/` with `--no-video`/`--keep-frames`) |
 | `--mode MODE` | `surface` | `particles` (points) or `surface` (reconstructed mesh) |
 | `--particles N` | 8000 | target number of fluid particles (spacing is derived) |
 | `--dt T` | auto (CFL) | fixed time step in seconds |
 | `--grid S` | 1.0 | surface grid scale (1.0 = paper r, 0.5 = fine/high quality) |
 | `--threads N` | all cores | OpenMP thread count |
-| `--no-video` | off | render frames only, skip ffmpeg encode |
-| `--keep-frames` | off | keep the BMP frame directory after encoding |
+| `--no-video` | off | write BMP frames only, skip ffmpeg encode (debug / manual encode) |
+| `--keep-frames` | off | write BMP frames too and keep them after encoding (old behaviour) |
 | `--bench NAME` | — | run a validation experiment and exit (see below) |
 
 ### Examples
@@ -67,7 +77,7 @@ IISPH.exe --headless --seconds 10 --fps 30 -r 1920x1080 --grid 0.5 --output hi
 IISPH.exe --headless --seconds 20 --mode particles --particles 33000 --dt 0.002 --output pv
 
 # render frames only (no ffmpeg), then encode manually
-IISPH.exe --headless --frames 120 --no-video --keep-frames --output raw
+IISPH.exe --headless --frames 120 --no-video --output raw
 ffmpeg -framerate 30 -i raw/frames/frame_%04d.bmp -pix_fmt yuv420p raw.mp4
 ```
 

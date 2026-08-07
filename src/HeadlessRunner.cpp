@@ -10,6 +10,7 @@
 #include <cstring>
 #include <cerrno>
 #include <vector>
+#include <io.h>   // _popen / _pclose (MinGW)
 #include <algorithm>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -116,8 +117,27 @@ int RunHeadless(const HeadlessOptions& opt) {
     std::string dir = opt.output;
     if (dir.empty()) dir = "out";
     MakeDirs(dir);
+    // Default path: stream frames straight into ffmpeg over a pipe (no BMPs on
+    // disk at all - a 14400-frame 1080p run is ~90 GB as BMPs, ~500 MB as mp4).
+    // BMP frames are only written for --no-video (debug, manual ffmpeg) or
+    // --keep-frames (old behaviour).
+    const bool usePipe = !opt.noVideo && !opt.keepFrames && FfmpegAvailable();
     std::string framesDir = dir + "/frames";
-    MakeDirs(framesDir);
+    if (!usePipe) MakeDirs(framesDir);
+    FILE* pipe = nullptr;
+    if (usePipe) {
+        std::string cmd = "ffmpeg -y -f rawvideo -pixel_format bgr24 -video_size " +
+                          std::to_string(opt.width) + "x" + std::to_string(opt.height) +
+                          " -framerate " + std::to_string(opt.fps) +
+                          " -i pipe:0 -c:v libx264 -preset veryfast -pix_fmt yuv420p -crf 18 \"" +
+                          dir + "/output.mp4\"";
+        pipe = _popen(cmd.c_str(), "wb");
+        if (!pipe) {
+            printf("[headless] WARNING: could not start ffmpeg pipe, falling back to BMP frames\n");
+            MakeDirs(framesDir);
+        }
+    }
+    const bool writeBMP = !usePipe || !pipe;
 
     std::vector<unsigned char> pixels((size_t)opt.width * opt.height * 4);   // BGRA
     const int reconInterval = 3;   // rebuild mesh every N frames
@@ -146,9 +166,26 @@ int RunHeadless(const HeadlessOptions& opt) {
         glReadPixels(0, 0, opt.width, opt.height, GL_BGRA, GL_UNSIGNED_BYTE, pixels.data());
         fb->UBind();
 
-        char name[64];
-        snprintf(name, sizeof(name), "%s/frames/frame_%04d.bmp", dir.c_str(), f);
-        WriteBMP(name, pixels.data(), opt.width, opt.height);
+        if (pipe) {
+            // rawvideo bgr24 expects top-down rows; glReadPixels gives
+            // bottom-up, so write rows in reverse order (row h-1 first).
+            // MUST strip the alpha byte per pixel (BGRA -> BGR); a plain
+            // fwrite of w*3 bytes would take 960 BGRA pixels, not 1280 BGR.
+            std::vector<unsigned char> row((size_t)opt.width * 3);
+            for (int y = opt.height - 1; y >= 0; y--) {
+                const unsigned char* src = pixels.data() + (size_t)y * opt.width * 4;
+                for (int x = 0; x < opt.width; x++) {
+                    row[x * 3 + 0] = src[x * 4 + 0];   // B
+                    row[x * 3 + 1] = src[x * 4 + 1];   // G
+                    row[x * 3 + 2] = src[x * 4 + 2];   // R
+                }
+                fwrite(row.data(), 1, row.size(), pipe);
+            }
+        } else {
+            char name[64];
+            snprintf(name, sizeof(name), "%s/frames/frame_%04d.bmp", dir.c_str(), f);
+            WriteBMP(name, pixels.data(), opt.width, opt.height);
+        }
 
         if (f % 30 == 0)
             printf("  frame %4d/%d  t=%.2fs  avg-rho-err=%.3f%%  iters=%d  tris=%d\n",
@@ -159,14 +196,32 @@ int RunHeadless(const HeadlessOptions& opt) {
     printf("[headless] done: %d frames in %.1f s (%.1f fps wall), sim time %.2f s\n",
            opt.frames, tWall1 - tWall0, opt.frames / (tWall1 - tWall0), solver.SimTime());
 
-    // Assemble the video with ffmpeg if available.
-    if (!opt.noVideo) {
+    // Streaming path: closing the pipe makes ffmpeg finish the mp4; its exit
+    // code is the real success signal (previously ignored -> "No space left on
+    // device" was reported as success).
+    if (pipe) {
+        const int rc = _pclose(pipe);
+        if (rc == 0) {
+            printf("[headless] video written to %s/output.mp4\n", dir.c_str());
+        } else {
+            printf("[headless] ERROR: ffmpeg exited with code %d - check free disk space and that %s is writable\n",
+                   rc, dir.c_str());
+            return 1;
+        }
+    }
+
+    // BMP fallback path (--no-video / --keep-frames / no ffmpeg): assemble from frames.
+    if (!opt.noVideo && !pipe) {
         if (FfmpegAvailable()) {
             std::string cmd = "ffmpeg -y -framerate " + std::to_string(opt.fps) +
                               " -i \"" + dir + "/frames/frame_%04d.bmp\" -c:v libx264 -pix_fmt yuv420p -crf 18 \"" +
                               dir + "/output.mp4\"";
             printf("[headless] running ffmpeg...\n");
-            system(cmd.c_str());
+            const int rc = system(cmd.c_str());
+            if (rc != 0) {
+                printf("[headless] ERROR: ffmpeg exited with code %d\n", rc);
+                return 1;
+            }
             printf("[headless] video written to %s/output.mp4\n", dir.c_str());
             if (!opt.keepFrames) {
                 std::string rm = "rmdir /s /q \"" + dir + "\\frames\"";
