@@ -115,22 +115,25 @@ void OpenGLLayer::InitGeometry() {
 	glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
 };
 
-void OpenGLLayer::SetTankSize(float x, float y, float z) {
-	// 8 corners of the box [0,x]x[0,y]x[0,z]
+void OpenGLLayer::SetTankSize(float x, float y, float z, float cx, float cz, bool openTop) {
+	// box [cx-x/2, cx+x/2] x [0,y] x [cz-z/2, cz+z/2] (openTop: no top face)
+	const float x0 = cx - 0.5f * x, x1 = cx + 0.5f * x;
+	const float z0 = cz - 0.5f * z, z1 = cz + 0.5f * z;
 	float c[8][3] = {
-		{0,0,0},{x,0,0},{x,0,z},{0,0,z},
-		{0,y,0},{x,y,0},{x,y,z},{0,y,z},
+		{x0,0,z0},{x1,0,z0},{x1,0,z1},{x0,0,z1},
+		{x0,y,z0},{x1,y,z0},{x1,y,z1},{x0,y,z1},
 	};
-	// 12 edges (index pairs into c)
+	// edges; top face omitted when the container is open
 	int e[12][2] = {
 		{0,1},{1,2},{2,3},{3,0},   // bottom
-		{4,5},{5,6},{6,7},{7,4},   // top
+		{4,5},{5,6},{6,7},{7,4},   // top (skipped if openTop)
 		{0,4},{1,5},{2,6},{3,7},   // vertical
 	};
+	const int nEdges = openTop ? 8 : 12;
 	// GL_LINES: two vertices per edge; pos(3) + light-blue color(3)
 	float v[12 * 2 * 6];
 	int n = 0;
-	for (int i = 0; i < 12; i++) {
+	for (int i = 0; i < nEdges; i++) {
 		for (int k = 0; k < 2; k++) {
 			int idx = e[i][k];
 			v[n++] = c[idx][0];
@@ -141,7 +144,7 @@ void OpenGLLayer::SetTankSize(float x, float y, float z) {
 			v[n++] = 1.00f;
 		}
 	}
-	m_TankLineCount = 24;
+	m_TankLineCount = nEdges * 2;
 
 	if (m_TankVAO == 0) glGenVertexArrays(1, &m_TankVAO);
 	if (m_TankVBO == 0) glGenBuffers(1, &m_TankVBO);

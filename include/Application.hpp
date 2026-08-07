@@ -25,6 +25,9 @@ private:
     void MainLoop();
     void CleanUp();
     void RenderSimulationUI();
+    void SetupScene(int scene);   // 0 = dam break, 1 = open tank + inflow
+    int m_Scene = 1;
+    int m_AppliedScene = -1;
 
     int m_Width;
     int m_Height;

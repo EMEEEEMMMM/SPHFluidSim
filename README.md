@@ -29,6 +29,8 @@ IISPH.exe
 ### GUI controls (ImGui panel)
 
 - **Pause / Step once / Reset** — inspect the dam break step by step
+- **Scene** — dam break (open-top) / inflow jet
+- **Spawn water drop** (dam scene) — one-shot button: spawns a spherical blob above the open tank rim that falls into the water
 - **Resolution** — low (8k) .. ultra (64k) particles; changing it resets the scene
 - **View** — particles / surface / both
 - **Surface** — threshold (0.8), grid scale (1.0 fine .. 2.0 fast), rebuild interval
@@ -44,9 +46,22 @@ files are written** and the only disk usage is the final mp4. BMP frames are
 only written with `--no-video` (debug / manual encode) or `--keep-frames`.
 
 ```powershell
-IISPH/build/IISPH.exe --headless --seconds 10 --output dam_break
-# -> dam_break/output.mp4 only (no dam_break/frames/)
+IISPH/build/IISPH.exe --headless --seconds 10 --output drop_demo
+# -> drop_demo/output.mp4 only (no frames/); default scene = dam break (open-top)
 ```
+
+### Scenes (`--scene`)
+
+| scene | description |
+|---|---|
+| `dam` (default) | classic dam break in an **open-top** 2.0x1.2x1.0 m tank (no lid, splash may leave the tank); optional `--drop <N>[f|s]` spawns a water drop above the rim |
+| `inflow` | open-top 1.0 m cubic container with a continuous central jet falling 0.5 m from above (injects until `--particles` is reached, then stops - fixed volume) |
+
+All scenes render their container/tank as a wireframe outline.
+
+**Fixed water volume**: each scene defines a physical water volume (dam 0.512 m^3, inflow 0.6 m^3; the optional drop adds a fixed 0.034 m^3 sphere); `--particles N` derives the spacing from
+`spacing = (volume / N)^(1/3)`, so 8000 or 16000 particles show the *same*
+water volume - only the resolution changes.
 
 ### Options
 
@@ -59,7 +74,9 @@ IISPH/build/IISPH.exe --headless --seconds 10 --output dam_break
 | `-r WxH` | 1280x720 | render resolution |
 | `--output PATH` | `out` | output directory (`output.mp4`, or `frames/` with `--no-video`/`--keep-frames`) |
 | `--mode MODE` | `surface` | `particles` (points) or `surface` (reconstructed mesh) |
-| `--particles N` | 8000 | target number of fluid particles (spacing is derived) |
+| `--particles N` | 8000 | target number of fluid particles (spacing = (scene water volume / N)^(1/3)) |
+| `--scene S` | `dam` | `dam` \| `inflow` (see Scenes above) |
+| `--drop N[f/s]` | off | spawn the one-shot water drop at frame N, or N seconds in (`20f`/`20s`; dam only) |
 | `--dt T` | auto (CFL) | fixed time step in seconds |
 | `--grid S` | 1.0 | surface grid scale (1.0 = paper r, 0.5 = fine/high quality) |
 | `--threads N` | all cores | OpenMP thread count |
@@ -70,10 +87,16 @@ IISPH/build/IISPH.exe --headless --seconds 10 --output dam_break
 ### Examples
 
 ```powershell
-# 8000-particle dam break, 10 seconds at 30 fps (= 300 frames), 1080p, high-quality surface
+# default scene (dam break, open-top): 0.8 m water cube collapses, 10 s @ 30 fps, 1080p HQ surface
 IISPH.exe --headless --seconds 10 --fps 30 -r 1920x1080 --grid 0.5 --output hi
 
-# particle-points video, 33k particles, fixed dt
+# dam break with a water drop spawned at 3 s into the video
+IISPH.exe --headless --seconds 10 --scene dam --drop 3s --output dam
+
+# inflow jet (strong central jet, falls 0.5 m)
+IISPH.exe --headless --seconds 15 --scene inflow --particles 12000 --output jet
+
+# particle-points video, fixed dt
 IISPH.exe --headless --seconds 20 --mode particles --particles 33000 --dt 0.002 --output pv
 
 # render frames only (no ffmpeg), then encode manually
@@ -97,8 +120,8 @@ Latest numbers (this machine, 20 threads):
 
 | bench | result |
 |---|---|
-| hydrostatic (64k particles) | pressure-depth slope -5.2 .. -5.9 (theory -9.81; SPH noise at 0.025 spacing, criterion < -2) |
-| dambreak | peak avg density error 0.30% (paper ~0.1% converged), avg 2.9 pressure iterations (paper Table 1: 2.2-33.5) |
+| hydrostatic (64k particles) | pressure-depth slope -10.6 .. -11.6 (theory -9.81; SPH noise at 0.025 spacing, criterion < -2) |
+| dambreak | peak avg density error 0.30% (paper ~0.1% converged), avg 2.8 pressure iterations (paper Table 1: 2.2-33.5) |
 | energy | KE monotonically decays via viscosity; no NaN, no escapes, density < 2% |
 | performance | 33k particles ~ 14 ms/sim-step; reconstruction ~20 ms @ grid 1.0, ~100 ms @ grid 0.5 (background thread) |
 

@@ -89,19 +89,38 @@ int RunHeadless(const HeadlessOptions& opt) {
     OpenGLLayer layer(opt.width, opt.height);
     FluidSolver solver;
 
-    // --particles -> spacing: water cube = waterSize^3, N = (waterSize/spacing)^3
-    const float waterSize = 0.8f;
-    float spacing = powf(waterSize * waterSize * waterSize / (float)opt.particles, 1.0f / 3.0f);
+    // --particles -> spacing: each scene defines a FIXED water volume, and the
+    // spacing is derived so that N particles always fill that volume:
+    //   volume = N * spacing^3  ->  spacing = (volume / N)^(1/3).
+    // Choosing 8000 or 16000 particles therefore gives the SAME water volume
+    // (the water looks identical, just more/less resolved).
+    const bool isInflow = (opt.scene == "inflow");
+    float waterVol = 0.512f;                       // dam: 0.8^3 water cube (open-top tank)
+    if (isInflow) waterVol = 0.6f;                 // inflow: open tank filled to 60%
+    const float waterSize = powf(waterVol, 1.0f / 3.0f);
+    float spacing = powf(waterVol / (float)opt.particles, 1.0f / 3.0f);
     solver.GetParams().spacing = spacing;
     if (opt.dt > 0.0f) solver.GetParams().dt = opt.dt;
-    solver.Init(2.0f, 1.2f, 1.0f, waterSize);
+    if (isInflow) {
+        // open-top cubic container (side 1 m at x=1, z=0.5) + central jet
+        // falling 0.5 m from above (stronger jet)
+        solver.InitInflow(1.0f, 0.5f, 100, 0.12f, 1.0f, 0.5f, opt.particles);
+        layer.SetTankSize(1.0f, 1.0f, 1.0f, 1.0f, 0.5f, true);
+    } else {
+        // dam break in an OPEN-TOP tank: splash may leave the tank. With
+        // --drop <frame> a spherical blob is spawned above the rim at that
+        // frame and falls in (one-shot, like the GUI button).
+        solver.InitDamOpen(2.0f, 1.2f, 1.0f, waterSize);
+        layer.SetTankSize(2.0f, 1.2f, 1.0f, 0.0f, 0.0f, true);   // open top
+    }
 
-    // Camera: a closer three-quarter view centred on the 2.0 x 1.2 x 1.0 tank
-    // (tank centre ~ (1.0, 0.55, 0.5)).
+    // Camera: a closer three-quarter view centred on the tank.
     {
         auto& cam = layer.GetCamera();
         cam.Position = { 2.9f, 2.3f, 2.9f };
-        Math::Vector3 f = { 1.0f - 2.9f, 0.55f - 2.3f, 0.5f - 2.9f };
+        const float tx = 1.0f, tz = 0.5f;
+        const float ty = isInflow ? 0.5f : 0.55f;
+        Math::Vector3 f = { tx - 2.9f, ty - 2.3f, tz - 2.9f };
         cam.Front = f * (1.0f / f.length());
         cam.Up = { 0.0f, 1.0f, 0.0f };
         cam.Zoom = 42.0f;
@@ -147,7 +166,13 @@ int RunHeadless(const HeadlessOptions& opt) {
            showSurface ? "surface" : "particles", opt.width, opt.height);
 
     double tWall0 = omp_get_wtime();
+    const int dropFrame = opt.dropFrame;   // -1 = never (spawn at this frame)
     for (int f = 0; f < opt.frames; f++) {
+        if (!isInflow && dropFrame >= 0 && f == dropFrame && !solver.HasDrop()) {
+            // one-shot: spherical blob above the tank rim, falls in (R=0.2)
+            solver.SpawnDrop(0.2f, 1.0f, 1.6f, 0.5f);
+            printf("[headless] drop spawned at frame %d (N=%d)\n", f, solver.FluidCount());
+        }
         solver.Step();
 
         layer.UpdateParticles(solver.Positions(), solver.Colors());

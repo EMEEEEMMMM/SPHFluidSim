@@ -34,6 +34,15 @@ static std::string ValueAfter(const char* arg, const char* name) {
     return std::string(arg + std::strlen(name));
 }
 
+// --drop <N>[f|s]: N frames (default), or N seconds (N*fps frames). "20f" -> frame
+// 20, "20s" -> frame 20*fps (for --fps 30: frame 600).
+static int ParseDropFrame(const std::string& v, int fps) {
+    if (v.empty()) return -1;
+    const char last = v.back();
+    if (last == 's') return (int)(atof(v.c_str()) * fps + 0.5);   // seconds -> frames
+    return atoi(v.c_str());                                        // 'f' or bare = frames
+}
+
 int main(int argc, char** argv) {
     bool headless = false;
     HeadlessOptions opt;
@@ -68,6 +77,10 @@ int main(int argc, char** argv) {
         else if (Match(a, "--particles") && i + 1 < argc) { opt.particles = atoi(argv[++i]); }
         else if (MatchPrefix(a, "--dt=")) { opt.dt = (float)atof(ValueAfter(a, "--dt=").c_str()); }
         else if (Match(a, "--dt") && i + 1 < argc) { opt.dt = (float)atof(argv[++i]); }
+        else if (MatchPrefix(a, "--scene=")) { opt.scene = ValueAfter(a, "--scene="); }
+        else if (Match(a, "--scene") && i + 1 < argc) { opt.scene = argv[++i]; }
+        else if (MatchPrefix(a, "--drop=")) { opt.dropFrame = ParseDropFrame(ValueAfter(a, "--drop="), opt.fps); }
+        else if (Match(a, "--drop") && i + 1 < argc) { opt.dropFrame = ParseDropFrame(argv[++i], opt.fps); }
         else if (MatchPrefix(a, "--grid=")) { opt.gridScale = (float)atof(ValueAfter(a, "--grid=").c_str()); }
         else if (Match(a, "--grid") && i + 1 < argc) { opt.gridScale = (float)atof(argv[++i]); }
         else if (MatchPrefix(a, "--threads=")) { opt.threads = atoi(ValueAfter(a, "--threads=").c_str()); }
@@ -87,6 +100,8 @@ int main(int argc, char** argv) {
                    "  --output <dir>   output dir (default ./out)\n"
                    "  --mode <m>       particles | surface (default surface)\n"
                    "  --particles <n>  approx. fluid particles (default 8000)\n"
+                   "  --scene <s>      dam | inflow (default dam; dam tank is open-top)\n"
+                   "  --drop <N>[f|s]  spawn the one-shot water drop at frame N, or N seconds in ('20f'/'20s', dam only)\n"
                    "  --dt <s>         fixed timestep\n"
                    "  --threads <n>    OpenMP threads\n"
                    "  --no-video       keep BMP frames only\n"

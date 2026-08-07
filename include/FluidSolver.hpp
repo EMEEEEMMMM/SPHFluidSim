@@ -33,8 +33,32 @@ public:
 
     // boxX/Y/Z: tank dimensions; waterSize: side of the water cube in the corner.
     void Init(float boxX, float boxY, float boxZ, float waterSize);
+    // Dam break in an OPEN-TOP tank (no lid): the same water cube in the corner,
+    // but splash can leave the tank. A user-triggered SpawnDrop() adds one
+    // spherical blob that falls in from above the rim.
+    void InitDamOpen(float boxX, float boxY, float boxZ, float waterSize);
+    // Appends one spherical water blob (radius, centre) as a lattice of new
+    // particles above the tank; a one-shot button calls this. No-op if already
+    // spawned.
+    void SpawnDrop(float radius, float cx, float cy, float cz);
+    bool HasDrop() const { return m_DropSpawned; }
     // water fills the whole tank cross-section up to waterHeight (hydrostatic test).
     void InitFull(float boxX, float boxY, float boxZ, float waterHeight);
+    // Open-top cubic container (side = tankSize, centred at (cx, 0, cz)) with a
+    // continuous water jet injected from directly above the centre, falling a
+    // distance `gap` before entering the container. A disk layer of particles
+    // is emitted whenever the jet has fallen one spacing; injection STOPS once
+    // the particle count reaches maxParticles (fixed water volume).
+    void InitInflow(float tankSize, float gap, int inflowPerStep, float inflowRadius,
+                    float cx, float cz, int maxParticles);
+    // Open-top cubic container with a PRE-FILLED pool plus a separate SPHERICAL
+    // drop hovering above the centre; the drop falls naturally into the pool.
+    // poolHeight is the resting water level inside the container; dropRadius
+    // is the sphere radius, whose bottom starts dropGap above the rim.
+    // Pool and drop volumes are fixed -> the pool:drop volume ratio is fixed
+    // for any particle count (spacing is derived externally).
+    void InitDrop(float tankSize, float poolHeight, float dropRadius, float dropGap,
+                  float cx, float cz, int maxParticles);
     void Reset();
     void Step();
 
@@ -62,7 +86,8 @@ public:
 
 private:
     void PushFluid(float x, float y, float z);
-    void BuildBoundary();
+    void BuildBoundary(bool openTop = false);   // true = open-top cubic container (inflow scene)
+    void InjectFluid();   // spawn inflow particles for the open-tank scene
     void BuildNeighborhood();
     void PredictAdvection();
     void PressureSolve();
@@ -73,6 +98,8 @@ private:
 
     Params params;
     bool m_UseFullInit = false;   // Reset() needs to know which Init variant to rerun
+    bool m_UseDamOpen = false;    // dam-break with open top (InitDamOpen)
+    bool m_DropSpawned = false;   // SpawnDrop() already fired (one-shot)
     float m_h = 0.1f;      // kernel support radius = 2 * spacing
     float m_mass = 1.0f;   // particle mass = rho0 * spacing^3
 
@@ -103,7 +130,29 @@ private:
     float m_BoxX = 2.0f, m_BoxY = 1.2f, m_BoxZ = 1.0f;
     float m_WaterSize = 0.8f;
 
-    // neighborhood grid (uniform, cell = h)
+    // wall planes for the hard-wall safety net (Integrate). The closed box
+    // spans [0, BoxX]x[0, BoxY]x[0, BoxZ]; the open-top inflow container is
+    // [x0,x1]x[0,L]x[z0,z1] with NO top wall.
+    float m_WallX0 = 0.0f, m_WallX1 = 2.0f, m_WallY1 = 1.2f, m_WallZ0 = 0.0f, m_WallZ1 = 1.0f;
+    bool  m_WallTop = true;
+
+    // open-tank scenes: inflow (jet) and drop (pool + falling blob)
+    bool  m_Inflow = false;
+    bool  m_Drop = false;
+    float m_DropPool = 0.4f, m_DropSize = 0.585f, m_DropGap = 0.15f;
+    float m_InflowGap = 0.3f;         // fall distance from the emitter to the container rim [m]
+    float m_InflowRadius = 0.08f;     // emitter disk radius [m]
+    int   m_InflowPerStep = 100;      // max particles per emitted layer (radius decides the actual count)
+    float m_InflowCounter = 0.0f;     // distance travelled since the last layer [m]
+    int   m_MaxParticles = 8000;      // injection stops at this many particles (fixed volume)
+    float m_InflowX = 1.0f, m_InflowZ = 0.5f;   // emitter centre (x, z)
+
+    // neighborhood grid (uniform, cell = h). Origin follows the particle
+    // bounding box (fluid + boundary) each rebuild, so translated containers
+    // (inflow/drop scenes, box centred at x=1) hash correctly - a fixed
+    // (0,0,0) origin clamped everything right of x=1.0 into the last cell
+    // column, corrupting neighbour queries along that wall (visible pile-up).
+    Math::Vector3 m_GridOrigin;   // grid corner = bbox min - margin
     int m_GW = 0, m_GH = 0, m_GD = 0;
     // Spatial hash cells as SoA (paper [30] "Parallel data structures for SPH"):
     // particles are grouped per cell in m_CellParticles, with m_CellStart giving

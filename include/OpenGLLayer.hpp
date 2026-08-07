@@ -41,7 +41,7 @@ public:
     void SetParticleScale(float scale) { m_ParticleScale = scale; }
 
     // Wireframe outline of the simulation tank (drawn on top, always visible).
-    void SetTankSize(float x, float y, float z);
+    void SetTankSize(float x, float y, float z, float cx = 0.0f, float cz = 0.0f, bool openTop = false);
 
     // Reconstructed fluid surface mesh (Akinci 2012): verts = 3 floats/vertex,
     // indices = triangles. Drawn with the Phong surface shader when visible.

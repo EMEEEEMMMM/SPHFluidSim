@@ -10,6 +10,8 @@ struct HeadlessOptions {
     int    height    = 720;
     std::string output = "out"; // output directory (frames/ + video)
     enum class Mode { Particles, Surface } mode = Mode::Surface;
+    std::string scene = "dam";    // "dam" | "inflow" (dam = open-top tank + optional --drop)
+    int    dropFrame = -1;    // spawn the one-shot water drop at this frame (-1 = never)
     int    particles = 8000;    // approx. fluid particle count (adjusts spacing)
     float  dt        = 0.0f;    // fixed timestep (0 = solver default / CFL)
     float  gridScale = 1.0f;    // surface-reconstruction grid: 1.0 = r (fast), 0.5 = r/2 high quality

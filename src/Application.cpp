@@ -64,14 +64,7 @@ bool Application::Init() {
     };
 
     m_Solver = std::make_unique<FluidSolver>();
-    m_Solver->Init(2.0f, 1.2f, 1.0f, 0.8f);   // tank 2x1.2x1 m, water cube 0.8 m
-    m_OpenGLLayer->SetTankSize(2.0f, 1.2f, 1.0f);
-    m_OpenGLLayer->SetParticleScale(0.6f * m_Solver->Spacing());
-    m_OpenGLLayer->UpdateParticles(m_Solver->Positions(), m_Solver->Colors());
-    char tb[64];
-    snprintf(tb, sizeof(tb), "tank %.1f x %.1f x %.1f m  |  %d particles",
-             2.0f, 1.2f, 1.0f, m_Solver->FluidCount());
-    m_TankLabel = tb;
+    SetupScene(m_Scene);   // default: open tank + central water jet
 
     return true;
 }
@@ -226,6 +219,38 @@ int Application::Run() {
     return 0;
 }
 
+void Application::SetupScene(int scene) {
+    m_Scene = scene;
+    // Particle cap for the open-tank inflow scene = particles needed to fill
+    // the fixed 0.6 m^3 water volume at the CURRENT spacing (so switching to a
+    // finer resolution keeps the same water volume, just more particles).
+    const float sp = m_Solver->GetParams().spacing;
+    const int volCap = (int)(0.6f / (sp * sp * sp)) + 8;
+    if (scene == 0) {
+        // dam break in an OPEN-TOP tank (2 x 1.2 x 1 m, no lid): splash may
+        // leave the tank. A one-shot button spawns a spherical drop above the
+        // rim that falls in (see RenderSimulationUI).
+        m_Solver->InitDamOpen(2.0f, 1.2f, 1.0f, 0.8f);
+        m_OpenGLLayer->SetTankSize(2.0f, 1.2f, 1.0f, 0.0f, 0.0f, true);   // open top
+    } else {
+        // open-top cubic container (side 1 m, centred at x=1, z=0.5) with a
+        // continuous central jet falling 0.3 m from above
+        m_Solver->InitInflow(1.0f, 0.3f, 100, 0.08f, 1.0f, 0.5f, volCap);
+        m_OpenGLLayer->SetTankSize(1.0f, 1.0f, 1.0f, 1.0f, 0.5f, true);
+    }
+    m_OpenGLLayer->SetParticleScale(0.6f * m_Solver->Spacing());
+    m_OpenGLLayer->UpdateParticles(m_Solver->Positions(), m_Solver->Colors());
+    char tb[128];
+    if (scene == 0) {
+        snprintf(tb, sizeof(tb), "tank 2.0 x 1.2 x 1.0 m (open)  |  N=%d", m_Solver->FluidCount());
+    } else {
+        snprintf(tb, sizeof(tb), "open tank 1.0^3 (inflow)  |  N=%d", m_Solver->FluidCount());
+    }
+    m_TankLabel = tb;
+    m_ShowSurfaceMode = 0;   // particles view by default; switch to surface when the pool forms
+    m_AppliedScene = scene;  // CRITICAL: otherwise the UI rebuilds the scene every frame
+}
+
 void Application::RenderSimulationUI() {
     // Called inside ImGuiLayer's "Options" window (via OnSimulationUI).
     auto& p = m_Solver->GetParams();
@@ -237,6 +262,22 @@ void Application::RenderSimulationUI() {
 
     ImGui::Separator();
     ImGui::Checkbox("Pause", &m_Pause);
+    ImGui::Text("Scene");
+    ImGui::RadioButton("dam break (open)", &m_Scene, 0);
+    ImGui::SameLine();
+    ImGui::RadioButton("inflow", &m_Scene, 1);
+    if (m_Scene != m_AppliedScene) { SetupScene(m_Scene); }
+    if (m_Scene == 0) {
+        // one-shot: spawn a spherical drop above the tank rim, it falls in
+        if (m_Solver->HasDrop()) {
+            ImGui::TextDisabled("Drop spawned (one-shot)");
+        } else {
+            if (ImGui::Button("Spawn water drop")) {
+                m_Solver->SpawnDrop(0.2f, 1.0f, 1.6f, 0.5f);
+            }
+        }
+    }
+    ImGui::Separator();
     ImGui::SliderInt("Steps / frame", &m_StepsPerFrame, 1, 8);
     if (ImGui::Button("Step once")) {
         m_Solver->Step();
