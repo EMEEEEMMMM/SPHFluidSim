@@ -11,6 +11,26 @@ find_package(OpenGL REQUIRED)
 find_package(OpenMP REQUIRED)
 find_package(glfw3 CONFIG REQUIRED)
 
+# OpenCL for the GPU surface reconstruction (Akinci et al. 2012 GPU pipeline).
+# Prefer CMake's FindOpenCL; fall back to the CUDA toolkit's shipped headers +
+# import library (NVIDIA OpenCL.dll comes with the driver).
+find_package(OpenCL)
+if(NOT OpenCL_FOUND)
+    set(_cuda_root "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.1")
+    find_path(OpenCL_INCLUDE_DIR CL/cl.h PATHS "${_cuda_root}/include" NO_DEFAULT_PATH)
+    find_library(OpenCL_LIBRARY NAMES OpenCL.lib OpenCL PATHS "${_cuda_root}/lib/x64" NO_DEFAULT_PATH)
+    if(OpenCL_INCLUDE_DIR AND OpenCL_LIBRARY)
+        set(OpenCL_FOUND TRUE)
+        set(OpenCL_INCLUDE_DIRS ${OpenCL_INCLUDE_DIR})
+        set(OpenCL_LIBRARIES ${OpenCL_LIBRARY})
+    endif()
+endif()
+if(OpenCL_FOUND)
+    message(STATUS "OpenCL found: ${OpenCL_LIBRARIES}")
+else()
+    message(WARNING "OpenCL not found — GPU surface reconstruction disabled (CPU path only)")
+endif()
+
 set(GLAD_DIR "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/glad")
 set(IMGUI_DIR "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/imgui")
 set(IMGUI_SOURCES
@@ -30,6 +50,7 @@ include_directories(
     ${IMGUI_DIR}/backends
     ${GLFW_INCLUDE_DIRS}
     ${GLAD_DIR}/include
+    ${OpenCL_INCLUDE_DIRS}
 )
 
 add_executable(${PROJECT_NAME}
@@ -41,6 +62,7 @@ add_executable(${PROJECT_NAME}
     src/ImguiLayer.cpp
     src/FluidSolver.cpp
     src/SurfaceReconstructor.cpp
+    src/SurfaceReconstructorCL.cpp
     src/HeadlessRunner.cpp
     ${IMGUI_SOURCES}
     ${GLAD_DIR}/src/glad.c
@@ -51,6 +73,7 @@ target_link_libraries(${PROJECT_NAME}
     OpenGL::GL
     OpenMP::OpenMP_CXX
     -fopenmp
+    ${OpenCL_LIBRARIES}
 )
 
 if(WIN32)
@@ -79,4 +102,5 @@ add_headless_test(verify_hydrostatic)
 add_headless_test(benchmark)
 add_headless_test(surface_reconstruct)
 # the surface test also needs the reconstructor
-target_sources(surface_reconstruct PRIVATE src/SurfaceReconstructor.cpp)
+target_sources(surface_reconstruct PRIVATE src/SurfaceReconstructor.cpp src/SurfaceReconstructorCL.cpp)
+target_link_libraries(surface_reconstruct PRIVATE ${OpenCL_LIBRARIES})

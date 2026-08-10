@@ -1,4 +1,5 @@
 #include "SurfaceReconstructor.hpp"
+#include "SurfaceReconstructorCL.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -33,6 +34,10 @@ Math::Vector3 SurfaceReconstructor::gradW(const Math::Vector3& r) const {
 }
 
 // ---------------------------------------------------------------------------
+SurfaceReconstructor::SurfaceReconstructor() = default;
+SurfaceReconstructor::~SurfaceReconstructor() = default;
+
+// ---------------------------------------------------------------------------
 bool SurfaceReconstructor::Reconstruct(const std::vector<Math::Vector3>& particles, float spacing) {
     m_verts.clear();
     m_indices.clear();
@@ -42,6 +47,27 @@ bool SurfaceReconstructor::Reconstruct(const std::vector<Math::Vector3>& particl
     m_h = 2.0f * spacing;
     m_vol = spacing * spacing * spacing;
     m_k = 0.5f * spacing;
+
+    // GPU path (OpenCL): scalar-field construction on the GPU, Marching Cubes on
+    // the CPU — exactly the split the paper uses (Sec. 4.2 triangulates serially).
+    // Falls back to the CPU pipeline on any OpenCL failure.
+    if (!m_gpu) {
+        m_gpu = std::make_unique<SurfaceReconstructorCL>();
+        if (!m_gpu->Available()) {
+            fprintf(stderr, "[surface] OpenCL unavailable (%s) — using CPU path\n", m_gpu->LastError());
+            m_gpu.reset();
+        }
+    }
+    if (m_gpu) {
+        if (m_gpu->ComputeField(particles, spacing, m_bandScale, m_gridScale, m_useEvmax,
+                                m_surfaceThreshold, m_origin, m_fstep, m_fw, m_fh, m_fd,
+                                m_field, m_surfVert, m_surfNormal)) {
+            MarchingCubes(particles);
+            return !m_indices.empty();
+        }
+        fprintf(stderr, "[surface] OpenCL compute failed (%s) — using CPU path\n", m_gpu->LastError());
+        m_gpu.reset();
+    }
 
     BuildGrid(particles, spacing);
     ComputeColorAndNormal(particles);
@@ -71,9 +97,6 @@ void SurfaceReconstructor::BuildGrid(const std::vector<Math::Vector3>& particles
         int cy = std::clamp((int)std::floor((particles[i].y - m_origin.y) / m_h), 0, m_gh - 1);
         int cz = std::clamp((int)std::floor((particles[i].z - m_origin.z) / m_h), 0, m_gd - 1);
         const size_t cid = (size_t)cz * m_gw * m_gh + (size_t)cy * m_gw + (size_t)cx;
-        if (i == 8820)
-            fprintf(stderr, "[bg] count-pass i=%zu pos=(%.4f,%.4f,%.4f) cell=(%d,%d,%d) cid=%zu\n",
-                    i, particles[i].x, particles[i].y, particles[i].z, cx, cy, cz, cid);
         m_cellStart[cid]++;
     }
     {   // exclusive prefix sum: start[c] = sum of counts [0..c-1]
@@ -265,17 +288,22 @@ void SurfaceReconstructor::BuildImplicitField(const std::vector<Math::Vector3>& 
                                         xbar = xbar + particles[j] * w;
                                         wsum += w;
                                         if (m_useEvmax) {
-                                            // dw/dx = (dk/ds)/R * (x - x_j)/|x-x_j|,
-                                            // dk/ds = -6 s (1-s^2)^2
+                                            // dw = dk/dx  (gradient of the kernel w.r.t. query point x)
+                                            // k(s) = (1-s^2)^3, s = |x-x_j|/R
+                                            // dk/dx = dk/ds * ds/dx
+                                            //       = (-6 s (1-s^2)^2) * (x-x_j)/(R|x-x_j|)
+                                            //       = +6 s (1-s^2)^2 * (x_j-x)/(R|x-x_j|)
                                             float d = std::sqrt(d2);
-                                            float s = d / R;
-                                            float kp = -6.0f * s * (1.0f - s * s) * (1.0f - s * s);
-                                            Math::Vector3 dw = dj * (kp / (R * d));
-                                            sumdw = sumdw + dw;
-                                            for (int a = 0; a < 3; a++) {
-                                                row[a][0] += dw[a] * particles[j].x;
-                                                row[a][1] += dw[a] * particles[j].y;
-                                                row[a][2] += dw[a] * particles[j].z;
+                                            if (d > 1e-9f) {
+                                                float s = d / R;
+                                                float kp = 6.0f * s * (1.0f - s * s) * (1.0f - s * s);
+                                                Math::Vector3 dw = dj * (kp / (R * d));
+                                                sumdw = sumdw + dw;
+                                                for (int a = 0; a < 3; a++) {
+                                                    row[a][0] += dw[a] * particles[j].x;
+                                                    row[a][1] += dw[a] * particles[j].y;
+                                                    row[a][2] += dw[a] * particles[j].z;
+                                                }
                                             }
                                         }
                                     }
@@ -412,6 +440,25 @@ void SurfaceReconstructor::MarchingCubes(const std::vector<Math::Vector3>& parti
     auto cornerNrm = [&](int fw, int fh, int cx, int cy, int cz, int ci) {
         return m_surfNormal[cornerIdx(fw, fh, cx, cy, cz, ci)];
     };
+    // GPU path: m_surfNormal is empty (normals were not read back). Rebuild the
+    // corner normals numerically from the field gradient, lazily cached, only
+    // for the corners that survive the 8-of-8 cull.
+    std::vector<Math::Vector3> lazyNrm;
+    std::vector<uint8_t> lazyDone;
+    auto cornerNrmLazy = [&](int fw, int fh, int cx, int cy, int cz, int ci) -> Math::Vector3 {
+        size_t idx = cornerIdx(fw, fh, cx, cy, cz, ci);
+        if (!lazyDone[idx]) {
+            Math::Vector3 n = FieldGrad(cornerPos(cx, cy, cz, ci));
+            float nl = n.length();
+            lazyNrm[idx] = (nl > 1e-9f) ? n * (1.0f / nl) : Math::Vector3(0.0f, 1.0f, 0.0f);
+            lazyDone[idx] = 1;
+        }
+        return lazyNrm[idx];
+    };
+    auto getCornerNrm = [&](int fw, int fh, int cx, int cy, int cz, int ci) -> Math::Vector3 {
+        if (!m_surfNormal.empty()) return cornerNrm(fw, fh, cx, cy, cz, ci);
+        return cornerNrmLazy(fw, fh, cx, cy, cz, ci);
+    };
 
     // Shared edge-intersection points (paper Sec. 4.2): every grid vertex keeps
     // three edge ids for the edges leaving it (+x, +y, +z). Triangulation is
@@ -419,6 +466,8 @@ void SurfaceReconstructor::MarchingCubes(const std::vector<Math::Vector3>& parti
     // parallelized, since it takes a rather small amount of time").
     std::vector<int> edgePoint(nVerts * 3, -1);
     std::vector<float> pointData; // pos(3)+normal(3) per shared intersection point
+    lazyNrm.assign(nVerts, Math::Vector3(0.0f, 0.0f, 0.0f));
+    lazyDone.assign(nVerts, 0);
     m_indices.clear();
     m_indices.reserve((size_t)ncells * 3);
 
@@ -489,8 +538,8 @@ void SurfaceReconstructor::MarchingCubes(const std::vector<Math::Vector3>& parti
                         Math::Vector3 pa = cornerPos(cx, cy, cz, a);
                         Math::Vector3 pb = cornerPos(cx, cy, cz, b);
                         Math::Vector3 pos = pa + (pb - pa) * t;
-                        Math::Vector3 na = cornerNrm(fw, fh, cx, cy, cz, a);
-                        Math::Vector3 nb = cornerNrm(fw, fh, cx, cy, cz, b);
+                        Math::Vector3 na = getCornerNrm(fw, fh, cx, cy, cz, a);
+                        Math::Vector3 nb = getCornerNrm(fw, fh, cx, cy, cz, b);
                         if (na.length() < 1e-6f) na = nb;
                         if (nb.length() < 1e-6f) nb = na;
                         Math::Vector3 nn = na + (nb - na) * t;

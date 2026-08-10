@@ -292,11 +292,24 @@ void Application::RenderSimulationUI() {
     ImGui::Separator();
     ImGui::Text("Solver parameters");
     // Resolution: particle spacing. Changing it re-initializes the scene.
-    static const char* resNames[] = { "low (0.040 m, ~8k)", "medium (0.030 m, ~19k)", "high (0.025 m, ~33k)", "ultra (0.020 m, ~64k)" };
-    static const float resSpacing[] = { 0.040f, 0.030f, 0.025f, 0.020f };
+    // Particle count = water volume / spacing^3 (dam: 0.512 m^3).
+    // Higher resolutions exist for the GPU path: the OpenCL scalar-field
+    // kernels only become GPU-bound at large particle counts — at 8k-64k the
+    // whole reconstruction is a few ms and the GPU sits mostly idle (task
+    // manager will show ~1% utilisation, which is normal, not a bug).
+    static const char* resNames[] = {
+        "low (0.040 m, ~8k)",
+        "medium (0.030 m, ~19k)",
+        "high (0.025 m, ~33k)",
+        "ultra (0.020 m, ~64k)",
+        "cinema (0.015 m, ~150k)",
+        "epic (0.0125 m, ~260k)",
+        "extreme (0.010 m, ~500k)" };
+    static const float resSpacing[] = { 0.040f, 0.030f, 0.025f, 0.020f, 0.015f, 0.0125f, 0.010f };
+    constexpr int kNumRes = 7;
     int curRes = 0;
-    for (int r = 0; r < 4; r++) if (std::fabs(p.spacing - resSpacing[r]) < 1e-4f) curRes = r;
-    if (ImGui::Combo("resolution", &curRes, resNames, 4)) {
+    for (int r = 0; r < kNumRes; r++) if (std::fabs(p.spacing - resSpacing[r]) < 1e-4f) curRes = r;
+    if (ImGui::Combo("resolution", &curRes, resNames, kNumRes)) {
         p.spacing = resSpacing[curRes];
         m_Solver->Reset();
         m_OpenGLLayer->SetParticleScale(0.6f * p.spacing);

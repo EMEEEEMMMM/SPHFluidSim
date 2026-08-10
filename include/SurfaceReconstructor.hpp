@@ -18,9 +18,17 @@
 #include "Math/Vector3.hpp"
 #include <vector>
 #include <cstdint>
+#include <memory>
+
+class SurfaceReconstructorCL;
 
 class SurfaceReconstructor {
 public:
+    SurfaceReconstructor();   // defined in .cpp so the OpenCL backend (unique_ptr) sees a complete type
+    ~SurfaceReconstructor();
+    SurfaceReconstructor(const SurfaceReconstructor&) = delete;
+    SurfaceReconstructor& operator=(const SurfaceReconstructor&) = delete;
+
     // Builds the surface mesh from fluid particle positions.
     // spacing: nominal particle spacing [m] (grid resolution and kernel).
     // Returns false if no surface mesh was produced (too few particles etc.).
@@ -34,7 +42,7 @@ public:
     void SetSurfaceThreshold(float t) { m_surfaceThreshold = t; }
     // field grid resolution as a multiple of spacing (1.0 = full quality, >1 faster)
     void SetGridScale(float s) { m_gridScale = s; }
-    void SetBandScale(float b) { m_bandScale = b; }   // surface-vertex band half-width in units of r (default 1.5)
+    void SetBandScale(float b) { m_bandScale = b; }   // surface-vertex band half-width in units of r (default 2.0)
 
 private:
     // internal uniform grid helpers
@@ -54,8 +62,14 @@ private:
     float m_k = 0.0f;                            // implicit-plane offset = spacing/2
     float m_surfaceThreshold = 0.8f;             // color-field threshold for surface particles
     float m_gridScale = 1.0f;
-    float m_bandScale = 1.5f;   // surface-vertex band half-width in units of r (paper uses 1.0; 1.5 keeps moving water crack-free)                    // field grid spacing = gridScale * particle spacing
-    bool m_useEvmax = false;                     // paper Eq. 2-3 EVmax factor (measured 0% trigger on dam break)
+    float m_bandScale = 2.0f;   // surface-vertex band half-width in units of r.
+    // Paper Sec. 4.1 uses ±1r (2r total span). At ±1.5r the isosurface — which
+    // [SSP07] places ~0.5r BELOW the top particles for a settled body of water —
+    // still falls outside the band for a measurable share of MC cells, so their
+    // 8/8 surface-vertex cull drops the triangles (visible cracks on calm
+    // water). ±2r keeps the whole isosurface band inside while the 8/8 cull
+    // still rejects the (false) bottom-layer surface (no double layer).
+    bool m_useEvmax = false;                     // paper Eq. 2-3 EVmax factor (off: settled top surface has EVmax ~0.39 < t_low=0.4, so it never fires there)
     float m_fstep = 0.0f;                        // field grid spacing (derived)
 
     // grid of particles for neighbor search — flat SoA buckets (paper [30]:
@@ -70,7 +84,7 @@ private:
     std::vector<int> m_nbCount;        // neighbours within h, per particle
     std::vector<int> m_surface;        // surface particle indices
 
-    // grid of surface particles (cell size = 2r; band half-extent 1.5r = superset of the paper 2r-total-span)
+    // grid of surface particles (cell size = 2r; band half-extent 2.0r = superset of the paper 2r-total-span)
     float m_R = 0.0f;
     int m_sw = 0, m_sh = 0, m_sd = 0;
     std::vector<int> m_surfStart;      // flat SoA buckets, same scheme as m_cellStart
@@ -86,4 +100,7 @@ private:
     // output
     std::vector<float> m_verts;
     std::vector<unsigned> m_indices;
+
+    // optional OpenCL backend (GPU scalar-field construction; CPU Marching Cubes)
+    std::unique_ptr<SurfaceReconstructorCL> m_gpu;
 };
