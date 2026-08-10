@@ -3,13 +3,15 @@
 #include "FluidSolver.hpp"
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 
 int main(int argc, char** argv) {
     FluidSolver solver;
     solver.Init(2.0f, 1.2f, 1.0f, 0.8f);
     if (argc > 2) solver.GetParams().dt = (float)atof(argv[2]);   // optional dt override
     if (argc > 3 && atoi(argv[3]) == 1) solver.GetParams().gravity = 0.0f;  // hydrostatic test
-    if (argc > 4) solver.GetParams().viscosity = (float)atof(argv[4]);      // Monaghan alpha
+    if (argc > 4) solver.GetParams().viscosity = (float)atof(argv[4]);      // XSPH coefficient
+    if (argc > 5 && std::strcmp(argv[5], "df sph") == 0) solver.GetParams().solver = 1;  // DFSPH mode
 
     const int N = solver.FluidCount();
     const int B = solver.BoundaryCount();
@@ -31,7 +33,9 @@ int main(int argc, char** argv) {
     int outOfTank = 0;
     for (int s = 0; s < steps; s++) {
         solver.Step();
-        maxErr = std::max(maxErr, solver.AvgDensityError());
+        // |err| works for both solvers: IISPH reports a positive algebraic
+        // residual, DFSPH a signed average density error that can be negative.
+        maxErr = std::max(maxErr, std::fabs(solver.AvgDensityError()));
         const auto& pos = solver.Positions();
         const auto& vel = solver.Velocities();
         for (size_t i = 0; i < pos.size() && i < vel.size(); i++) {

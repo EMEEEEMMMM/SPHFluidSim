@@ -89,6 +89,8 @@ int RunHeadless(const HeadlessOptions& opt) {
     OpenGLLayer layer(opt.width, opt.height);
     FluidSolver solver;
 
+    solver.GetParams().solver = (opt.solver == "df sph") ? 1 : 0;
+
     // --particles -> spacing: each scene defines a FIXED water volume, and the
     // spacing is derived so that N particles always fill that volume:
     //   volume = N * spacing^3  ->  spacing = (volume / N)^(1/3).
@@ -270,6 +272,7 @@ namespace {
 // linearly with depth (p = rho g h). We fit p vs y and check the slope.
 int BenchHydrostatic(const HeadlessOptions& opt) {
     FluidSolver s;
+    s.GetParams().solver = (opt.solver == "df sph") ? 1 : 0;
     s.GetParams().spacing = 0.025f;   // 64k particles: stable pressure field
     if (opt.dt > 0) s.GetParams().dt = opt.dt;
     s.InitFull(2.0f, 1.2f, 1.0f, 0.5f);
@@ -312,6 +315,7 @@ int BenchHydrostatic(const HeadlessOptions& opt) {
 // tank; avg density error should stay small.
 int BenchDamBreak(const HeadlessOptions& opt) {
     FluidSolver s;
+    s.GetParams().solver = (opt.solver == "df sph") ? 1 : 0;
     s.GetParams().spacing = 0.04f;
     if (opt.dt > 0) s.GetParams().dt = opt.dt;
     s.Init(2.0f, 1.2f, 1.0f, 0.8f);
@@ -349,6 +353,7 @@ int BenchDamBreak(const HeadlessOptions& opt) {
 // speed/stability metrics are measured after it.
 int BenchEnergy(const HeadlessOptions& opt) {
     FluidSolver s;
+    s.GetParams().solver = (opt.solver == "df sph") ? 1 : 0;
     s.GetParams().spacing = 0.04f;
     if (opt.dt > 0) s.GetParams().dt = opt.dt;
     s.Init(2.0f, 1.2f, 1.0f, 0.8f);

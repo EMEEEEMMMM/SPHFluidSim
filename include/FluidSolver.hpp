@@ -14,16 +14,24 @@ public:
         float rho0 = 1000.0f;    // rest density [kg/m^3]
         float dt = 0.003f;       // time step [s]
         float omega = 0.5f;      // relaxation factor (paper: 0.5 optimal)
-        float eta = 0.001f;      // pressure-solve convergence (paper Sec.5.1: avg density error < 0.1%)
+        float eta = 0.0001f;     // pressure-solve convergence: avg density error < 0.01%
+                                 // (paper Sec.4 enforces < 0.01%; SPlisHSPlasH default maxError)
         int   maxIter = 100;     // Jacobi iteration cap (SPlisHSPlasH default: 100)
-        bool  useCFL = true;     // adaptive dt = min(dt, 0.4h/vmax); paper Table 1 uses fixed dt
-        // Artificial viscosity (Monaghan 1992/2005, cited as [23] in the paper).
-        // alpha: dimensionless viscosity strength; soundSpeed: artificial speed of sound.
+        float etaV = 0.001f;     // DFSPH divergence-solver tolerance: avg |Drho/Dt| < etaV/h
+                                 // (paper Sec.4: density change rate error < 0.1%,
+                                 // applied as 0.1%/dt like SPlisHSPlasH maxErrorV)
+        int   solver = 0;        // 0 = IISPH (Ihmsen et al. 2013), 1 = DFSPH (Bender & Koschier 2017)
+        bool  warmStart = true;  // DFSPH: seed both solvers with 0.5x last step's stiffness
+        bool  useCFL = true;     // adaptive dt = min(dt, 0.4*d/vmax), d = particle diameter (paper Sec.3.1)
+        // Viscosity: XSPH variant of Schechter & Bridson 2012 (paper Sec.4),
+        // implemented as in SPlisHSPlasH:
+        //   dv_i = -xsph * sum_j (V_j/rhoN_j) * (v_i - v_j) * W_ij
+        // (velocity-space filter; xsph = 0.1 is the common choice in the
+        // SPlisHSPlasH dam-break scenes).
         float viscosity = 0.1f;
-        float soundSpeed = 25.0f;
-        // Surface tension (Becker & Teschner 2007, cited as [5] in the paper):
-        // cohesion forces between particles. surfaceTensionBoundary is the
-        // fluid-wall cohesion (wetting).
+        // Surface tension (Akinci et al. 2013, used for the paper's results):
+        // color-field normals + cohesion + curvature + boundary adhesion.
+        // Defaults match SPlisHSPlasH (k = 0.05, kb = 0.01).
         float surfaceTension = 0.05f;
         float surfaceTensionBoundary = 0.01f;
         float gravity = -9.81f;  // [m/s^2]
@@ -68,6 +76,7 @@ public:
     float SimTime() const { return m_Time; }
     float AvgDensityError() const { return m_AvgErr; }
     int   LastIterations() const { return m_LastIter; }
+    int   DivergenceIterations() const { return m_LastIterV; }   // DFSPH divergence solver
     int   FluidCount() const { return m_N; }
     int   BoundaryCount() const { return static_cast<int>(m_BoundX.size()); }
     Params& GetParams() { return params; }
@@ -93,8 +102,18 @@ private:
     void PressureSolve();
     void Integrate();
     void UpdateColors();
+    // --- DFSPH (Bender & Koschier 2017, paper Alg. 1-3) ---
+    void ComputeDensity();          // rhoN = sum V_j W_ij (+ boundary)
+    void ComputeDFSPHFactor();      // alpha_i = 1 / (sum |V gradW|^2 + |sum V gradW|^2)
+    void CorrectDensityError();     // Alg. 3: fix rho* - rho0 on position level
+    void CorrectDivergenceError();  // Alg. 2: fix Drho/Dt = 0 on velocity level
+    void ApplyWallClamp();          // hard-wall safety net (position + velocity)
+    float RhoAdvOf(int i) const;    // rhoN + dt * Drho/Dt at current velocity
+    float RhoDotOf(int i) const;    // Drho/Dt at current velocity (SPH divergence)
     float W(float r) const;                       // cubic spline kernel value
     Math::Vector3 gradW(const Math::Vector3& r) const;  // kernel gradient
+    float WCohesion(float r) const;               // Akinci 2013 cohesion kernel (support h)
+    float WAdhesion(float r) const;               // Akinci 2013 adhesion kernel (support h)
 
     Params params;
     bool m_UseFullInit = false;   // Reset() needs to know which Init variant to rerun
@@ -115,6 +134,11 @@ private:
     std::vector<float> m_gradB2;                   // sum_b V_b |gradW|^2 (for the a_ii boundary term)
     std::vector<std::vector<int>> m_FluidNb;       // fluid neighbors of each particle
     std::vector<std::vector<int>> m_BoundNb;       // boundary neighbors of each particle (for surface tension)
+    std::vector<Math::Vector3> m_Normals;          // Akinci-2013 color-field normals (scaled by h)
+    std::vector<float> m_Alpha;                    // DFSPH factor alpha_i (paper Eq. 8 denominator inverse)
+    std::vector<float> m_KappaV;                   // DFSPH divergence-solver stiffness (p/rho^2 form)
+    std::vector<float> m_KappaVPrev;               // DFSPH divergence-solver kappa_v*h (warm start seed)
+    int m_LastIterV = 0;                           // DFSPH divergence-solver iterations
     std::vector<float> m_Colors;                   // per-particle RGB (velocity colored)
     bool m_traceNext = false;                      // record the next pressure solve's error trace
     std::vector<float> m_convTrace;                // |avg density error| per Jacobi iteration

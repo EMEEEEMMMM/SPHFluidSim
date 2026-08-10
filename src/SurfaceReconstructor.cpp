@@ -563,5 +563,76 @@ void SurfaceReconstructor::MarchingCubes(const std::vector<Math::Vector3>& parti
 
     // indexed mesh: vertices = shared intersection points, indices reference them
     m_verts.swap(pointData);
+    FilterIsolated();
+}
+
+// ---------------------------------------------------------------------------
+// FilterIsolated — drop tiny disconnected surface patches. Marching Cubes on a
+// per-frame particle snapshot produces transient fragments (a cell whose 8
+// corners all fall inside the surface band for a frame or two, and isolated
+// splash particles) that pop in and out with inverted/unstable normals —
+// visible as "random patches with a different colour that flash for a frame".
+// Connected components are found with union-find over shared vertices; every
+// patch smaller than 5% of the main body is discarded. If the main body is
+// itself small (< 50 triangles, e.g. a single droplet scene) nothing is
+// filtered.
+// ---------------------------------------------------------------------------
+void SurfaceReconstructor::FilterIsolated() {
+    const int nTris = (int)(m_indices.size() / 3);
+    const int nVerts = (int)(m_verts.size() / 6);
+    if (nTris < 2 || nVerts == 0) return;
+
+    std::vector<int> parent(nVerts);
+    for (int i = 0; i < nVerts; i++) parent[i] = i;
+    auto find = [&](int a) {
+        while (parent[a] != a) { parent[a] = parent[parent[a]]; a = parent[a]; }
+        return a;
+    };
+    auto unite = [&](int a, int b) {
+        a = find(a); b = find(b);
+        if (a != b) parent[a] = b;
+    };
+    for (int t = 0; t < nTris; t++) {
+        unite(m_indices[3 * t], m_indices[3 * t + 1]);
+        unite(m_indices[3 * t + 1], m_indices[3 * t + 2]);
+    }
+
+    std::vector<int> triCnt(nVerts, 0);
+    for (int t = 0; t < nTris; t++) triCnt[find(m_indices[3 * t])]++;
+    int maxTri = 0;
+    for (int c = 0; c < nVerts; c++) maxTri = std::max(maxTri, triCnt[c]);
+    if (maxTri == 0) return;
+
+    const int keepMin = (maxTri < 50) ? 0 : (int)(0.05f * maxTri);
+    std::vector<char> keep(nTris, 0);
+    int keptTris = 0;
+    for (int t = 0; t < nTris; t++) {
+        if (triCnt[find(m_indices[3 * t])] >= keepMin) { keep[t] = 1; keptTris++; }
+    }
+    if (keptTris == nTris) return;   // already a single clean patch
+
+    std::vector<char> used(nVerts, 0);
+    for (int t = 0; t < nTris; t++) if (keep[t]) {
+        used[m_indices[3 * t]] = 1;
+        used[m_indices[3 * t + 1]] = 1;
+        used[m_indices[3 * t + 2]] = 1;
+    }
+    std::vector<int> remap(nVerts, -1);
+    std::vector<float> newVerts;
+    newVerts.reserve(m_verts.size());
+    for (int v = 0; v < nVerts; v++) {
+        if (!used[v]) continue;
+        remap[v] = (int)(newVerts.size() / 6);
+        for (int k = 0; k < 6; k++) newVerts.push_back(m_verts[v * 6 + k]);
+    }
+    std::vector<unsigned> newIdx;
+    newIdx.reserve((size_t)keptTris * 3);
+    for (int t = 0; t < nTris; t++) if (keep[t]) {
+        newIdx.push_back((unsigned)remap[m_indices[3 * t]]);
+        newIdx.push_back((unsigned)remap[m_indices[3 * t + 1]]);
+        newIdx.push_back((unsigned)remap[m_indices[3 * t + 2]]);
+    }
+    m_verts.swap(newVerts);
+    m_indices.swap(newIdx);
 }
 

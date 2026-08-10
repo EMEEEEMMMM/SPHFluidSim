@@ -2,13 +2,13 @@
 
 A from-scratch, real-time reproduction of **Implicit Incompressible SPH** (Ihmsen et al., IEEE TVCG 2013) in C++17 + OpenGL 3.3 + ImGui + OpenMP, running on Windows (MinGW + CMake).
 
-The solver, the surface reconstruction and the rendering follow the paper's reference implementation (SPlisHSPlasH) formula-for-formula. The focus is **physical correctness** (density error < 0.5%, 2-10 pressure iterations like the paper) at interactive speed (33k particles ~ 14 ms/step on a desktop CPU, 20 threads).
+The solver, the surface reconstruction and the rendering follow the paper's reference implementation (SPlisHSPlasH) formula-for-formula. The focus is **physical correctness** (density error < 0.01% like the paper, relaxed-Jacobi pressure iterations) at interactive speed (33k particles ~ 14 ms/step on a desktop CPU, 20 threads).
 
 ---
 
 ## Features
 
-- **IISPH solver** (paper Alg. 1): implicit density constraint via relaxed-Jacobi pressure solve (`omega = 0.5`, negative pressure clamped to 0, warm start `p^0 = 0.5 p(t-dt)`), CFL step limiter, single-layer boundary particles with Akinci-2012 volumes, artificial viscosity (Monaghan 1992/2005) and surface tension (Becker & Teschner 2007 cohesion)
+- **IISPH solver** (paper Alg. 1): implicit density constraint via relaxed-Jacobi pressure solve (`omega = 0.5`, negative pressure clamped to 0, warm start `p^0 = 0.5 p(t-dt)`), CFL step limiter (`dt <= 0.4 d/vmax`, paper Sec.3.1), single-layer boundary particles with Akinci-2012 volumes, XSPH viscosity (Schechter & Bridson 2012, as in SPlisHSPlasH) and surface tension (Akinci et al. 2013: color-field normals + cohesion + curvature + boundary adhesion)
 - **Water surface reconstruction** (Akinci et al. 2012): color-field surface particles, distance-to-weighted-centroid scalar field `phi = |x - xbar| - r`, Marching Cubes lookup tables with shared-edge intersection reuse (watertight, crack-free), opaque fresnel water shader (deep-blue gradient + sun glint)
 - **Parallelism** (Ihmsen et al. 2011 style): SoA spatial hash built in 3 passes — atomic count -> prefix sum -> atomic scatter; no locks, cache-friendly neighbor slices; reconstruction runs on a background thread (never stalls the render loop)
 - **ImGui control panel**: pause / single step / reset, resolution presets, solver parameters, surface parameters, particles/surface/both view modes, FPS + tank label overlay (top-left)
@@ -25,6 +25,17 @@ mkdir build && cd build
 cmake .. && cmake --build .
 IISPH.exe
 ```
+
+The default configuration is **Debug**. For the fast build (recommended for the real-time demo; Debug is ~5x slower), configure a Release build explicitly:
+
+```powershell
+cd build
+cmake -DCMAKE_BUILD_TYPE=Release .   # switch to Release
+cmake --build .                      # recompile (takes a while)
+IISPH.exe
+```
+
+This uses a single-configuration generator (MinGW Makefiles), so the build type is baked into the configured directory — to go back to Debug, run `cmake -DCMAKE_BUILD_TYPE=Debug .` and rebuild. (The `--config Release` flag only works with multi-config generators such as Visual Studio / Ninja Multi-Config, not here.)
 
 ### GUI controls (ImGui panel)
 

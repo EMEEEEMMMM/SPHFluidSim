@@ -45,6 +45,7 @@ static int ParseDropFrame(const std::string& v, int fps) {
 
 int main(int argc, char** argv) {
     bool headless = false;
+    std::string benchName;   // --bench is run AFTER parsing all options
     HeadlessOptions opt;
 
     for (int i = 1; i < argc; i++) {
@@ -79,6 +80,14 @@ int main(int argc, char** argv) {
         else if (Match(a, "--dt") && i + 1 < argc) { opt.dt = (float)atof(argv[++i]); }
         else if (MatchPrefix(a, "--scene=")) { opt.scene = ValueAfter(a, "--scene="); }
         else if (Match(a, "--scene") && i + 1 < argc) { opt.scene = argv[++i]; }
+        else if (MatchPrefix(a, "--solver=")) { opt.solver = ValueAfter(a, "--solver="); if (opt.solver == "df") opt.solver = "df sph"; }
+        else if (Match(a, "--solver") && i + 1 < argc) {
+            opt.solver = argv[++i];
+            if (opt.solver == "df" && i + 1 < argc && std::strcmp(argv[i + 1], "sph") == 0) {
+                opt.solver = "df sph";
+                i++;
+            }
+        }
         else if (MatchPrefix(a, "--drop=")) { opt.dropFrame = ParseDropFrame(ValueAfter(a, "--drop="), opt.fps); }
         else if (Match(a, "--drop") && i + 1 < argc) { opt.dropFrame = ParseDropFrame(argv[++i], opt.fps); }
         else if (MatchPrefix(a, "--grid=")) { opt.gridScale = (float)atof(ValueAfter(a, "--grid=").c_str()); }
@@ -87,8 +96,8 @@ int main(int argc, char** argv) {
         else if (Match(a, "--threads") && i + 1 < argc) { opt.threads = atoi(argv[++i]); }
         else if (Match(a, "--no-video"))      { opt.noVideo = true; }
         else if (Match(a, "--keep-frames"))   { opt.keepFrames = true; }
-        else if (MatchPrefix(a, "--bench="))  { return RunBench(ValueAfter(a, "--bench="), opt); }
-        else if (Match(a, "--bench") && i + 1 < argc) { return RunBench(argv[++i], opt); }
+        else if (MatchPrefix(a, "--bench="))  { benchName = ValueAfter(a, "--bench="); }
+        else if (Match(a, "--bench") && i + 1 < argc) { benchName = argv[++i]; }
         else if (Match(a, "--help") || Match(a, "-h")) {
             printf("Usage: IISPH.exe [--gui|--headless] [options]\n"
                    "  --gui            interactive window (default)\n"
@@ -101,6 +110,7 @@ int main(int argc, char** argv) {
                    "  --mode <m>       particles | surface (default surface)\n"
                    "  --particles <n>  approx. fluid particles (default 8000)\n"
                    "  --scene <s>      dam | inflow (default dam; dam tank is open-top)\n"
+                   "  --solver <s>     iisph | df sph (default iisph; DFSPH = Bender & Koschier 2017)\n"
                    "  --drop <N>[f|s]  spawn the one-shot water drop at frame N, or N seconds in ('20f'/'20s', dam only)\n"
                    "  --dt <s>         fixed timestep\n"
                    "  --threads <n>    OpenMP threads\n"
@@ -114,6 +124,8 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
+
+    if (!benchName.empty()) return RunBench(benchName, opt);   // --bench with any other options
 
     if (headless) {
         // --seconds is a convenience: N seconds of video at `fps` = N * fps frames.

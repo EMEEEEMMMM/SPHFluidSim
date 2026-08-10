@@ -50,6 +50,7 @@ private:
     void ComputeColorAndNormal(const std::vector<Math::Vector3>& particles);
     void BuildImplicitField(const std::vector<Math::Vector3>& particles);
     void MarchingCubes(const std::vector<Math::Vector3>& particles);
+    void FilterIsolated();   // drop tiny disconnected surface patches (flicker)
 
     float W(float r) const;                     // cubic spline, support h = 2*spacing
     Math::Vector3 gradW(const Math::Vector3& r) const;

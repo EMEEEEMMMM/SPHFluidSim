@@ -41,6 +41,34 @@ Math::Vector3 FluidSolver::gradW(const Math::Vector3& r) const {
 }
 
 // ---------------------------------------------------------------------------
+// Akinci et al. 2013 surface-tension kernels (SPlisHSPlasH SPHKernels.h):
+//   cohesion: W_c(r) = 32/(pi h^9) (h-r)^3 r^3                for h/2 < r <= h
+//             32/(pi h^9) (2 (h-r)^3 r^3 - h^6/64)            for 0 < r <= h/2
+//              (the h^6/64 shift keeps W_c continuous at r = h/2)
+//   adhesion: W_a(r) = 0.007/h^3.25 (-4 r^2/h + 6 r - 2 h)^0.25   for h/2 < r <= h
+float FluidSolver::WCohesion(float r) const {
+    if (r <= 0.0f || r >= m_h) return 0.0f;
+    const float k = 32.0f / (kPi * powf(m_h, 9.0f));
+    const float r3 = r * r * r;
+    const float t = m_h - r;
+    const float hr3 = t * t * t;
+    if (r > 0.5f * m_h) return k * hr3 * r3;
+    return k * (2.0f * hr3 * r3 - powf(m_h, 6.0f) / 64.0f);
+}
+
+float FluidSolver::WAdhesion(float r) const {
+    if (r <= 0.5f * m_h || r >= m_h) return 0.0f;
+    const float k = 0.007f / powf(m_h, 3.25f);
+    // base = -4r^2/h + 6r - 2h is >= 0 for r in (h/2, h), but for r just
+    // above h/2 the three terms cancel to ~1e-9 and float rounding can make
+    // base slightly negative -> powf(neg, 0.25) = NaN (seen in Debug builds).
+    // Clamp to 0 so the kernel is well-defined at the lower support edge.
+    float base = -4.0f * r * r / m_h + 6.0f * r - 2.0f * m_h;
+    if (base < 0.0f) base = 0.0f;
+    return k * powf(base, 0.25f);
+}
+
+// ---------------------------------------------------------------------------
 void FluidSolver::Init(float boxX, float boxY, float boxZ, float waterSize) {
     m_BoxX = boxX; m_BoxY = boxY; m_BoxZ = boxZ; m_WaterSize = waterSize;
     m_UseFullInit = false;
@@ -56,7 +84,8 @@ void FluidSolver::Init(float boxX, float boxY, float boxZ, float waterSize) {
     m_dii.clear(); m_S.clear();
     m_Rho.clear(); m_RhoAdv.clear(); m_P.clear(); m_Pprev.clear();
     m_aii.clear(); m_deltaB.clear(); m_gradB.clear(); m_gradB2.clear();
-    m_FluidNb.clear(); m_BoundNb.clear(); m_Colors.clear();
+    m_FluidNb.clear(); m_BoundNb.clear(); m_Normals.clear(); m_Colors.clear();
+    m_Alpha.clear(); m_KappaV.clear(); m_KappaVPrev.clear();
     m_N = 0;
 
     // water cube in the corner (classic dam break start)
@@ -89,7 +118,8 @@ void FluidSolver::InitDamOpen(float boxX, float boxY, float boxZ, float waterSiz
     m_dii.clear(); m_S.clear();
     m_Rho.clear(); m_RhoAdv.clear(); m_P.clear(); m_Pprev.clear();
     m_aii.clear(); m_deltaB.clear(); m_gradB.clear(); m_gradB2.clear();
-    m_FluidNb.clear(); m_BoundNb.clear(); m_Colors.clear();
+    m_FluidNb.clear(); m_BoundNb.clear(); m_Normals.clear(); m_Colors.clear();
+    m_Alpha.clear(); m_KappaV.clear(); m_KappaVPrev.clear();
     m_N = 0;
 
     // water cube in the corner (classic dam break start)
@@ -140,7 +170,8 @@ void FluidSolver::InitFull(float boxX, float boxY, float boxZ, float waterHeight
     m_dii.clear(); m_S.clear();
     m_Rho.clear(); m_RhoAdv.clear(); m_P.clear(); m_Pprev.clear();
     m_aii.clear(); m_deltaB.clear(); m_gradB.clear(); m_gradB2.clear();
-    m_FluidNb.clear(); m_BoundNb.clear(); m_Colors.clear();
+    m_FluidNb.clear(); m_BoundNb.clear(); m_Normals.clear(); m_Colors.clear();
+    m_Alpha.clear(); m_KappaV.clear(); m_KappaVPrev.clear();
     m_N = 0;
 
     // water fills the whole tank cross-section (only the top surface is free) —
@@ -175,6 +206,10 @@ void FluidSolver::PushFluid(float x, float y, float z) {
     m_gradB2.push_back(0.0f);
     m_FluidNb.emplace_back();
     m_BoundNb.emplace_back();
+    m_Normals.push_back(Math::Vector3());
+    m_Alpha.push_back(0.0f);
+    m_KappaV.push_back(0.0f);
+    m_KappaVPrev.push_back(0.0f);
     m_Colors.push_back(0.0f); m_Colors.push_back(0.0f); m_Colors.push_back(0.0f);
     m_N++;
 }
@@ -200,7 +235,8 @@ void FluidSolver::InitInflow(float tankSize, float gap, int perStep, float radiu
     m_dii.clear(); m_S.clear();
     m_Rho.clear(); m_RhoAdv.clear(); m_P.clear(); m_Pprev.clear();
     m_aii.clear(); m_deltaB.clear(); m_gradB.clear(); m_gradB2.clear();
-    m_FluidNb.clear(); m_BoundNb.clear(); m_Colors.clear();
+    m_FluidNb.clear(); m_BoundNb.clear(); m_Normals.clear(); m_Colors.clear();
+    m_Alpha.clear(); m_KappaV.clear(); m_KappaVPrev.clear();
     m_N = 0;
 
     // small puddle DIRECTLY under the jet, at full spacing density (cushions the
@@ -244,7 +280,8 @@ void FluidSolver::InitDrop(float tankSize, float poolHeight, float dropRadius, f
     m_dii.clear(); m_S.clear();
     m_Rho.clear(); m_RhoAdv.clear(); m_P.clear(); m_Pprev.clear();
     m_aii.clear(); m_deltaB.clear(); m_gradB.clear(); m_gradB2.clear();
-    m_FluidNb.clear(); m_BoundNb.clear(); m_Colors.clear();
+    m_FluidNb.clear(); m_BoundNb.clear(); m_Normals.clear(); m_Colors.clear();
+    m_Alpha.clear(); m_KappaV.clear(); m_KappaVPrev.clear();
     m_N = 0;
 
     const float x0 = cx - 0.5f * tankSize, z0 = cz - 0.5f * tankSize;
@@ -518,94 +555,379 @@ void FluidSolver::BuildNeighborhood() {
 // ---------------------------------------------------------------------------
 void FluidSolver::PredictAdvection() {
     const bool hasVisc = params.viscosity > 0.0f;
-    const float viscC = params.viscosity * params.soundSpeed;
-    // Surface tension (Becker & Teschner 2007, paper [5]): cohesion forces.
     const bool hasTens = params.surfaceTension > 0.0f;
 
-    // Pass 1: density + d_ii (pure function of x(t)); no reads of m_Rho, so the
-    // viscosity pass below can safely use the previous step's density.
-    #pragma omp parallel for
-    for (int i = 0; i < m_N; i++) {
-        float rhoN = m_Vol * W(0.0f);
-        Math::Vector3 gsum;
-        for (int j : m_FluidNb[i]) {
-            Math::Vector3 r = m_X[i] - m_X[j];
-            rhoN += m_Vol * W(r.length());
-            gsum += m_Vol * gradW(r);
+    // Pass 1: density (pure function of x(t)); no reads of m_Rho, so the
+    // XSPH / Akinci-2013 passes below can safely use this fresh rho(t).
+    ComputeDensity();
+    // Pass 1b: d_ii (IISPH only; DFSPH uses the precomputed factor alpha_i).
+    if (params.solver == 0) {
+        #pragma omp parallel for
+        for (int i = 0; i < m_N; i++) {
+            Math::Vector3 gsum = m_gradB[i];
+            for (int j : m_FluidNb[i])
+                gsum += m_Vol * gradW(m_X[i] - m_X[j]);
+            m_dii[i] = gsum * (-1.0f / (m_Rho[i] * m_Rho[i]));
         }
-        rhoN += m_deltaB[i];
-        gsum += m_gradB[i];
-        m_Rho[i] = rhoN;
-        m_dii[i] = gsum * (-1.0f / (rhoN * rhoN));
     }
 
-    // Pass 2: non-pressure forces -> v_adv. Density is stable here.
+    // Pass 2a: Akinci-2013 color-field normals n_i = h * sum_j (V_j/rhoN_j) gradW_ij
+    // (SPlisHSPlasH scales the raw normal by the support radius h).
+    if (hasTens) {
+        #pragma omp parallel for
+        for (int i = 0; i < m_N; i++) {
+            Math::Vector3 n;
+            for (int j : m_FluidNb[i]) {
+                if (m_Rho[j] > 1e-6f)
+                    n += (m_Vol / m_Rho[j]) * gradW(m_X[i] - m_X[j]);
+            }
+            m_Normals[i] = n * m_h;
+        }
+    }
+
+    // Pass 2b: non-pressure forces -> v_adv (gravity + XSPH + Akinci-2013).
+    // XSPH (Schechter & Bridson 2012, as in SPlisHSPlasH): velocity-space filter
+    //   dv_i = -xsph * sum_j (V_j/rhoN_j) (v_i - v_j) W_ij
+    // Akinci-2013 surface tension: per fluid neighbor j
+    //   accel = -k m_j xhat_ij W_c(r_ij)  -  k (n_i - n_j),   weighted by K_ij = 2/(rhoN_i+rhoN_j),
+    // plus boundary adhesion  -kb rho0 V_b xhat_ib W_a(r_ib).
     #pragma omp parallel for
     for (int i = 0; i < m_N; i++) {
-        // Non-pressure forces: gravity + artificial viscosity + surface tension
-        // (paper Sec.5, [23] and [5]). Viscosity uses the density from pass 1
-        // (= rho(t), positions not yet updated — matches the paper's rho(t)).
-        Math::Vector3 aVisc;
+        Math::Vector3 dvXSPH;
         if (hasVisc) {
             for (int j : m_FluidNb[i]) {
+                if (m_Rho[j] < 1e-6f) continue;
                 Math::Vector3 r = m_X[i] - m_X[j];
-                Math::Vector3 vrel = m_V[i] - m_V[j];
-                const float dot = vrel.dot(r);
-                if (dot < 0.0f) {   // particles approach each other
-                    const float r2 = r.dot(r);
-                    const float mu = m_h * dot / (r2 + 0.01f * m_h * m_h);   // < 0
-                    const float rhoAvg = 0.5f * (m_Rho[i] + m_Rho[j]);
-                    if (rhoAvg > 1e-4f) {
-                        // Pi_ij = -alpha c mu / rho_avg  (>0 when approaching)
-                        const float pi = -viscC * mu / rhoAvg;
-                        // a_i += sum_j m_j Pi_ij gradW(x_i-x_j); in normalized
-                        // form m_j/rho_avg = V_j/rhoN_avg, hence:
-                        aVisc -= m_Vol * pi * gradW(r);
-                    }
-                }
+                dvXSPH -= params.viscosity * (m_Vol / m_Rho[j]) * (m_V[i] - m_V[j]) * W(r.length());
             }
         }
         Math::Vector3 aTens;
         if (hasTens) {
-            // cohesion acceleration (uniform masses): a_i = -k * sum_j W_ij (x_i-x_j)
-            // W is clamped to W(diameter) for r < diameter (no overlap blow-up).
+            const Math::Vector3 ni = m_Normals[i];
             for (int j : m_FluidNb[i]) {
                 Math::Vector3 r = m_X[i] - m_X[j];
-                float rr = r.length();
-                float w = W(rr);   // paper Eq. (16): no clamp
-                aTens -= params.surfaceTension * w * r;
+                const float rr = r.length();
+                if (rr < 1e-9f) continue;
+                Math::Vector3 xhat = r * (1.0f / rr);
+                Math::Vector3 accel;
+                // cohesion (attractive toward the neighbor)
+                accel -= params.surfaceTension * (params.rho0 * m_Vol) * xhat * WCohesion(rr);
+                // curvature: -k (n_i - n_j)
+                accel -= params.surfaceTension * (ni - m_Normals[j]);
+                const float Kij = 2.0f / (m_Rho[i] + m_Rho[j]);
+                aTens += Kij * accel;
+            }
+            // adhesion to Akinci-2012 boundary particles
+            for (int b : m_BoundNb[i]) {
+                Math::Vector3 r = m_X[i] - m_BoundX[b];
+                const float rr = r.length();
+                if (rr < 1e-9f) continue;
+                Math::Vector3 xhat = r * (1.0f / rr);
+                aTens -= params.surfaceTensionBoundary * params.rho0 * m_BoundV[b] * xhat * WAdhesion(rr);
             }
         }
-        m_Vadv[i] = m_V[i] + Math::Vector3(0.0f, params.dt * params.gravity, 0.0f) + (aVisc + aTens) * params.dt;
+        m_Vadv[i] = m_V[i] + Math::Vector3(0.0f, params.dt * params.gravity, 0.0f) + aTens * params.dt + dvXSPH;
     }
 
+    // Pass 3 (IISPH only): predicted density for the pressure solve, warm
+    // start, and the a_ii diagonal. DFSPH recomputes rho* inside its constant
+    // density solver, so this whole pass is skipped for solver == 1.
+    if (params.solver == 0) {
+        #pragma omp parallel for
+        for (int i = 0; i < m_N; i++) {
+            float rhoAdv = m_Rho[i];
+            Math::Vector3 vi = m_Vadv[i];
+            for (int j : m_FluidNb[i]) {
+                Math::Vector3 r = m_X[i] - m_X[j];
+                rhoAdv += params.dt * m_Vol * (vi - m_Vadv[j]).dot(gradW(r));
+            }
+            rhoAdv += params.dt * vi.dot(m_gradB[i]);   // v_b = 0 (static walls)
+            m_RhoAdv[i] = rhoAdv;
+
+            m_P[i] = 0.5f * m_Pprev[i];
+
+            float a = 0.0f;
+            float coefJi = m_Vol / (m_Rho[i] * m_Rho[i]);
+            for (int j : m_FluidNb[i]) {
+                Math::Vector3 g = gradW(m_X[i] - m_X[j]);
+                a += m_Vol * (m_dii[i] - g * coefJi).dot(g);
+            }
+            // boundary neighbors: sum_b V_b (d_ii - d_ji).gradW_ib = d_ii . gradB
+            // (the paper's Eq. 12 boundary part; an extra -coefJi*|gradB|^2 term
+            // was present and is removed: it shrinks a_ii for wall-adjacent
+            // particles, which the shallow open-tank pool amplifies into a
+            // permanent wall-squeeze jitter - measured pool vmax 1.5-4 m/s that
+            // no settle/relaxation could remove.)
+            a += m_dii[i].dot(m_gradB[i]);
+            m_aii[i] = a;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DFSPH (Bender & Koschier 2017) — paper Algorithm 1-3, normalized formulation
+// (rhoN = rho/rho0, V = spacing^3, boundary particles are static).
+// ---------------------------------------------------------------------------
+
+// Density rhoN_i = sum_j V_j W_ij + sum_b V_b W_ib.
+void FluidSolver::ComputeDensity() {
     #pragma omp parallel for
     for (int i = 0; i < m_N; i++) {
-        float rhoAdv = m_Rho[i];
-        Math::Vector3 vi = m_Vadv[i];
+        float rhoN = m_Vol * W(0.0f);
         for (int j : m_FluidNb[i]) {
-            Math::Vector3 r = m_X[i] - m_X[j];
-            rhoAdv += params.dt * m_Vol * (vi - m_Vadv[j]).dot(gradW(r));
+            float rr = (m_X[i] - m_X[j]).length();
+            rhoN += m_Vol * W(rr);
         }
-        rhoAdv += params.dt * vi.dot(m_gradB[i]);   // v_b = 0 (static walls)
-        m_RhoAdv[i] = rhoAdv;
+        m_Rho[i] = rhoN + m_deltaB[i];
+    }
+}
 
-        m_P[i] = 0.5f * m_Pprev[i];
-
-        float a = 0.0f;
-        float coefJi = m_Vol / (m_Rho[i] * m_Rho[i]);
+// Factor alpha_i (paper Eq. 8): inverse of
+//   sum_j |V_j gradW_ij|^2  +  |sum_j V_j gradW_ij + sum_b V_b gradW_ib|^2
+// (SPlisHSPlasH computeDFSPHFactor; boundary particles are included in the
+// gradient sum so wall-adjacent fluid gets the correct stiffness).
+void FluidSolver::ComputeDFSPHFactor() {
+    #pragma omp parallel for
+    for (int i = 0; i < m_N; i++) {
+        Math::Vector3 gradPI;   // sum V gradW over fluid + boundary
+        float sum = 0.0f;
         for (int j : m_FluidNb[i]) {
-            Math::Vector3 g = gradW(m_X[i] - m_X[j]);
-            a += m_Vol * (m_dii[i] - g * coefJi).dot(g);
+            Math::Vector3 gp = m_Vol * gradW(m_X[i] - m_X[j]);
+            gradPI += gp;
+            sum += gp.dot(gp);
         }
-        // boundary neighbors: sum_b V_b (d_ii - d_ji).gradW_ib = d_ii . gradB
-        // (the paper's Eq. 12 boundary part; an extra -coefJi*|gradB|^2 term
-        // was present and is removed: it shrinks a_ii for wall-adjacent
-        // particles, which the shallow open-tank pool amplifies into a
-        // permanent wall-squeeze jitter - measured pool vmax 1.5-4 m/s that
-        // no settle/relaxation could remove.)
-        a += m_dii[i].dot(m_gradB[i]);
-        m_aii[i] = a;
+        for (int b : m_BoundNb[i]) {
+            Math::Vector3 gp = m_BoundV[b] * gradW(m_X[i] - m_BoundX[b]);
+            gradPI += gp;
+        }
+        sum += gradPI.dot(gradPI);
+        // Clamp tiny denominators (paper Sec.3.2: threshold 1e-6).
+        m_Alpha[i] = (sum > 1e-6f) ? 1.0f / sum : 0.0f;
+    }
+}
+
+// Drho/Dt at the current velocity (paper Eq. 6, normalized):
+//   sum_j V_j (v_i - v_j) . gradW_ij + v_i . gradB_i   (v_b = 0)
+float FluidSolver::RhoDotOf(int i) const {
+    float drho = 0.0f;
+    const Math::Vector3 vi = m_Vadv[i];
+    for (int j : m_FluidNb[i]) {
+        Math::Vector3 r = m_X[i] - m_X[j];
+        drho += m_Vol * (vi - m_Vadv[j]).dot(gradW(r));
+    }
+    drho += vi.dot(m_gradB[i]);
+    return drho;
+}
+
+// Predicted density rho*_i = rhoN_i + dt * Drho/Dt (paper Sec. 3.3).
+float FluidSolver::RhoAdvOf(int i) const {
+    return m_Rho[i] + params.dt * RhoDotOf(i);
+}
+
+// Constant density solver (paper Algorithm 3): enforce rho* - 1 = 0 by
+// adapting velocities BEFORE the position integration.
+//   kappa_i = max(rho*_i - 1, 0) * alpha_i / dt^2
+//   v*_i -= dt * sum_j V_j (kappa_i + kappa_j) gradW_ij   (+ boundary term)
+// (the rhoN_i factors cancel in the normalized p/rho^2 form, as in
+// SPlisHSPlasH). min 2 iterations, stops at avg |rho* - 1| < eta (0.01%).
+void FluidSolver::CorrectDensityError() {
+    const float h = params.dt;
+    const float invH2 = 1.0f / (h * h);
+    const float omega = params.omega;
+
+    // Warm start (SPlisHSPlasH): seed the pressure with 0.5x the previous
+    // step's kappa (stored as kappa*h^2 so it is step-size independent, capped
+    // at 0.00025 so a stale outlier cannot inject momentum) and apply it once
+    // before iterating. Density-deficit particles stay at p = 0.
+    if (params.warmStart) {
+        #pragma omp parallel for
+        for (int i = 0; i < m_N; i++) {
+            const float rhoAdv = RhoAdvOf(i);
+            m_RhoAdv[i] = rhoAdv;
+            m_P[i] = (rhoAdv > 1.0f) ? 0.5f * std::min(m_Pprev[i], 0.00025f) * invH2 : 0.0f;
+        }
+        #pragma omp parallel for
+        for (int i = 0; i < m_N; i++) {
+            Math::Vector3 a;
+            for (int j : m_FluidNb[i]) {
+                Math::Vector3 g = gradW(m_X[i] - m_X[j]);
+                a -= m_Vol * (m_P[i] + m_P[j]) * g;
+            }
+            for (int b : m_BoundNb[i])
+                a -= m_BoundV[b] * m_P[i] * gradW(m_X[i] - m_BoundX[b]);
+            m_Vadv[i] += omega * h * a;
+        }
+    } else {
+        #pragma omp parallel for
+        for (int i = 0; i < m_N; i++) {
+            const float rhoAdv = RhoAdvOf(i);
+            m_RhoAdv[i] = rhoAdv;
+            // Negative pressure clamp (paper Sec.4): rho* < 1 -> p = 0.
+            m_P[i] = std::max(rhoAdv - 1.0f, 0.0f) * m_Alpha[i] * invH2;
+        }
+    }
+
+    int iter = 0;
+    float err = 1e9f;
+    while ((err > params.eta || iter < 2) && iter < params.maxIter) {
+        iter++;
+        // Adapt velocities with the current stiffness values. The closed-form
+        // kappa = (rho*-1) alpha/dt^2 over-corrects for the wall-corner density
+        // surplus of the single-layer boundary (initial rho ~ 1.7 there); the
+        // same relaxed-Jacobi omega as IISPH damps the correction.
+        #pragma omp parallel for
+        for (int i = 0; i < m_N; i++) {
+            Math::Vector3 a;
+            for (int j : m_FluidNb[i]) {
+                Math::Vector3 g = gradW(m_X[i] - m_X[j]);
+                a -= m_Vol * (m_P[i] + m_P[j]) * g;
+            }
+            for (int b : m_BoundNb[i])
+                a -= m_BoundV[b] * m_P[i] * gradW(m_X[i] - m_BoundX[b]);
+            m_Vadv[i] += omega * h * a;
+        }
+        // Re-predict the density and refresh kappa. Convergence uses the
+        // SIGNED average (SPlisHSPlasH avg_density_err): wall-adjacent
+        // particles carry a geometric density surplus (single-layer boundary)
+        // that cannot be removed by moving (hard-wall clamp), while surface
+        // particles carry a deficit; the signed mean lets these cancel instead
+        // of forcing the solver to run into maxIter every step.
+        double errSum = 0.0;
+        #pragma omp parallel for reduction(+:errSum)
+        for (int i = 0; i < m_N; i++) {
+            const float rhoAdv = RhoAdvOf(i);
+            m_RhoAdv[i] = rhoAdv;
+            m_P[i] = std::max(rhoAdv - 1.0f, 0.0f) * m_Alpha[i] * invH2;
+            errSum += rhoAdv - 1.0f;
+        }
+        err = (float)(errSum / m_N);
+    }
+    m_LastIter = iter;
+    m_AvgErr = err;
+
+    // Keep kappa*h^2 for the next step's warm start (SPlisHSPlasH multiplies
+    // the pressure by h^2 at the end of the pressure solve).
+    if (params.warmStart) {
+        #pragma omp parallel for
+        for (int i = 0; i < m_N; i++)
+            m_Pprev[i] = m_P[i] * h * h;
+    }
+}
+
+// Divergence-free solver (paper Algorithm 2): enforce Drho/Dt = 0 by
+// adapting the final velocities AFTER the position integration.
+//   kappa_v_i = (Drho/Dt)_i * alpha_i / dt
+//   v_i -= dt * sum_j V_j (kappa_v_i + kappa_v_j) gradW_ij  (+ boundary term)
+// min 1 iteration, stops at avg |Drho/Dt| < etaV (0.1%).
+void FluidSolver::CorrectDivergenceError() {
+    const float h = params.dt;
+    const float invH = 1.0f / h;
+    const float omega = params.omega;
+    const int kMinNeighbors = 20;
+
+    // m_KappaV temporarily stores Drho/Dt (stiffness is Drho/Dt * alpha / h).
+    // Particles with a deficient neighborhood (free surface / splashes) are
+    // excluded from the divergence solve (SPlisHSPlasH: numNeighbors < 20 ->
+    // densityAdv = 0), which also stops them from over-correcting.
+    if (params.warmStart) {
+        // Warm start: apply 0.5x the previous step's divergence stiffness
+        // (stored as kappa_v*h, capped) once, then re-measure Drho/Dt so the
+        // loop below keeps its "m_KappaV holds Drho/Dt" invariant.
+        #pragma omp parallel for
+        for (int i = 0; i < m_N; i++) {
+            const bool poor = (int)(m_FluidNb[i].size() + m_BoundNb[i].size()) < kMinNeighbors;
+            m_KappaV[i] = poor ? 0.0f : 0.5f * std::min(m_KappaVPrev[i], 0.00025f) * invH;
+        }
+        #pragma omp parallel for
+        for (int i = 0; i < m_N; i++) {
+            Math::Vector3 a;
+            for (int j : m_FluidNb[i]) {
+                Math::Vector3 g = gradW(m_X[i] - m_X[j]);
+                a -= m_Vol * (m_KappaV[i] + m_KappaV[j]) * g;
+            }
+            for (int b : m_BoundNb[i])
+                a -= m_BoundV[b] * m_KappaV[i] * gradW(m_X[i] - m_BoundX[b]);
+            m_Vadv[i] += omega * h * a;
+        }
+    }
+    #pragma omp parallel for
+    for (int i = 0; i < m_N; i++) {
+        if ((int)(m_FluidNb[i].size() + m_BoundNb[i].size()) < kMinNeighbors)
+            m_KappaV[i] = 0.0f;
+        else
+            m_KappaV[i] = RhoDotOf(i);
+    }
+    double errSum0 = 0.0;
+    #pragma omp parallel for reduction(+:errSum0)
+    for (int i = 0; i < m_N; i++)
+        errSum0 += m_KappaV[i];
+    float err = (float)(errSum0 / m_N);
+
+    int iter = 0;
+    // SPlisHSPlasH scales the tolerance by 1/h: the divergence error is a
+    // density change RATE (1/s), so eta_v = 0.1% / h.
+    while ((err > params.etaV / h || iter < 1) && iter < params.maxIter) {
+        iter++;
+        // Stiffness from the current divergence.
+        #pragma omp parallel for
+        for (int i = 0; i < m_N; i++)
+            m_KappaV[i] *= m_Alpha[i] * invH;
+        // Adapt velocities (relaxed with omega). The divergence stiffness
+        // kappa_v = Drho/Dt*alpha/h needs the same damping as the constant
+        // density solver: without it the free-surface particles over-correct
+        // and the body slowly inflates (measured avg rho down to 0.7).
+        #pragma omp parallel for
+        for (int i = 0; i < m_N; i++) {
+            Math::Vector3 a;
+            for (int j : m_FluidNb[i]) {
+                Math::Vector3 g = gradW(m_X[i] - m_X[j]);
+                a -= m_Vol * (m_KappaV[i] + m_KappaV[j]) * g;
+            }
+            for (int b : m_BoundNb[i])
+                a -= m_BoundV[b] * m_KappaV[i] * gradW(m_X[i] - m_BoundX[b]);
+            m_Vadv[i] += omega * h * a;
+        }
+        // Convergence: signed avg Drho/Dt after the update (SPlisHSPlasH
+        // convention; the geometric boundary surplus cancels against the
+        // free-surface deficit).
+        double errSum = 0.0;
+        #pragma omp parallel for reduction(+:errSum)
+        for (int i = 0; i < m_N; i++) {
+            if ((int)(m_FluidNb[i].size() + m_BoundNb[i].size()) < kMinNeighbors) {
+                m_KappaV[i] = 0.0f;
+                continue;
+            }
+            const float rhoDot = RhoDotOf(i);
+            m_KappaV[i] = rhoDot;   // reused as the next iteration's input
+            errSum += rhoDot;
+        }
+        err = (float)(errSum / m_N);
+    }
+    m_LastIterV = iter;
+
+    // Keep kappa_v*h (= Drho/Dt * alpha) for the next step's warm start
+    // (SPlisHSPlasH multiplies the divergence stiffness by h at the end).
+    if (params.warmStart) {
+        #pragma omp parallel for
+        for (int i = 0; i < m_N; i++)
+            m_KappaVPrev[i] = m_KappaV[i] * m_Alpha[i];
+    }
+}
+
+// Hard-wall safety net shared by IISPH Integrate and the DFSPH step:
+// keep the particle CENTER at least half a spacing from the wall.
+void FluidSolver::ApplyWallClamp() {
+    const float half = 0.5f * params.spacing;
+    #pragma omp parallel for
+    for (int i = 0; i < m_N; i++) {
+        Math::Vector3& x = m_X[i];
+        Math::Vector3& v = m_Vadv[i];
+        if (x.x < m_WallX0 + half)          { x.x = m_WallX0 + half;          if (v.x < 0.0f) v.x = 0.0f; }
+        if (x.x > m_WallX1 - half)          { x.x = m_WallX1 - half;          if (v.x > 0.0f) v.x = 0.0f; }
+        if (x.y < half)                     { x.y = half;                     if (v.y < 0.0f) v.y = 0.0f; }
+        if (m_WallTop && x.y > m_WallY1 - half) { x.y = m_WallY1 - half;      if (v.y > 0.0f) v.y = 0.0f; }
+        if (x.z < m_WallZ0 + half)          { x.z = m_WallZ0 + half;          if (v.z < 0.0f) v.z = 0.0f; }
+        if (x.z > m_WallZ1 - half)          { x.z = m_WallZ1 - half;          if (v.z > 0.0f) v.z = 0.0f; }
     }
 }
 
@@ -655,6 +977,12 @@ void FluidSolver::PressureSolve() {
             if (std::fabs(denom) > 3e-5f)
                 pnew = (1.0f - omega) * m_P[i] + omega / denom * (b - h2 * sum);
             if (pnew < 0.0f) pnew = 0.0f;
+            // Numerical anti-divergence cap: a free-flying particle with a low
+            // neighbor count gets a tiny |denom|, so omega/denom can inflate
+            // p far beyond any physical pressure (hydrostatic here ~ 5). Cap it
+            // at 100 (20x headroom) so a single outlier cannot snowball through
+            // the Jacobi passes. Physical peaks stay well below this.
+            if (pnew > 100.0f) pnew = 100.0f;
             m_P[i] = pnew;
             // SPlisHSPlasH convergence: signed algebraic residual, only for p>0 particles
             if (pnew != 0.0f) errSum += (m_aii[i] * pnew + sum) * h2 - b;
@@ -718,21 +1046,50 @@ void FluidSolver::UpdateColors() {
 }
 
 void FluidSolver::Step() {
-    // CFL condition: keep the particle displacement per step well below h
-    // (helps a lot when the water block slams into the tank bottom).
+    // CFL condition (paper Sec.3.1): dt <= 0.4 * d / vmax with d = particle
+    // diameter (= spacing). Keeps the particle displacement per step well
+    // below the kernel support (helps when the water block slams into the
+    // tank bottom).
     float vmax = 0.0f;
     for (int i = 0; i < m_N; i++) vmax = std::max(vmax, m_V[i].length());
     float dt = params.dt;
     if (params.useCFL)
-        dt = std::min(params.dt, 0.25f * m_h / std::max(vmax, 0.1f));   // 0.4h -> 0.25h: calms impact/splash steps
+        dt = std::min(params.dt, 0.4f * params.spacing / std::max(vmax, 0.1f));
     float prevDt = params.dt;
     params.dt = dt;
 
     InjectFluid();          // open-tank scene: spawn this step's jet particles
     BuildNeighborhood();
-    PredictAdvection();
-    PressureSolve();
-    Integrate();
+    PredictAdvection();     // rho, Akinci-2013 normals, XSPH + surface tension -> v_adv
+
+    if (params.solver == 1) {
+        // ---- DFSPH (paper Algorithm 1) ----
+        // 1) constant density solver on the predicted velocities
+        ComputeDFSPHFactor();
+        CorrectDensityError();
+        // 2) integrate positions, rebuild neighborhoods, recompute rho + alpha
+        #pragma omp parallel for
+        for (int i = 0; i < m_N; i++) m_X[i] += m_Vadv[i] * params.dt;
+        ApplyWallClamp();            // hard-wall safety net (existing convention)
+        BuildNeighborhood();
+        ComputeDensity();
+        ComputeDFSPHFactor();
+        // 3) divergence-free solver on the final velocities
+        CorrectDivergenceError();
+        m_V = m_Vadv;
+        // Numerical-splash damping (same guard as the IISPH path).
+        const float kVMax = 4.0f;
+        #pragma omp parallel for
+        for (int i = 0; i < m_N; i++) {
+            const float v = m_V[i].length();
+            if (v > kVMax) m_V[i] *= kVMax / v;
+        }
+        m_Time += params.dt;
+        UpdateColors();
+    } else {
+        PressureSolve();
+        Integrate();
+    }
 
     params.dt = prevDt;
 }

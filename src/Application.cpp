@@ -319,18 +319,26 @@ void Application::RenderSimulationUI() {
                  2.0f, 1.2f, 1.0f, m_Solver->FluidCount());
         m_TankLabel = tb;
     }
-    ImGui::SliderFloat("omega (relaxation)", &p.omega, 0.1f, 0.9f);
+    ImGui::Separator();
+    ImGui::Text("Pressure solver");
+    const char* solverNames[] = { "IISPH (Ihmsen 2013)", "DFSPH (Bender & Koschier 2017)" };
+    int curSolver = p.solver;
+    if (ImGui::Combo("solver", &curSolver, solverNames, 2)) {
+        p.solver = curSolver;
+        m_Solver->Reset();   // solver state arrays differ; restart the scene
+    }
+    if (p.solver == 0) ImGui::SliderFloat("omega (relaxation)", &p.omega, 0.1f, 0.9f);
     ImGui::SliderFloat("eta (density tol.)", &p.eta, 0.0001f, 0.01f, "%.4f");
+    if (p.solver == 1) ImGui::SliderFloat("eta_v (divergence tol.)", &p.etaV, 0.0001f, 0.01f, "%.4f");
     ImGui::SliderInt("max pressure iters", &p.maxIter, 2, 100);
     ImGui::SliderFloat("dt [s]", &p.dt, 0.0005f, 0.01f, "%.4f");
     ImGui::Checkbox("CFL step limiter", &p.useCFL);
 
     ImGui::Separator();
     ImGui::Text("Non-pressure forces (paper Sec.5)");
-    ImGui::SliderFloat("viscosity alpha [23]", &p.viscosity, 0.0f, 1.0f, "%.3f");
-    ImGui::SliderFloat("sound speed [m/s]", &p.soundSpeed, 5.0f, 100.0f, "%.0f");
-    ImGui::SliderFloat("surface tension k [5]", &p.surfaceTension, 0.0f, 0.5f, "%.3f");
-    ImGui::SliderFloat("wall cohesion kb [5]", &p.surfaceTensionBoundary, 0.0f, 0.1f, "%.3f");
+    ImGui::SliderFloat("XSPH viscosity c", &p.viscosity, 0.0f, 1.0f, "%.3f");
+    ImGui::SliderFloat("surface tension k [Akinci13]", &p.surfaceTension, 0.0f, 0.5f, "%.3f");
+    ImGui::SliderFloat("wall adhesion kb [Akinci13]", &p.surfaceTensionBoundary, 0.0f, 0.1f, "%.3f");
 
     ImGui::Separator();
     ImGui::Text("Surface reconstruction (Akinci 2012 [32])");
