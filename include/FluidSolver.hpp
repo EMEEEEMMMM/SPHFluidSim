@@ -72,6 +72,7 @@ public:
 
     const std::vector<Math::Vector3>& Positions() const { return m_X; }
     const std::vector<Math::Vector3>& Velocities() const { return m_V; }
+    const std::vector<float>&         Densities() const { return m_Rho; }   // rhoN: density incl. boundary-particle contribution
     const std::vector<float>&         Colors() const { return m_Colors; }   // 3 floats per particle
     float SimTime() const { return m_Time; }
     float AvgDensityError() const { return m_AvgErr; }

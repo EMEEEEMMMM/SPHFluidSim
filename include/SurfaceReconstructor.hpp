@@ -44,13 +44,18 @@ public:
     void SetGridScale(float s) { m_gridScale = s; }
     void SetBandScale(float b) { m_bandScale = b; }   // surface-vertex band half-width in units of r (default 2.0)
 
+    // per-particle scalar fields from the CPU color-field pass (filled by
+    // Reconstruct's CPU path; empty on the GPU path). Used by the Gaussian
+    // splatting renderer: c = color field (surface measure), n = grad c dir.
+    const std::vector<float>&         ParticleColorField() const { return m_color; }
+    const std::vector<Math::Vector3>& ParticleNormals()     const { return m_normal; }
+
 private:
     // internal uniform grid helpers
     void BuildGrid(const std::vector<Math::Vector3>& particles, float spacing);
     void ComputeColorAndNormal(const std::vector<Math::Vector3>& particles);
     void BuildImplicitField(const std::vector<Math::Vector3>& particles);
     void MarchingCubes(const std::vector<Math::Vector3>& particles);
-    void FilterIsolated();   // drop tiny disconnected surface patches (flicker)
 
     float W(float r) const;                     // cubic spline, support h = 2*spacing
     Math::Vector3 gradW(const Math::Vector3& r) const;
