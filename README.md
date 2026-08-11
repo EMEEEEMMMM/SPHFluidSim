@@ -6,6 +6,12 @@ The solver, the surface reconstruction and the rendering follow the paper's refe
 
 ---
 
+<div align="center">
+  <img src="./assets/output.gif" alt="演示动画" width="700">
+  <br>
+  <small>IISPH.exe --headless --seconds 20 --output demo_dam --fps 120 -r 1920x1080 --scene dam --drop 5s --grid 0.5 --particles 64000 --solver df sph</small>
+</div>
+
 ## Features
 
 - **IISPH solver** (paper Alg. 1): implicit density constraint via relaxed-Jacobi pressure solve (`omega = 0.5`, negative pressure clamped to 0, warm start `p^0 = 0.5 p(t-dt)`), CFL step limiter (`dt <= 0.4 d/vmax`, paper Sec.3.1), single-layer boundary particles with Akinci-2012 volumes, XSPH viscosity (Schechter & Bridson 2012, as in SPlisHSPlasH) and surface tension (Akinci et al. 2013: color-field normals + cohesion + curvature + boundary adhesion)

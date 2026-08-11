@@ -43,6 +43,7 @@ public:
     // field grid resolution as a multiple of spacing (1.0 = full quality, >1 faster)
     void SetGridScale(float s) { m_gridScale = s; }
     void SetBandScale(float b) { m_bandScale = b; }   // surface-vertex band half-width in units of r (default 2.0)
+    void SetUseEvmax(bool b) { m_useEvmax = b; }      // paper Eq. 2-3 curvature correction (default off)
 
     // per-particle scalar fields from the CPU color-field pass (filled by
     // Reconstruct's CPU path; empty on the GPU path). Used by the Gaussian
@@ -75,7 +76,12 @@ private:
     // 8/8 surface-vertex cull drops the triangles (visible cracks on calm
     // water). ±2r keeps the whole isosurface band inside while the 8/8 cull
     // still rejects the (false) bottom-layer surface (no double layer).
-    bool m_useEvmax = false;                     // paper Eq. 2-3 EVmax factor (off: settled top surface has EVmax ~0.39 < t_low=0.4, so it never fires there)
+    bool m_useEvmax = true;                      // paper Eq. 2-3 EVmax factor: shrinks the implicit
+                                                 // radius where the neighborhood is one-sided (water
+                                                 // edges, waves) — the paper's anti-bulge mechanism.
+                                                 // On a settled flat top EVmax ~0.39 < t_low=0.4, so
+                                                 // it never fires there (measured: 87-92% fewer
+                                                 // isosurface bulges on a dam break with it on).
     float m_fstep = 0.0f;                        // field grid spacing (derived)
 
     // grid of particles for neighbor search — flat SoA buckets (paper [30]:
