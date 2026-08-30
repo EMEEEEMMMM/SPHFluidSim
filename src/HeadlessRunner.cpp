@@ -1,6 +1,6 @@
 #include "HeadlessRunner.hpp"
 #include "FluidSolver.hpp"
-#include "SurfaceReconstructor.hpp"
+#include "GaussianRenderer.hpp"
 #include "OpenGLLayer.hpp"
 #include <glad/glad.h>
 #include <GLFW/glfw3.h>
@@ -48,7 +48,7 @@ void WriteBMP(const std::string& path, const unsigned char* bgra, int w, int h) 
     fwrite(header, 1, 54, f);
     std::vector<unsigned char> row(rowSize);
     // glReadPixels returns rows bottom-up (row 0 = framebuffer bottom), and a
-    // BMP also stores rows bottom-up — so write rows in order 0..h-1.
+    // BMP also stores rows bottom-up -- so write rows in order 0..h-1.
     for (int y = 0; y < h; y++) {
         const unsigned char* src = bgra + (size_t)y * w * 4;
         for (int x = 0; x < w; x++) {
@@ -130,10 +130,9 @@ int RunHeadless(const HeadlessOptions& opt) {
 
     // Surface or particle view.
     const bool showSurface = (opt.mode == HeadlessOptions::Mode::Surface);
-    layer.SetSurfaceVisible(showSurface);
+    layer.SetGaussiansVisible(showSurface);
     layer.SetParticlesVisible(!showSurface);
-    SurfaceReconstructor recon;
-    recon.SetGridScale(opt.gridScale);   // 1.0 = paper r (fast), 0.5 = r/2 high-quality
+    GaussianRenderer gauss;
 
     std::string dir = opt.output;
     if (dir.empty()) dir = "out";
@@ -161,13 +160,14 @@ int RunHeadless(const HeadlessOptions& opt) {
     const bool writeBMP = !usePipe || !pipe;
 
     std::vector<unsigned char> pixels((size_t)opt.width * opt.height * 4);   // BGRA
-    const int reconInterval = 3;   // rebuild mesh every N frames
+    const int gaussInterval = 3;   // recompute Gaussian splats every N frames
 
     printf("[headless] particles=%d (spacing=%.4f)  frames=%d  fps=%d  mode=%s  res=%dx%d\n",
            solver.FluidCount(), spacing, opt.frames, opt.fps,
            showSurface ? "surface" : "particles", opt.width, opt.height);
 
     double tWall0 = omp_get_wtime();
+    double tSim = 0, tGauss = 0, tRender = 0;
     const int dropFrame = opt.dropFrame;   // -1 = never (spawn at this frame)
     for (int f = 0; f < opt.frames; f++) {
         if (!isInflow && dropFrame >= 0 && f == dropFrame && !solver.HasDrop()) {
@@ -175,15 +175,23 @@ int RunHeadless(const HeadlessOptions& opt) {
             solver.SpawnDrop(0.2f, 1.0f, 1.6f, 0.5f);
             printf("[headless] drop spawned at frame %d (N=%d)\n", f, solver.FluidCount());
         }
+        double t0 = omp_get_wtime();
         solver.Step();
+        tSim += omp_get_wtime() - t0;
 
         layer.UpdateParticles(solver.Positions(), solver.Colors());
-        if (showSurface && (f % reconInterval == 0)) {
-            if (recon.Reconstruct(solver.Positions(), solver.Spacing()))
-                layer.UpdateSurfaceMesh(recon.Vertices(), recon.Indices());
+        if (showSurface && (f % gaussInterval == 0)) {
+            // per-particle 3D Gaussians (docs/theory.md Parts II-IV)
+            t0 = omp_get_wtime();
+            gauss.Compute(solver.Positions(), solver.Velocities(), solver.Densities(),
+                          solver.Spacing(), solver.GetParams().dt, layer.GetCamera().Position);
+            tGauss += omp_get_wtime() - t0;
+            if (gauss.SplatCount() > 0) layer.UpdateGaussianSplats(gauss.Splats());
         }
 
+        t0 = omp_get_wtime();
         layer.Render();
+        tRender += omp_get_wtime() - t0;
 
         // Read the FBO back to CPU: GL_BGRA is 4-byte aligned and needs no
         // channel swap for the BMP writer (rows stay bottom-up as in the BMP).
@@ -215,13 +223,15 @@ int RunHeadless(const HeadlessOptions& opt) {
         }
 
         if (f % 30 == 0)
-            printf("  frame %4d/%d  t=%.2fs  avg-rho-err=%.3f%%  iters=%d  tris=%d\n",
+            printf("  frame %4d/%d  t=%.2fs  avg-rho-err=%.3f%%  iters=%d  splats=%d\n",
                    f + 1, opt.frames, solver.SimTime(), 100.0 * solver.AvgDensityError(),
-                   solver.LastIterations(), layer.SurfaceTriangleCount());
+                   solver.LastIterations(), layer.SplatCount());
     }
     double tWall1 = omp_get_wtime();
     printf("[headless] done: %d frames in %.1f s (%.1f fps wall), sim time %.2f s\n",
            opt.frames, tWall1 - tWall0, opt.frames / (tWall1 - tWall0), solver.SimTime());
+    printf("[headless] timing: solver=%.1fms/frame  gauss=%.2fms/frame  render=%.1fms/frame\n",
+           1000.0 * tSim / opt.frames, 1000.0 * tGauss / opt.frames, 1000.0 * tRender / opt.frames);
 
     // Streaming path: closing the pipe makes ffmpeg finish the mp4; its exit
     // code is the real success signal (previously ignored -> "No space left on
@@ -395,7 +405,7 @@ int BenchEnergy(const HeadlessOptions& opt) {
            std::sqrt(vmaxOverall), 100.0 * maxErr);
     // Stability: no particle loss, density under control, KE not monotonically
     // growing (viscosity + wall impacts dissipate). Peak speed is reported but
-    // not judged — SPH has particle-scale pressure noise (paper does not report
+    // not judged -- SPH has particle-scale pressure noise (paper does not report
     // speeds either).
     const bool pass = (s.FluidCount() == (int)s.Positions().size()) &&
                       (maxErr < 0.02) && (keLast < keFirst * 1.5);

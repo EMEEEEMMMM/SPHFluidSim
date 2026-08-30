@@ -7,16 +7,16 @@
 
 Application::Application(int width, int height, const char* title)
     : m_Width(width), m_Height(height), m_Title(title) {
-    m_ReconThread = std::thread([this] { ReconLoop(); });
+    m_GaussThread = std::thread([this] { GaussLoop(); });
 }
 
 Application::~Application() {
     {
-        std::lock_guard<std::mutex> lk(m_ReconMutex);
-        m_ReconQuit = true;
-        m_ReconCV.notify_all();
+        std::lock_guard<std::mutex> lk(m_GaussMutex);
+        m_GaussQuit = true;
+        m_GaussCV.notify_all();
     }
-    if (m_ReconThread.joinable()) m_ReconThread.join();
+    if (m_GaussThread.joinable()) m_GaussThread.join();
     CleanUp();
 }
 
@@ -131,27 +131,33 @@ void Application::MainLoop() {
             for (int s = 0; s < m_StepsPerFrame; s++) m_Solver->Step();
         }
         m_OpenGLLayer->UpdateParticles(m_Solver->Positions(), m_Solver->Colors());
+        {
+            std::lock_guard<std::mutex> lk(m_CameraMutex);
+            m_CameraPos = m_OpenGLLayer->GetCamera().Position;
+        }
 
-        // Surface reconstruction (Akinci 2012), async: ask the worker thread for
-        // a fresh mesh every m_ReconInterval frames, then render the latest
-        // finished mesh (upload to GL only when a new one arrived).
-        m_OpenGLLayer->SetSurfaceVisible(m_ShowSurfaceMode > 0);
+        // Gaussian-splat surface (docs/theory.md 3DGS), async: ask the worker
+        // thread for fresh splats every m_GaussInterval frames, then render the
+        // latest finished list (upload to GL only when a new one arrived).
+        m_OpenGLLayer->SetGaussiansVisible(m_ShowSurfaceMode > 0);
         m_OpenGLLayer->SetParticlesVisible(m_ShowSurfaceMode != 1);  // hide particles in pure-surface mode
         if (m_ShowSurfaceMode > 0) {
-            if (++m_ReconCounter >= m_ReconInterval) {
-                m_ReconCounter = 0;
-                std::lock_guard<std::mutex> lk(m_ReconMutex);
-                if (!m_ReconPending && !m_ReconQuit) {
-                    m_ReconInput.assign(m_Solver->Positions().begin(), m_Solver->Positions().end());
-                    m_ReconPending = true;
-                    m_ReconCV.notify_one();
+            if (++m_GaussCounter >= m_GaussInterval) {
+                m_GaussCounter = 0;
+                std::lock_guard<std::mutex> lk(m_GaussMutex);
+                if (!m_GaussPending && !m_GaussQuit) {
+                    m_GaussInputX.assign(m_Solver->Positions().begin(), m_Solver->Positions().end());
+                    m_GaussInputV.assign(m_Solver->Velocities().begin(), m_Solver->Velocities().end());
+                    m_GaussInputRho.assign(m_Solver->Densities().begin(), m_Solver->Densities().end());
+                    m_GaussPending = true;
+                    m_GaussCV.notify_one();
                 }
             }
             {
-                std::lock_guard<std::mutex> lk(m_ReconMutex);
-                if (m_HaveMesh && m_UploadedVersion != m_ReconVersion) {
-                    m_OpenGLLayer->UpdateSurfaceMesh(m_ReconVerts, m_ReconIndices);
-                    m_UploadedVersion = m_ReconVersion;
+                std::lock_guard<std::mutex> lk(m_GaussMutex);
+                if (m_HaveSplats && m_UploadedVersion != m_GaussVersion) {
+                    m_OpenGLLayer->UpdateGaussianSplats(m_Splats);
+                    m_UploadedVersion = m_GaussVersion;
                 }
             }
         }
@@ -183,32 +189,37 @@ void Application::CleanUp() {
     glfwTerminate();
 }
 
-// Worker thread: wait for a particle snapshot, reconstruct the surface, publish
-// the mesh. Never touches GL or the solver — it only reads the snapshot.
-void Application::ReconLoop() {
-    SurfaceReconstructor rec;
-    float lastThreshold = -1.0f, lastGrid = -1.0f;
+// Worker thread: wait for a particle snapshot, compute the per-particle 3D
+// Gaussians (docs/theory.md Parts II-III), publish the splat list. Never
+// touches GL or the solver — it only reads the snapshot.
+void Application::GaussLoop() {
+    GaussianRenderer renderer;
     while (true) {
-        std::vector<Math::Vector3> input;
-        float thr, gs;
+        std::vector<Math::Vector3> X, V;
+        std::vector<float> rho;
+        GaussianRenderer::Params params;
+        Math::Vector3 camPos;
+        float spacing = 0.04f, dt = 0.003f;
         {
-            std::unique_lock<std::mutex> lk(m_ReconMutex);
-            m_ReconCV.wait(lk, [this] { return m_ReconQuit.load() || m_ReconPending.load(); });
-            if (m_ReconQuit.load()) return;
-            m_ReconPending = false;
-            input.swap(m_ReconInput);
-            thr = m_SurfaceThreshold;   // read under the lock (ImGui may write it)
-            gs = m_GridScale;
+            std::unique_lock<std::mutex> lk(m_GaussMutex);
+            m_GaussCV.wait(lk, [this] { return m_GaussQuit.load() || m_GaussPending.load(); });
+            if (m_GaussQuit.load()) return;
+            m_GaussPending = false;
+            X.swap(m_GaussInputX);
+            V.swap(m_GaussInputV);
+            rho.swap(m_GaussInputRho);
+            params = m_GaussParams;   // read under the lock (ImGui may write it)
+            camPos = m_CameraPos;
         }
-        if (thr != lastThreshold) { rec.SetSurfaceThreshold(thr); lastThreshold = thr; }
-        if (gs != lastGrid) { rec.SetGridScale(gs); lastGrid = gs; }
-        const bool ok = rec.Reconstruct(input, m_Solver->Spacing());
-        if (ok) {
-            std::lock_guard<std::mutex> lk(m_ReconMutex);
-            m_ReconVerts = rec.Vertices();
-            m_ReconIndices = rec.Indices();
-            m_HaveMesh = true;
-            m_ReconVersion++;
+        spacing = m_Solver->Spacing();
+        dt = m_Solver->GetParams().dt;
+        renderer.GetParams() = params;
+        renderer.Compute(X, V, rho, spacing, dt, camPos);
+        if (!renderer.Splats().empty()) {
+            std::lock_guard<std::mutex> lk(m_GaussMutex);
+            m_Splats = renderer.Splats();
+            m_HaveSplats = true;
+            m_GaussVersion++;
         }
     }
 }
@@ -341,16 +352,24 @@ void Application::RenderSimulationUI() {
     ImGui::SliderFloat("wall adhesion kb [Akinci13]", &p.surfaceTensionBoundary, 0.0f, 0.1f, "%.3f");
 
     ImGui::Separator();
-    ImGui::Text("Surface reconstruction (Akinci 2012 [32])");
+    ImGui::Text("Surface rendering (3D Gaussian splatting, docs/theory.md)");
     ImGui::RadioButton("particles", &m_ShowSurfaceMode, 0);
     ImGui::SameLine();
     ImGui::RadioButton("surface", &m_ShowSurfaceMode, 1);
     ImGui::SameLine();
     ImGui::RadioButton("both", &m_ShowSurfaceMode, 2);
+    if (m_ShowSurfaceMode > 0 && m_ShowSurfaceMode != m_LastShowSurfaceMode)
+        m_GaussCounter = m_GaussInterval;   // recompute immediately on switch
+    m_LastShowSurfaceMode = m_ShowSurfaceMode;
     if (m_ShowSurfaceMode > 0) {
-        ImGui::SliderFloat("surface threshold", &m_SurfaceThreshold, 0.3f, 0.95f, "%.2f");
-        ImGui::SliderFloat("grid scale (0.5 = r/2 HQ, 1.0 = r, 2.0 = fast)", &m_GridScale, 0.5f, 2.0f, "%.1f");
-        ImGui::SliderInt("rebuild every N frames", &m_ReconInterval, 1, 20);
-        ImGui::Text("triangles: %d", m_OpenGLLayer->SurfaceTriangleCount());
+        auto& gp = m_GaussParams;
+        ImGui::SliderFloat("surface threshold", &gp.surfaceThreshold, 0.3f, 0.95f, "%.2f");
+        ImGui::SliderFloat("stretch alpha (Sec.7.2)", &gp.stretchAlpha, 0.0f, 6.0f, "%.1f");
+        ImGui::SliderFloat("flatten min eps (Sec.7.3)", &gp.epsMin, 0.01f, 0.4f, "%.2f");
+        ImGui::SliderFloat("flatten max eps (Sec.7.3)", &gp.epsMax, 0.2f, 1.0f, "%.2f");
+        ImGui::SliderFloat("opacity base (Sec.12)", &gp.alphaBase, 0.1f, 1.0f, "%.2f");
+        ImGui::SliderFloat("foam speed vmax (Sec.10)", &gp.foamVMax, 0.5f, 5.0f, "%.1f");
+        ImGui::SliderInt("recompute every N frames", &m_GaussInterval, 1, 20);
+        ImGui::Text("splats: %d", m_OpenGLLayer->SplatCount());
     }
 }

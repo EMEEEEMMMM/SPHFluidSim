@@ -5,6 +5,7 @@
 
 #include <iostream>
 #include <filesystem>
+#include <algorithm>
 #include <GLFW/glfw3.h>
 
 OpenGLLayer::OpenGLLayer(uint32_t width, uint32_t height) {
@@ -38,6 +39,36 @@ OpenGLLayer::OpenGLLayer(uint32_t width, uint32_t height) {
 	glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)(3 * sizeof(float)));
 	glBindVertexArray(0);
 
+	// Gaussian splat surface (3DGS): instanced quads, 4 vertices per splat.
+	// Per-instance layout (stride 16 floats = 64 bytes):
+	//   loc 4: center(3)  loc 5: covDiag(3)  loc 6: covOff(3)
+	//   loc 7: color(3)   loc 8: alpha(1)
+	std::string spVert = (baseDir / "src/ShaderProgram/splat_vertex.glsl").string();
+	std::string spFrag = (baseDir / "src/ShaderProgram/splat_fragment.glsl").string();
+	m_SplatShader = new Shader(spVert, spFrag);
+	glGenVertexArrays(1, &m_SplatVAO);
+	glBindVertexArray(m_SplatVAO);
+	glGenBuffers(1, &m_SplatVBO);
+	glBindBuffer(GL_ARRAY_BUFFER, m_SplatVBO);
+	glBufferData(GL_ARRAY_BUFFER, 0, nullptr, GL_STREAM_DRAW);
+	const GLsizei splatStride = 16 * (GLsizei)sizeof(float);
+	glEnableVertexAttribArray(4);
+	glVertexAttribPointer(4, 3, GL_FLOAT, GL_FALSE, splatStride, (void*)0);
+	glVertexAttribDivisor(4, 1);
+	glEnableVertexAttribArray(5);
+	glVertexAttribPointer(5, 3, GL_FLOAT, GL_FALSE, splatStride, (void*)(3 * sizeof(float)));
+	glVertexAttribDivisor(5, 1);
+	glEnableVertexAttribArray(6);
+	glVertexAttribPointer(6, 3, GL_FLOAT, GL_FALSE, splatStride, (void*)(6 * sizeof(float)));
+	glVertexAttribDivisor(6, 1);
+	glEnableVertexAttribArray(7);
+	glVertexAttribPointer(7, 3, GL_FLOAT, GL_FALSE, splatStride, (void*)(9 * sizeof(float)));
+	glVertexAttribDivisor(7, 1);
+	glEnableVertexAttribArray(8);
+	glVertexAttribPointer(8, 1, GL_FLOAT, GL_FALSE, splatStride, (void*)(12 * sizeof(float)));
+	glVertexAttribDivisor(8, 1);
+	glBindVertexArray(0);
+
 	// Particles: instanced GL_POINTS (rendered as spheres via fragment discard).
 	// aPosInst(2)/aColorInst(3) = per-instance data, divisor 1.
 	glGenVertexArrays(1, &m_ParticleVAO);
@@ -66,6 +97,9 @@ OpenGLLayer::~OpenGLLayer() {
 	glDeleteVertexArrays(1, &m_MeshVAO);
 	glDeleteBuffers(1, &m_MeshVBO);
 	glDeleteBuffers(1, &m_MeshEBO);
+	glDeleteVertexArrays(1, &m_SplatVAO);
+	glDeleteBuffers(1, &m_SplatVBO);
+	delete m_SplatShader;
 	delete m_SurfaceShader;
 	delete m_Shader;
 	delete m_FrameBuffer;
@@ -226,6 +260,12 @@ void OpenGLLayer::Render() {
 		glBindVertexArray(0);
 	}
 
+	// Gaussian splat surface (theory.md 3DGS): transparent ellipsoids sorted
+	// far->near on the CPU, premultiplied alpha blending, no depth test.
+	if (m_ShowGaussians && m_SplatCount > 0 && m_SplatShader) {
+		DrawGaussianSplats(view, Math::radians(m_Camera.Zoom));
+	}
+
 	// Tank wireframe: drawn on top (depth test off) so the box is always visible.
 	if (m_TankVAO != 0) {
 		glDisable(GL_DEPTH_TEST);
@@ -286,5 +326,59 @@ void OpenGLLayer::UpdateSurfaceMesh(const std::vector<float>& verts,
 	// NOTE: do NOT unbind GL_ELEMENT_ARRAY_BUFFER here while the VAO is bound —
 	// that would clear m_MeshVAO's index-buffer slot to 0 and glDrawElements
 	// would run with a NULL index buffer (driver crash at present()).
+	glBindVertexArray(0);
+}
+
+void OpenGLLayer::UpdateGaussianSplats(const std::vector<Splat>& splats) {
+	m_Splats = splats;
+	m_SplatCount = splats.size();
+}
+
+void OpenGLLayer::DrawGaussianSplats(const Math::Matrix4& view, float fovYRad) {
+	const size_t n = m_Splats.size();
+	if (n == 0) return;
+
+	// Sort far -> near by camera-space depth (theory.md Sec. 17 ordering).
+	std::vector<float> depth(n);
+	for (size_t i = 0; i < n; i++) {
+		const Math::Vector3& c = m_Splats[i].center;
+		// camera-space z = view row 2 (column-major: m[col][row])
+		const float zc = view.m[0][2] * c.x + view.m[1][2] * c.y + view.m[2][2] * c.z + view.m[3][2];
+		depth[i] = -zc;
+	}
+	std::vector<int> idx(n);
+	for (size_t i = 0; i < n; i++) idx[i] = (int)i;
+	std::sort(idx.begin(), idx.end(), [&depth](int a, int b) { return depth[a] > depth[b]; });
+
+	// Interleave per-instance data: center(3) covDiag(3) covOff(3) color(3) alpha(1).
+	std::vector<float> data(n * 16);
+	for (size_t i = 0; i < n; i++) {
+		const Splat& s = m_Splats[idx[i]];
+		float* d = &data[i * 16];
+		d[0] = s.center.x; d[1] = s.center.y; d[2] = s.center.z;
+		d[3] = s.cov[0]; d[4] = s.cov[1]; d[5] = s.cov[2];
+		d[6] = s.cov[3]; d[7] = s.cov[4]; d[8] = s.cov[5];
+		d[9] = s.color[0]; d[10] = s.color[1]; d[11] = s.color[2];
+		d[12] = s.alpha;
+		d[13] = d[14] = d[15] = 0.0f;
+	}
+
+	glBindVertexArray(m_SplatVAO);
+	glBindBuffer(GL_ARRAY_BUFFER, m_SplatVBO);
+	glBufferData(GL_ARRAY_BUFFER, data.size() * sizeof(float), data.data(), GL_STREAM_DRAW);
+
+	m_SplatShader->Bind();
+	glUniformMatrix4fv(glGetUniformLocation(m_SplatShader->m_RendererID, "view"), 1, GL_FALSE, &view.m[0][0]);
+	glUniform1f(glGetUniformLocation(m_SplatShader->m_RendererID, "fovY"), fovYRad);
+	glUniform2f(glGetUniformLocation(m_SplatShader->m_RendererID, "viewport"),
+	            (float)m_FrameBuffer->GetWidth(), (float)m_FrameBuffer->GetHeight());
+
+	glDisable(GL_DEPTH_TEST);
+	glEnable(GL_BLEND);
+	glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+	glDrawArraysInstanced(GL_TRIANGLE_STRIP, 0, 4, (GLsizei)n);
+	glDisable(GL_BLEND);
+	glEnable(GL_DEPTH_TEST);
+	m_SplatShader->Unbind();
 	glBindVertexArray(0);
 }

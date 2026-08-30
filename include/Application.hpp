@@ -11,7 +11,7 @@
 #include "OpenGLLayer.hpp"
 #include "ImguiLayer.hpp"
 #include "FluidSolver.hpp"
-#include "SurfaceReconstructor.hpp"
+#include "GaussianRenderer.hpp"
 #include "Math/Vector3.hpp"
 
 class Application {
@@ -40,27 +40,30 @@ private:
     bool m_Pause = true;         // start paused, inspect before simulating
     int m_StepsPerFrame = 1;
 
-    // Surface reconstruction (Akinci et al. 2012) — async worker thread so the
-    // main loop never blocks on the scalar-field build (~130 ms at r/2, 32k
-    // particles). The main thread renders the latest finished mesh every frame.
-    std::thread m_ReconThread;
-    std::mutex m_ReconMutex;
-    std::condition_variable m_ReconCV;
-    std::atomic<bool> m_ReconQuit{false};
-    std::atomic<bool> m_ReconPending{false};
-    std::vector<Math::Vector3> m_ReconInput;   // particle snapshot for the worker
-    std::vector<float> m_ReconVerts;           // latest finished mesh (worker->main)
-    std::vector<unsigned> m_ReconIndices;
-    bool m_HaveMesh = false;
-    uint64_t m_ReconVersion = 0;               // bump when a new mesh is published
-    uint64_t m_UploadedVersion = 0;            // last mesh uploaded to GL
-    void ReconLoop();                          // worker thread body
+    // Gaussian-splat surface (docs/theory.md 3DGS path) — async worker thread
+    // so the main loop never blocks on the SPH field computation. The main
+    // thread uploads the latest finished splat list every frame.
+    std::thread m_GaussThread;
+    std::mutex m_GaussMutex;
+    std::condition_variable m_GaussCV;
+    std::atomic<bool> m_GaussQuit{false};
+    std::atomic<bool> m_GaussPending{false};
+    std::vector<Math::Vector3> m_GaussInputX;    // particle snapshot for the worker
+    std::vector<Math::Vector3> m_GaussInputV;
+    std::vector<float> m_GaussInputRho;
+    std::vector<Splat> m_Splats;                 // latest finished splats (worker->main)
+    bool m_HaveSplats = false;
+    uint64_t m_GaussVersion = 0;                 // bump when new splats are published
+    uint64_t m_UploadedVersion = 0;              // last list uploaded to GL
+    void GaussLoop();                            // worker thread body
 
-    int m_ShowSurfaceMode = 0;   // 0 = particles, 1 = surface, 2 = both
-    float m_SurfaceThreshold = 0.8f;   // color-field surface threshold
-    float m_GridScale = 0.5f;          // field grid spacing multiplier (1.0 = paper's r; 0.5 = r/2 high quality)
-    int m_ReconInterval = 3;           // ask the worker for a new mesh every N frames
-    int m_ReconCounter = 0;
+    int m_ShowSurfaceMode = 0;   // 0 = particles, 1 = surface (gaussians), 2 = both
+    int m_LastShowSurfaceMode = 0;
+    int m_GaussInterval = 3;     // recompute geometry every N frames
+    int m_GaussCounter = 0;
+    GaussianRenderer::Params m_GaussParams;      // UI-tunable, copied into the worker's renderer
+    std::mutex m_CameraMutex;
+    Math::Vector3 m_CameraPos;                   // latest camera position (for specular)
 
     float m_DeltaTime = 0.0f;
     float m_LastFrame = 0.0f;

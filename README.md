@@ -15,7 +15,7 @@ The solver, the surface reconstruction and the rendering follow the paper's refe
 ## Features
 
 - **IISPH solver** (paper Alg. 1): implicit density constraint via relaxed-Jacobi pressure solve (`omega = 0.5`, negative pressure clamped to 0, warm start `p^0 = 0.5 p(t-dt)`), CFL step limiter (`dt <= 0.4 d/vmax`, paper Sec.3.1), single-layer boundary particles with Akinci-2012 volumes, XSPH viscosity (Schechter & Bridson 2012, as in SPlisHSPlasH) and surface tension (Akinci et al. 2013: color-field normals + cohesion + curvature + boundary adhesion)
-- **Water surface reconstruction** (Akinci et al. 2012): color-field surface particles, distance-to-weighted-centroid scalar field `phi = |x - xbar| - r`, Marching Cubes lookup tables with shared-edge intersection reuse (watertight, crack-free), opaque fresnel water shader (deep-blue gradient + sun glint)
+- **Water surface rendering** (3D Gaussian Splatting, see `docs/theory.md`): every surface particle becomes a volume-conserving anisotropic ellipsoid — color-field surface normal (squeeze axis) + strain-rate eigendecomposition (stretch axis) + curvature-adaptive flattening — then the 3D covariance is projected to a screen-space ellipse and alpha-composited far-to-near on the GPU. Interior particles fall back to low-opacity isotropic spheres (theory.md Sec. 7.5) so the body reads as a volume, not an empty shell. No grid, no mesh; fully continuous, no topology changes between frames. CPU per-frame cost is ~10x lower than the Marching-Cubes scalar field (measured: 7.9 ms vs 189 ms per rebuild at 33k particles).
 - **Parallelism** (Ihmsen et al. 2011 style): SoA spatial hash built in 3 passes — atomic count -> prefix sum -> atomic scatter; no locks, cache-friendly neighbor slices; reconstruction runs on a background thread (never stalls the render loop)
 - **ImGui control panel**: pause / single step / reset, resolution presets, solver parameters, surface parameters, particles/surface/both view modes, FPS + tank label overlay (top-left)
 - **Headless mode**: offline simulation -> offscreen render -> ffmpeg streaming encode (frames piped straight to the encoder, no BMPs on disk; ~500 MB mp4 instead of ~90 GB of BMPs for a 14400-frame 1080p run)
@@ -50,7 +50,7 @@ This uses a single-configuration generator (MinGW Makefiles), so the build type 
 - **Spawn water drop** (dam scene) — one-shot button: spawns a spherical blob above the open tank rim that falls into the water
 - **Resolution** — low (8k) .. ultra (64k) particles; changing it resets the scene
 - **View** — particles / surface / both
-- **Surface** — threshold (0.8), grid scale (1.0 fine .. 2.0 fast), rebuild interval
+- **Surface** — Gaussian splatting controls: surface threshold, stretch alpha, flattening range (Sec. 7.2/7.3), opacity, foam speed, recompute interval
 - Camera: right-drag to look, WASD to move, scroll to zoom
 
 ---
@@ -90,7 +90,7 @@ water volume - only the resolution changes.
 | `--fps N` | 30 | video frame rate |
 | `-r WxH` | 1280x720 | render resolution |
 | `--output PATH` | `out` | output directory (`output.mp4`, or `frames/` with `--no-video`/`--keep-frames`) |
-| `--mode MODE` | `surface` | `particles` (points) or `surface` (reconstructed mesh) |
+| `--mode MODE` | `surface` | `particles` (points) or `surface` (3D Gaussian splat surface) |
 | `--particles N` | 8000 | target number of fluid particles (spacing = (scene water volume / N)^(1/3)) |
 | `--scene S` | `dam` | `dam` \| `inflow` (see Scenes above) |
 | `--drop N[f/s]` | off | spawn the one-shot water drop at frame N, or N seconds in (`20f`/`20s`; dam only) |

@@ -8,6 +8,7 @@
 #include "Shader.h"
 #include "Camera.hpp"
 #include "Math/Vector3.hpp"
+#include "GaussianRenderer.hpp"
 #include <vector>
 
 enum class ProjectionMode { Perspective, Orthographic };
@@ -51,8 +52,15 @@ public:
     bool SurfaceVisible() const { return m_ShowSurface; }
     int  SurfaceTriangleCount() const { return m_MeshIndexCount / 3; }
 
+    // Gaussian-splat surface (theory.md 3DGS path): per-particle ellipsoids
+    // sorted far->near and alpha-composited with premultiplied blending.
+    void UpdateGaussianSplats(const std::vector<Splat>& splats);
+    void SetGaussiansVisible(bool v) { m_ShowGaussians = v; }
+    int  SplatCount() const { return (int)m_SplatCount; }
+
 private:
     void InitGeometry();
+    void DrawGaussianSplats(const Math::Matrix4& view, float fovYRad);
     GLuint m_VAO = 0;
     GLuint m_VBO = 0;
     GLuint m_EBO = 0;
@@ -83,4 +91,12 @@ private:
     GLuint m_ParticleInstanceVBO = 0; // per-instance pos(3)+color(3)
     size_t m_ParticleCount = 0;
     float m_ParticleScale = 0.012f;   // particle radius (set from spacing)
+
+    // Gaussian splat surface (theory.md 3DGS path).
+    GLuint m_SplatVAO = 0;
+    GLuint m_SplatVBO = 0;
+    Shader* m_SplatShader = nullptr;
+    std::vector<Splat> m_Splats;
+    size_t m_SplatCount = 0;
+    bool m_ShowGaussians = false;
 };

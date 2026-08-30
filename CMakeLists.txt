@@ -61,6 +61,7 @@ add_executable(${PROJECT_NAME}
     src/OpenGLLayer.cpp
     src/ImguiLayer.cpp
     src/FluidSolver.cpp
+    src/GaussianRenderer.cpp
     src/SurfaceReconstructor.cpp
     src/SurfaceReconstructorCL.cpp
     src/HeadlessRunner.cpp
@@ -104,3 +105,10 @@ add_headless_test(surface_reconstruct)
 # the surface test also needs the reconstructor
 target_sources(surface_reconstruct PRIVATE src/SurfaceReconstructor.cpp src/SurfaceReconstructorCL.cpp)
 target_link_libraries(surface_reconstruct PRIVATE ${OpenCL_LIBRARIES})
+
+# diagnostic probe for the Gaussian splatting renderer (color-field stats,
+# per-splat dump, timing) — not part of the automated test suite
+add_executable(gaussian_probe tests/gaussian_probe.cpp src/FluidSolver.cpp src/GaussianRenderer.cpp)
+target_include_directories(gaussian_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(gaussian_probe PRIVATE OpenMP::OpenMP_CXX)
+target_compile_options(gaussian_probe PRIVATE -fopenmp)
