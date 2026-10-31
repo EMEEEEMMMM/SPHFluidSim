@@ -1,6 +1,6 @@
 # IISPH — Reproduction of "Implicit Incompressible SPH"
 
-A from-scratch, real-time reproduction of **Implicit Incompressible SPH** (Ihmsen et al., IEEE TVCG 2013) in C++17 + OpenGL 3.3 + ImGui + OpenMP, running on Windows (MinGW + CMake).
+A from-scratch, real-time reproduction of **Implicit Incompressible SPH** (Ihmsen et al., IEEE TVCG 2013) and a **Divergence-Free SPH** solver (Bender & Koschier 2017), in C++17 + OpenGL 3.3 + ImGui + OpenMP, running on Windows (MinGW + CMake).
 
 The solver, the surface reconstruction and the rendering follow the paper's reference implementation (SPlisHSPlasH) formula-for-formula. The focus is **physical correctness** (density error < 0.01% like the paper, relaxed-Jacobi pressure iterations) at interactive speed (33k particles ~ 14 ms/step on a desktop CPU, 20 threads).
 
@@ -9,7 +9,7 @@ The solver, the surface reconstruction and the rendering follow the paper's refe
 <div align="center">
   <img src="./assets/output.gif" alt="演示动画" width="700">
   <br>
-  <small>IISPH.exe --headless --seconds 20 --output demo_dam --fps 120 -r 1920x1080 --scene dam --drop 5s --grid 0.5 --particles 64000 --solver df sph</small>
+  <small>IISPH.exe --headless --seconds 20 --output demo_dam --fps 120 -r 1920x1080 --scene dam --drop 5s --grid 0.5 --particles 64000 --solver DFSPH</small>
 </div>
 
 ## Features
@@ -18,7 +18,10 @@ The solver, the surface reconstruction and the rendering follow the paper's refe
 - **Water surface reconstruction** (Akinci et al. 2012): color-field surface particles, distance-to-weighted-centroid scalar field `phi = |x - xbar| - r`, Marching Cubes lookup tables with shared-edge intersection reuse (watertight, crack-free), opaque fresnel water shader (deep-blue gradient + sun glint)
 - **Parallelism** (Ihmsen et al. 2011 style): SoA spatial hash built in 3 passes — atomic count -> prefix sum -> atomic scatter; no locks, cache-friendly neighbor slices; reconstruction runs on a background thread (never stalls the render loop)
 - **ImGui control panel**: pause / single step / reset, resolution presets, solver parameters, surface parameters, particles/surface/both view modes, FPS + tank label overlay (top-left)
+- **DFSPH solver** (Bender & Koschier 2017, `--solver DFSPH`): constant-density + divergence-free solvers with warm start, sharing the same boundary / XSPH / surface-tension passes as IISPH
+- **Deterministic pressure solve**: the IISPH iteration reads the previous pressure and writes the next one (`m_P` / `m_Pold`, strict relaxed Jacobi), so results no longer depend on thread scheduling
 - **Headless mode**: offline simulation -> offscreen render -> ffmpeg streaming encode (frames piped straight to the encoder, no BMPs on disk; ~500 MB mp4 instead of ~90 GB of BMPs for a 14400-frame 1080p run)
+- **Particle export** (headless only): `--export-particles` dumps one binary PLY per frame for Houdini / Blender, with a disk-space pre-check before the simulation starts
 
 ---
 
@@ -32,7 +35,7 @@ cmake .. && cmake --build .
 IISPH.exe
 ```
 
-The default configuration is **Debug**. For the fast build (recommended for the real-time demo; Debug is ~5x slower), configure a Release build explicitly:
+The default configuration is **Debug**. For the fast build (recommended for the real-time demo; measured 0.97 s/step vs 0.23 s/step at 100k particles, i.e. ~4x), configure a Release build explicitly:
 
 ```powershell
 cd build
@@ -91,6 +94,7 @@ water volume - only the resolution changes.
 | `-r WxH` | 1280x720 | render resolution |
 | `--output PATH` | `out` | output directory (`output.mp4`, or `frames/` with `--no-video`/`--keep-frames`) |
 | `--mode MODE` | `surface` | `particles` (points) or `surface` (reconstructed mesh) |
+| `--solver S` | `IISPH` | `IISPH` \| `DFSPH` (case-insensitive; DFSPH = Bender & Koschier 2017) |
 | `--particles N` | 8000 | target number of fluid particles (spacing = (scene water volume / N)^(1/3)) |
 | `--scene S` | `dam` | `dam` \| `inflow` (see Scenes above) |
 | `--drop N[f/s]` | off | spawn the one-shot water drop at frame N, or N seconds in (`20f`/`20s`; dam only) |
@@ -99,6 +103,7 @@ water volume - only the resolution changes.
 | `--threads N` | all cores | OpenMP thread count |
 | `--no-video` | off | write BMP frames only, skip ffmpeg encode (debug / manual encode) |
 | `--keep-frames` | off | write BMP frames too and keep them after encoding (old behaviour) |
+| `--export-particles` | off | dump per-frame particle positions to `<output>/particles/frame_%04d.ply` (binary PLY, headless only) |
 | `--bench NAME` | — | run a validation experiment and exit (see below) |
 
 ### Examples
@@ -119,6 +124,9 @@ IISPH.exe --headless --seconds 20 --mode particles --particles 33000 --dt 0.002 
 # render frames only (no ffmpeg), then encode manually
 IISPH.exe --headless --frames 120 --no-video --output raw
 ffmpeg -framerate 30 -i raw/frames/frame_%04d.bmp -pix_fmt yuv420p raw.mp4
+
+# DFSPH + per-frame particle positions for Houdini / Blender
+IISPH.exe --headless --seconds 20 --fps 120 -r 1920x1080 --particles 100000 --solver DFSPH --export-particles --output dam_ply
 ```
 
 ---
@@ -140,24 +148,8 @@ Latest numbers (this machine, 20 threads):
 | hydrostatic (64k particles) | pressure-depth slope -10.6 .. -11.6 (theory -9.81; SPH noise at 0.025 spacing, criterion < -2) |
 | dambreak | peak avg density error 0.30% (paper ~0.1% converged), avg 2.8 pressure iterations (paper Table 1: 2.2-33.5) |
 | energy | KE monotonically decays via viscosity; no NaN, no escapes, density < 2% |
-| performance | 33k particles ~ 14 ms/sim-step; reconstruction ~20 ms @ grid 1.0, ~100 ms @ grid 0.5 (background thread) |
-
----
-
-## Headless tests
-
-| target | what it verifies |
-|---|---|
-| `test_solver` | dam break: density error < 5%, no particle escapes |
-| `verify_hydrostatic` | hydrostatic: pressure grows linearly with depth, volume conserved |
-| `surface_reconstruct` | surface mesh: non-empty, normals mostly outward, timing |
-| `benchmark` | one-step convergence trace, iterations vs dt, strong scaling |
-
-```powershell
-IISPH/build/test_solver.exe 1000
-IISPH/build/verify_hydrostatic.exe 300
-IISPH/build/surface_reconstruct.exe
-```
+| performance (solver) | Release is ~4.2x faster than Debug (0.23 vs 0.97 s/step at 100k particles, 16 threads; 0.44 / 1.89 at 200k) |
+| performance (surface) | reconstruction ~20 ms @ grid 1.0, ~100 ms @ grid 0.5 (background thread) |
 
 ---
 

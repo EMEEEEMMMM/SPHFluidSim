@@ -22,5 +22,5 @@ int main() {
     for (int k = 0; k < 300; k++) s.Step();
     printf("封顶后 300 步: N=%d (应保持 %d)\n", s.FluidCount(), n0);
     printf("%s\n", (s.FluidCount() == n0 && n0 <= 8000) ? "PASS" : "FAIL");
-    return 0;
+    return (s.FluidCount() == n0 && n0 <= 8000) ? 0 : 1;   // a printed FAIL must also fail
 }

@@ -19,6 +19,10 @@ struct HeadlessOptions {
     int    threads   = 0;       // OpenMP threads (0 = all)
     bool   noVideo   = false;   // skip ffmpeg assembly, keep the BMP frames
     bool   keepFrames = false;  // keep frames/ after assembling the video
+    // Headless only: dump every frame's particle positions as <output>/particles/
+    // frame_%04d.ply (binary little-endian, 3 floats per vertex) for Houdini /
+    // Blender. The GUI has no equivalent switch.
+    bool   exportParticles = false;
 };
 
 // Runs the offline simulation and renders frames; returns 0 on success.

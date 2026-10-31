@@ -64,6 +64,8 @@ private:
     GLuint m_MeshVBO = 0;
     GLuint m_MeshEBO = 0;
     GLsizei m_MeshIndexCount = 0;
+    size_t m_MeshVBOBytes = 0;   // allocated capacity (grow-only, see UpdateSurfaceMesh)
+    size_t m_MeshEBOBytes = 0;
     Shader* m_SurfaceShader = nullptr;
     bool m_ShowSurface = false;
     bool m_ShowParticles = true;   // false in pure-surface mode
@@ -82,5 +84,6 @@ private:
     GLuint m_ParticleVBO = 0;         // unused (instance VBO is the geometry)
     GLuint m_ParticleInstanceVBO = 0; // per-instance pos(3)+color(3)
     size_t m_ParticleCount = 0;
+    size_t m_ParticleInstanceBytes = 0;   // allocated capacity (grow-only)
     float m_ParticleScale = 0.012f;   // particle radius (set from spacing)
 };

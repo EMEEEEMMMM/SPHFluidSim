@@ -443,8 +443,8 @@ void SurfaceReconstructor::MarchingCubes(const std::vector<Math::Vector3>& parti
     // GPU path: m_surfNormal is empty (normals were not read back). Rebuild the
     // corner normals numerically from the field gradient, lazily cached, only
     // for the corners that survive the 8-of-8 cull.
-    std::vector<Math::Vector3> lazyNrm;
-    std::vector<uint8_t> lazyDone;
+    std::vector<Math::Vector3>& lazyNrm = m_mcLazyNrm;
+    std::vector<uint8_t>& lazyDone = m_mcLazyDone;
     auto cornerNrmLazy = [&](int fw, int fh, int cx, int cy, int cz, int ci) -> Math::Vector3 {
         size_t idx = cornerIdx(fw, fh, cx, cy, cz, ci);
         if (!lazyDone[idx]) {
@@ -464,8 +464,11 @@ void SurfaceReconstructor::MarchingCubes(const std::vector<Math::Vector3>& parti
     // three edge ids for the edges leaving it (+x, +y, +z). Triangulation is
     // serial, exactly as in the paper ("The triangulation process is not
     // parallelized, since it takes a rather small amount of time").
-    std::vector<int> edgePoint(nVerts * 3, -1);
-    std::vector<float> pointData; // pos(3)+normal(3) per shared intersection point
+    std::vector<int>& edgePoint = m_mcEdgePoint;
+    std::vector<float>& pointData = m_mcPointData;  // pos(3)+normal(3) per point
+    edgePoint.assign(nVerts * 3, -1);
+    pointData.clear();
+    if (pointData.capacity() < 4096) pointData.reserve(4096);
     lazyNrm.assign(nVerts, Math::Vector3(0.0f, 0.0f, 0.0f));
     lazyDone.assign(nVerts, 0);
     m_indices.clear();
@@ -477,7 +480,8 @@ void SurfaceReconstructor::MarchingCubes(const std::vector<Math::Vector3>& parti
     // Narrow band (paper Alg. 1): pre-mark cells that contain at least one
     // surface vertex, so the march skips the (vast) empty volume cells. Each
     // surface vertex is a corner of up to 8 cells.
-    std::vector<uint8_t> cellMark((size_t)ncells, 0);
+    std::vector<uint8_t>& cellMark = m_mcCellMark;
+    cellMark.assign((size_t)ncells, 0);
     for (size_t idx = 0; idx < m_surfVert.size(); idx++) {
         if (!m_surfVert[idx]) continue;
         const int vcz = (int)(idx / ((size_t)fw * fh));
@@ -562,7 +566,9 @@ void SurfaceReconstructor::MarchingCubes(const std::vector<Math::Vector3>& parti
             }
 
     // indexed mesh: vertices = shared intersection points, indices reference them
-    m_verts.swap(pointData);
+    // (copy out of the reusable scratch buffer instead of swapping it away, so
+    // the next rebuild reuses the same committed storage)
+    m_verts.assign(pointData.begin(), pointData.end());
 }
 
 

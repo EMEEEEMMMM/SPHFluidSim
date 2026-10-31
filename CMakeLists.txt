@@ -98,9 +98,24 @@ endfunction()
 add_headless_test(test_solver)
 add_headless_test(test_inflow)
 add_headless_test(test_drop)
+add_headless_test(test_boundary)
 add_headless_test(verify_hydrostatic)
 add_headless_test(benchmark)
 add_headless_test(surface_reconstruct)
 # the surface test also needs the reconstructor
 target_sources(surface_reconstruct PRIVATE src/SurfaceReconstructor.cpp src/SurfaceReconstructorCL.cpp)
 target_link_libraries(surface_reconstruct PRIVATE ${OpenCL_LIBRARIES})
+
+# ctest integration: `ctest --test-dir build` runs the numerical regressions.
+# (Previously there were no add_test() calls at all, so ctest reported
+# "No tests were found" and nothing could fail the suite.)
+enable_testing()
+add_test(NAME solver      COMMAND test_solver)
+add_test(NAME inflow      COMMAND test_inflow)
+add_test(NAME drop        COMMAND test_drop)
+add_test(NAME boundary    COMMAND test_boundary)
+add_test(NAME hydrostatic COMMAND verify_hydrostatic 200)
+add_test(NAME surface     COMMAND surface_reconstruct)
+# DFSPH path: separate case because the warm start and the divergence solver
+# are only exercised with solver == 1 (and the test asserts the iteration count).
+add_test(NAME dfsph       COMMAND test_solver 120 0.003 0 0.1 DFSPH)

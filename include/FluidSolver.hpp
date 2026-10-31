@@ -77,13 +77,23 @@ public:
     float SimTime() const { return m_Time; }
     float AvgDensityError() const { return m_AvgErr; }
     int   LastIterations() const { return m_LastIter; }
+    float LastPressureTimeMs() const { return m_LastPressureMs; }   // wall time of the last pressure solve
     int   DivergenceIterations() const { return m_LastIterV; }   // DFSPH divergence solver
     int   FluidCount() const { return m_N; }
     int   BoundaryCount() const { return static_cast<int>(m_BoundX.size()); }
+    // wall-particle positions (for boundary invariants in tests)
+    const std::vector<Math::Vector3>& BoundaryPositions() const { return m_BoundX; }
     Params& GetParams() { return params; }
     float  KernelRadius() const { return m_h; }
     float  Spacing() const { return params.spacing; }
     const std::vector<float>& Pressures() const { return m_P; }   // normalized pressure
+    // Density-error diagnostics. AvgDensityError() (above) is the SIGNED
+    // average the solvers use internally (IISPH: algebraic residual, DFSPH:
+    // mean rho*-1); a signed mean can cancel a compressed and a dilated region,
+    // so these two report the local picture the mean hides. Normalized units
+    // (1.0 = rest density).
+    float MeanAbsDensityError() const { return m_AvgAbsErr; }
+    float MaxDensityError() const { return m_MaxErr; }
     // fluid-neighbor count of particle i (free-surface detection)
     int    NeighborCount(int i) const { return (int)m_FluidNb[i].size(); }
     int    MaxNeighbors() const { int m = 0; for (const auto& n : m_FluidNb) m = std::max(m, (int)n.size()); return m; }
@@ -129,6 +139,7 @@ private:
     std::vector<Math::Vector3> m_S;                // Pass-1 result: sum_j d_ij * p_j (vector, NO dt^2)
     std::vector<float> m_Rho, m_RhoAdv;            // NORMALIZED density rho/rho0, predicted density
     std::vector<float> m_P, m_Pprev;               // pressure (normalized), previous pressure (warm start)
+    std::vector<float> m_Pold;                     // IISPH Jacobi: previous-iteration pressure (read-only)
     std::vector<float> m_aii;                      // Eqn.(12) diagonal (scalar, NO dt^2, incl. boundary)
     std::vector<float> m_deltaB;                   // boundary density contribution: sum_b V_b W(x_i-x_b)
     std::vector<Math::Vector3> m_gradB;            // sum_b V_b gradW(x_i-x_b)
@@ -139,6 +150,7 @@ private:
     std::vector<float> m_Alpha;                    // DFSPH factor alpha_i (paper Eq. 8 denominator inverse)
     std::vector<float> m_KappaV;                   // DFSPH divergence-solver stiffness (p/rho^2 form)
     std::vector<float> m_KappaVPrev;               // DFSPH divergence-solver kappa_v*h (warm start seed)
+    std::vector<float> m_KappaSeed;                // divergence warm-start seed, in kappa_v units
     int m_LastIterV = 0;                           // DFSPH divergence-solver iterations
     std::vector<float> m_Colors;                   // per-particle RGB (velocity colored)
     bool m_traceNext = false;                      // record the next pressure solve's error trace
@@ -189,5 +201,8 @@ private:
     int m_N = 0;
     float m_Time = 0.0f;
     float m_AvgErr = 0.0f;
+    float m_AvgAbsErr = 0.0f;   // mean |density error| of the last solve
+    float m_MaxErr = 0.0f;      // max  |density error| of the last solve
     int m_LastIter = 0;
+    float m_LastPressureMs = 0.0f;
 };

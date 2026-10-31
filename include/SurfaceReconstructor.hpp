@@ -113,6 +113,18 @@ private:
     std::vector<float> m_verts;
     std::vector<unsigned> m_indices;
 
+    // Marching Cubes scratch, kept as members and reused frame to frame: at
+    // r/2 field resolution these run to hundreds of MB per rebuild (a 100k-
+    // particle dam break: ~78 MB edge table + ~78 MB lazy normals + flags).
+    // Re-allocating them every rebuild (every 3rd frame) churns the heap and
+    // leaves the committed size growing for the whole run, which on Windows
+    // eventually makes a later allocation throw std::bad_alloc.
+    std::vector<int>           m_mcEdgePoint;   // nVerts*3, shared edge ids
+    std::vector<float>         m_mcPointData;   // pos(3)+normal(3) per point
+    std::vector<Math::Vector3> m_mcLazyNrm;
+    std::vector<uint8_t>       m_mcLazyDone;
+    std::vector<uint8_t>       m_mcCellMark;    // narrow-band cell mask
+
     // optional OpenCL backend (GPU scalar-field construction; CPU Marching Cubes)
     std::unique_ptr<SurfaceReconstructorCL> m_gpu;
 };

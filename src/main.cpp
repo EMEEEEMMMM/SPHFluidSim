@@ -4,6 +4,7 @@
 #include <cstring>
 #include <string>
 #include <cstdlib>
+#include <cctype>
 
 // ---------------------------------------------------------------------------
 // CLI:
@@ -34,6 +35,31 @@ static std::string ValueAfter(const char* arg, const char* name) {
     return std::string(arg + std::strlen(name));
 }
 
+// --solver takes IISPH or DFSPH, case-insensitive. "df" / "df sph" stay as
+// aliases so older command lines keep working; they are not advertised.
+static std::string NormalizeSolver(const std::string& v) {
+    std::string s;
+    for (char c : v) {
+        if (c == ' ' || c == '\t' || c == '-') continue;
+        s += (char)std::tolower((unsigned char)c);
+    }
+    if (s == "iisph") return "iisph";
+    if (s == "dfsph" || s == "df") return "dfsph";
+    return std::string();
+}
+
+// -r WxH / -r=WxH -> width/height. The "-r=" form used to be matched by an
+// empty branch and silently ignored.
+static bool ParseResolution(const std::string& r, HeadlessOptions& opt) {
+    const size_t x = r.find('x');
+    if (x == std::string::npos) return false;
+    const int w = atoi(r.substr(0, x).c_str());
+    const int h = atoi(r.substr(x + 1).c_str());
+    if (w <= 0 || h <= 0) return false;
+    opt.width = w; opt.height = h;
+    return true;
+}
+
 // --drop <N>[f|s]: N frames (default), or N seconds (N*fps frames). "20f" -> frame
 // 20, "20s" -> frame 20*fps (for --fps 30: frame 600).
 static int ParseDropFrame(const std::string& v, int fps) {
@@ -46,6 +72,7 @@ static int ParseDropFrame(const std::string& v, int fps) {
 int main(int argc, char** argv) {
     bool headless = false;
     std::string benchName;   // --bench is run AFTER parsing all options
+    std::string dropSpec;    // parsed after the loop: "5s" needs the FINAL --fps
     HeadlessOptions opt;
 
     for (int i = 1; i < argc; i++) {
@@ -58,11 +85,17 @@ int main(int argc, char** argv) {
         else if (Match(a, "--frames") && i + 1 < argc) { opt.frames = atoi(argv[++i]); }
         else if (MatchPrefix(a, "--seconds=")) { opt.seconds = atof(ValueAfter(a, "--seconds=").c_str()); }
         else if (Match(a, "--seconds") && i + 1 < argc) { opt.seconds = atof(argv[++i]); }
-        else if (MatchPrefix(a, "-r=")) { /* -r=WxH */ }
+        else if (MatchPrefix(a, "-r=")) {
+            if (!ParseResolution(ValueAfter(a, "-r="), opt)) {
+                printf("[args] ERROR: invalid resolution '%s' (expected WxH, e.g. 1920x1080)\n", a);
+                return 1;
+            }
+        }
         else if (Match(a, "-r") && i + 1 < argc) {
-            const std::string r = argv[++i];
-            const size_t x = r.find('x');
-            if (x != std::string::npos) { opt.width = atoi(r.substr(0, x).c_str()); opt.height = atoi(r.substr(x + 1).c_str()); }
+            if (!ParseResolution(argv[++i], opt)) {
+                printf("[args] ERROR: invalid resolution (expected WxH, e.g. 1920x1080)\n");
+                return 1;
+            }
         }
         else if (MatchPrefix(a, "--output=")) { opt.output = ValueAfter(a, "--output="); }
         else if (Match(a, "--output") && i + 1 < argc) { opt.output = argv[++i]; }
@@ -88,14 +121,15 @@ int main(int argc, char** argv) {
                 i++;
             }
         }
-        else if (MatchPrefix(a, "--drop=")) { opt.dropFrame = ParseDropFrame(ValueAfter(a, "--drop="), opt.fps); }
-        else if (Match(a, "--drop") && i + 1 < argc) { opt.dropFrame = ParseDropFrame(argv[++i], opt.fps); }
+        else if (MatchPrefix(a, "--drop=")) { dropSpec = ValueAfter(a, "--drop="); }
+        else if (Match(a, "--drop") && i + 1 < argc) { dropSpec = argv[++i]; }
         else if (MatchPrefix(a, "--grid=")) { opt.gridScale = (float)atof(ValueAfter(a, "--grid=").c_str()); }
         else if (Match(a, "--grid") && i + 1 < argc) { opt.gridScale = (float)atof(argv[++i]); }
         else if (MatchPrefix(a, "--threads=")) { opt.threads = atoi(ValueAfter(a, "--threads=").c_str()); }
         else if (Match(a, "--threads") && i + 1 < argc) { opt.threads = atoi(argv[++i]); }
         else if (Match(a, "--no-video"))      { opt.noVideo = true; }
         else if (Match(a, "--keep-frames"))   { opt.keepFrames = true; }
+        else if (Match(a, "--export-particles")) { opt.exportParticles = true; }
         else if (MatchPrefix(a, "--bench="))  { benchName = ValueAfter(a, "--bench="); }
         else if (Match(a, "--bench") && i + 1 < argc) { benchName = argv[++i]; }
         else if (Match(a, "--help") || Match(a, "-h")) {
@@ -110,18 +144,58 @@ int main(int argc, char** argv) {
                    "  --mode <m>       particles | surface (default surface)\n"
                    "  --particles <n>  approx. fluid particles (default 8000)\n"
                    "  --scene <s>      dam | inflow (default dam; dam tank is open-top)\n"
-                   "  --solver <s>     iisph | df sph (default iisph; DFSPH = Bender & Koschier 2017)\n"
+                   "  --solver <s>     IISPH | DFSPH (default IISPH; DFSPH = Bender & Koschier 2017)\n"
                    "  --drop <N>[f|s]  spawn the one-shot water drop at frame N, or N seconds in ('20f'/'20s', dam only)\n"
                    "  --dt <s>         fixed timestep\n"
                    "  --threads <n>    OpenMP threads\n"
                    "  --no-video       keep BMP frames only\n"
                    "  --keep-frames    keep frames after assembling video\n"
+                   "  --export-particles  dump per-frame particle positions as PLY (headless only)\n"
                    "  --bench <name>   hydrostatic | dambreak | energy\n");
             return 0;
         }
         else {
             printf("Unknown argument: %s (use --help)\n", a);
             return 1;
+        }
+    }
+
+    // --drop depends on the FINAL fps, whatever order the flags were given in.
+    if (!dropSpec.empty()) opt.dropFrame = ParseDropFrame(dropSpec, opt.fps);
+
+    // Validate before doing any work: a typo used to be accepted silently
+    // (0 frames, 0x0 render target, negative particle count, ...).
+    if (opt.width <= 0 || opt.height <= 0 || opt.width > 16384 || opt.height > 16384) {
+        printf("[args] ERROR: invalid resolution %dx%d (use -r WxH, 1..16384)\n", opt.width, opt.height);
+        return 1;
+    }
+    if (opt.fps <= 0 || opt.fps > 1000) {
+        printf("[args] ERROR: invalid --fps %d (1..1000)\n", opt.fps);
+        return 1;
+    }
+    if (opt.frames <= 0) {
+        printf("[args] ERROR: invalid frame count %d (--frames / --seconds)\n", opt.frames);
+        return 1;
+    }
+    if (opt.particles <= 0) {
+        printf("[args] ERROR: invalid --particles %d (>0)\n", opt.particles);
+        return 1;
+    }
+    if (!(opt.gridScale > 0.0f) || opt.gridScale > 4.0f) {
+        printf("[args] ERROR: invalid --grid %.3f (0 < grid <= 4)\n", opt.gridScale);
+        return 1;
+    }
+    if (opt.dt < 0.0f) {
+        printf("[args] ERROR: invalid --dt %.5f (>=0; 0 = CFL)\n", opt.dt);
+        return 1;
+    }
+    {
+        const std::string norm = NormalizeSolver(opt.solver);
+        if (norm.empty()) {
+            printf("[args] WARNING: unknown --solver '%s' -> using IISPH (valid: IISPH | DFSPH)\n", opt.solver.c_str());
+            opt.solver = "iisph";
+        } else {
+            opt.solver = norm;
         }
     }
 

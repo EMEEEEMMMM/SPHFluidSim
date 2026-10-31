@@ -1,3 +1,7 @@
 build
+build-*
+out/
 .reasonix
 reasonix.toml
+docs
+tests

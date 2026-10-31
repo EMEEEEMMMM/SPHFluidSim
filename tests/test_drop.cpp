@@ -19,5 +19,10 @@ int main(int argc, char** argv) {
         }
     }
     printf("池=%.1fm 粘=%.1f: peak v=%.1f escaped=%d\n", ph, vis, peakV, nEsc);
-    return 0;
+    // Regression assertions: this test used to only print numbers and always
+    // exit 0, so it could never fail. peakV is capped by the 4 m/s splash
+    // clamp; nothing may leave the tank.
+    const bool pass = (nEsc == 0) && (peakV < 4.5f) && (s.FluidCount() > 0);
+    printf(pass ? "PASS\n" : "FAIL\n");
+    return pass ? 0 : 1;
 }

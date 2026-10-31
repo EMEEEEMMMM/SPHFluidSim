@@ -228,6 +228,11 @@ void OpenGLLayer::Render() {
 
 	// Tank wireframe: drawn on top (depth test off) so the box is always visible.
 	if (m_TankVAO != 0) {
+		// Re-bind unconditionally: the surface pass ends with
+		// m_SurfaceShader->Unbind() (glUseProgram(0)), and in pure-surface mode
+		// (m_ShowParticles == false) the particle pass that would re-bind
+		// m_Shader is skipped - the wireframe then drew with no program bound.
+		m_Shader->Bind();
 		glDisable(GL_DEPTH_TEST);
 		glLineWidth(1.5f);
 		glBindVertexArray(m_TankVAO);
@@ -259,7 +264,18 @@ void OpenGLLayer::UpdateParticles(const std::vector<Math::Vector3>& positions,
 	}
 
 	glBindBuffer(GL_ARRAY_BUFFER, m_ParticleInstanceVBO);
-	glBufferData(GL_ARRAY_BUFFER, data.size() * sizeof(float), data.data(), GL_DYNAMIC_DRAW);
+	// Grow-only allocation. glBufferData is NOT called every frame: each call
+	// makes the driver allocate a fresh buffer object and park the old one in
+	// its deferred-delete queue, which a headless run (no present/SwapBuffers
+	// to advance the frame) never drains — committed memory then grows by the
+	// full per-frame buffer size until a std::bad_alloc ends the run.
+	const size_t bytes = data.size() * sizeof(float);
+	if (bytes > m_ParticleInstanceBytes) {
+		glBufferData(GL_ARRAY_BUFFER, bytes, data.data(), GL_DYNAMIC_DRAW);
+		m_ParticleInstanceBytes = bytes;
+	} else if (bytes > 0) {
+		glBufferSubData(GL_ARRAY_BUFFER, 0, bytes, data.data());
+	}
 	glBindBuffer(GL_ARRAY_BUFFER, 0);
 }
 
@@ -278,10 +294,25 @@ void OpenGLLayer::UpdateSurfaceMesh(const std::vector<float>& verts,
 	// VAO and m_MeshVAO keeps an EMPTY index buffer (=> garbage triangles).
 	glBindVertexArray(m_MeshVAO);
 	// verts are already interleaved pos(3)+normal(3) from the reconstructor.
+	// Grow-only allocation: re-specifying the storage every rebuild (that is,
+	// every 3rd frame) leaves an orphaned buffer in the driver's deferred-delete
+	// queue, which a headless run never drains (see UpdateParticles).
 	glBindBuffer(GL_ARRAY_BUFFER, m_MeshVBO);
-	glBufferData(GL_ARRAY_BUFFER, verts.size() * sizeof(float), verts.data(), GL_DYNAMIC_DRAW);
+	const size_t vbytes = verts.size() * sizeof(float);
+	if (vbytes > m_MeshVBOBytes) {
+		glBufferData(GL_ARRAY_BUFFER, vbytes, verts.data(), GL_DYNAMIC_DRAW);
+		m_MeshVBOBytes = vbytes;
+	} else {
+		glBufferSubData(GL_ARRAY_BUFFER, 0, vbytes, verts.data());
+	}
 	glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, m_MeshEBO);
-	glBufferData(GL_ELEMENT_ARRAY_BUFFER, indices.size() * sizeof(unsigned), indices.data(), GL_DYNAMIC_DRAW);
+	const size_t ibytes = indices.size() * sizeof(unsigned);
+	if (ibytes > m_MeshEBOBytes) {
+		glBufferData(GL_ELEMENT_ARRAY_BUFFER, ibytes, indices.data(), GL_DYNAMIC_DRAW);
+		m_MeshEBOBytes = ibytes;
+	} else {
+		glBufferSubData(GL_ELEMENT_ARRAY_BUFFER, 0, ibytes, indices.data());
+	}
 	glBindBuffer(GL_ARRAY_BUFFER, 0);
 	// NOTE: do NOT unbind GL_ELEMENT_ARRAY_BUFFER here while the VAO is bound —
 	// that would clear m_MeshVAO's index-buffer slot to 0 and glDrawElements

@@ -67,16 +67,17 @@ int main() {
         s.GetParams().useCFL = false;  // paper Table 1 uses a FIXED time step
         const int steps = 20;
         for (int k = 0; k < 8; k++) s.Step();   // skip the cold-start steps
-        double iterSum = 0.0, tWall = 0.0;
+        double iterSum = 0.0, tWall = 0.0, tPressure = 0.0;
         for (int k = 0; k < steps; k++) {
             auto t0 = std::chrono::steady_clock::now();
             s.Step();
             auto t1 = std::chrono::steady_clock::now();
             iterSum += s.LastIterations();
+            tPressure += s.LastPressureTimeMs();
             tWall += std::chrono::duration<double, std::milli>(t1 - t0).count();
         }
         printf("  %.4f     %6.1f          %6.1f              %6.1f\n",
-               dt, iterSum / steps, tWall / steps, tWall / steps);
+               dt, iterSum / steps, tPressure / steps, tWall / steps);
     }
     printf("  (paper Table 1: IISPH avg iter 4.9 -> 18.4 -> 33.5 for the same dt set;\n"
            "   ours is ~16 flat-to-slightly-growing at 8k particles — same order of\n"
