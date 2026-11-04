@@ -4,4 +4,6 @@ out/
 .reasonix
 reasonix.toml
 docs
-tests
+_preview/
+captures/
+.VSCodeCounter

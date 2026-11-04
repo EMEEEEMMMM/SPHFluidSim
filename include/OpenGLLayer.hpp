@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <iostream>
+#include <string>
 
 #include "FrameBuffer.hpp"
 #include "Shader.h"
@@ -14,7 +15,9 @@ enum class ProjectionMode { Perspective, Orthographic };
 
 class OpenGLLayer {
 public:
-    OpenGLLayer(uint32_t width, uint32_t height);
+    // shaderDir: explicit directory holding the four .vert/.frag/.glsl files.
+    // Empty -> the built-in search path (see ResolveShaderDir in the .cpp).
+    OpenGLLayer(uint32_t width, uint32_t height, const std::string& shaderDir = std::string());
     ~OpenGLLayer();
 
     void Render();

@@ -1,0 +1,23 @@
+<RCC>
+    <qresource prefix="/qml">
+        <file>Main.qml</file>
+        <file>TitleBar.qml</file>
+        <file>NavBar.qml</file>
+        <file>NavMenuButton.qml</file>
+        <file>NavAction.qml</file>
+        <file>InfoDialog.qml</file>
+        <file>WindowButton.qml</file>
+        <file>StatusBar.qml</file>
+        <file>LeftPanel.qml</file>
+        <file>RightPanel.qml</file>
+        <file>Card.qml</file>
+        <file>Segmented.qml</file>
+        <file>Toggle.qml</file>
+        <file>SliderRow.qml</file>
+        <file>MetricGrid.qml</file>
+        <file>Spark.qml</file>
+        <file>IconBtn.qml</file>
+        <file>Pill.qml</file>
+        <file>ThemeSwatch.qml</file>
+    </qresource>
+</RCC>

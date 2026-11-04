@@ -462,6 +462,16 @@ void FluidSolver::Reset() {
 }
 
 // ---------------------------------------------------------------------------
+float FluidSolver::MeanDensity() const {
+    if (m_N <= 0 || m_Rho.empty()) return params.rho0;
+    double sum = 0.0;
+    #pragma omp parallel for reduction(+:sum)
+    for (int i = 0; i < m_N; ++i) sum += static_cast<double>(m_Rho[i]);
+    if (sum <= 1e-9) return params.rho0;   // before the first density pass
+    return params.rho0 * static_cast<float>(sum / m_N);
+}
+
+// ---------------------------------------------------------------------------
 void FluidSolver::BuildNeighborhood() {
     // Grid origin = particle bbox (fluid + boundary) minus a margin, so the
     // hash covers exactly what exists. A fixed (0,0,0) origin is fine for the

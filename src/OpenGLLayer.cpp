@@ -4,25 +4,58 @@
 #include "Camera.hpp"
 
 #include <iostream>
+#include <cstdlib>
 #include <filesystem>
-#include <GLFW/glfw3.h>
+#include <vector>
 
-OpenGLLayer::OpenGLLayer(uint32_t width, uint32_t height) {
-    // InitGeometry();
-	std::filesystem::path baseDir = 
-		std::filesystem::path(__FILE__)
-			.parent_path()
-			.parent_path();
+namespace {
 
-	std::string vertPath = (baseDir / "src/ShaderProgram/vertex_shader.vert").string();
-    std::string fragPath = (baseDir / "src/ShaderProgram/fragment_shader.frag").string();
+// The four shader files live in src/ShaderProgram. Depending on how the binary
+// is launched the working directory may be the repo root, build/ or the install
+// prefix, so try the plausible locations instead of trusting one.
+std::filesystem::path ResolveShaderDir(const std::string& overrideDir) {
+	namespace fs = std::filesystem;
+	auto hasShaders = [](const fs::path& p) {
+		return !p.empty() && fs::exists(p / "vertex_shader.vert") &&
+		       fs::exists(p / "surface_vertex.glsl");
+	};
+	if (!overrideDir.empty() && hasShaders(fs::path(overrideDir))) return fs::path(overrideDir);
+	if (const char* env = std::getenv("IISPH_SHADER_DIR")) {
+		if (hasShaders(fs::path(env))) return fs::path(env);
+	}
+	std::vector<fs::path> candidates = {
+		fs::path("shaders"),                    // copied next to the binary by CMake
+		fs::path("src/ShaderProgram"),          // launched from the repo root
+		fs::path("../src/ShaderProgram"),       // launched from build/
+		fs::path("../../src/ShaderProgram"),    // launched from build/<config>/
+	};
+	const fs::path self(__FILE__);
+	if (!self.parent_path().empty()) {
+		const fs::path root = self.parent_path().parent_path();
+		candidates.push_back(root / "ShaderProgram");
+		candidates.push_back(root / "src/ShaderProgram");
+	}
+	for (const auto& c : candidates) {
+		if (hasShaders(c)) return c;
+	}
+	return fs::path("src/ShaderProgram");
+}
+
+}  // namespace
+
+OpenGLLayer::OpenGLLayer(uint32_t width, uint32_t height, const std::string& shaderDir) {
+	// InitGeometry();
+	const std::filesystem::path baseDir = ResolveShaderDir(shaderDir);
+
+	std::string vertPath = (baseDir / "vertex_shader.vert").string();
+    std::string fragPath = (baseDir / "fragment_shader.frag").string();
     
 	m_Shader = new Shader(vertPath, fragPath);
 	m_FrameBuffer = new FrameBuffer(width, height);
 
 	// Surface mesh shader (Phong-lit translucent water)
-	std::string sVert = (baseDir / "src/ShaderProgram/surface_vertex.glsl").string();
-	std::string sFrag = (baseDir / "src/ShaderProgram/surface_fragment.glsl").string();
+	std::string sVert = (baseDir / "surface_vertex.glsl").string();
+	std::string sFrag = (baseDir / "surface_fragment.glsl").string();
 	m_SurfaceShader = new Shader(sVert, sFrag);
 	glGenVertexArrays(1, &m_MeshVAO);
 	glBindVertexArray(m_MeshVAO);
@@ -59,6 +92,8 @@ OpenGLLayer::OpenGLLayer(uint32_t width, uint32_t height) {
 OpenGLLayer::~OpenGLLayer() {
 	glDeleteVertexArrays(1, &m_VAO);
 	glDeleteBuffers(1, &m_VBO);
+	glDeleteVertexArrays(1, &m_TankVAO);
+	glDeleteBuffers(1, &m_TankVBO);
 	glDeleteBuffers(1, &m_EBO);
 	glDeleteVertexArrays(1, &m_ParticleVAO);
 	glDeleteBuffers(1, &m_ParticleVBO);
@@ -161,7 +196,16 @@ void OpenGLLayer::SetTankSize(float x, float y, float z, float cx, float cz, boo
 }
 
 void OpenGLLayer::Render() {
+	// Qt Quick's render thread can leave blending, depth writes or scissor
+	// state enabled from its own compositing pass. The widget/headless hosts
+	// start from clean defaults, so pin the states the water pass relies on.
+	glDisable(GL_BLEND);
+	glDisable(GL_SCISSOR_TEST);
 	glEnable(GL_DEPTH_TEST);
+	glDepthMask(GL_TRUE);
+	glDepthFunc(GL_LESS);
+	glDisable(GL_CULL_FACE);
+	glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
 
 	m_FrameBuffer->Bind();
 
@@ -203,8 +247,25 @@ void OpenGLLayer::Render() {
 		glBindVertexArray(0);
 	}
 
-	// Reconstructed fluid surface (Phong-lit water), drawn first (opaque).
+	// Particles first, then the opaque surface. Particles outside the mesh stay
+	// visible (closer depth), while particles inside it are correctly hidden.
+	// This order also keeps "both" consistent on Qt Quick, whose compositor can
+	// leave depth-related state in a different shape than QOpenGLWidget.
+	if (m_ShowParticles && m_ParticleCount > 0) {
+		m_Shader->Bind();
+		glBindVertexArray(m_ParticleVAO);
+		glDrawArraysInstanced(GL_POINTS, 0, 1, (GLsizei)m_ParticleCount);
+		glBindVertexArray(0);
+	}
+
+	// Reconstructed fluid surface (Phong-lit, opaque water).
 	if (m_ShowSurface && m_MeshIndexCount > 0 && m_SurfaceShader) {
+		// Set depth state again immediately before the mesh pass. This protects
+		// the opaque water from host-side state leakage between two draw calls
+		// (most visibly on Qt Quick's render thread).
+		glEnable(GL_DEPTH_TEST);
+		glDepthMask(GL_TRUE);
+		glDepthFunc(GL_LESS);
 		m_SurfaceShader->Bind();
 		glUniformMatrix4fv(glGetUniformLocation(m_SurfaceShader->m_RendererID, "model"), 1, GL_FALSE, &model.m[0][0]);
 		glUniformMatrix4fv(glGetUniformLocation(m_SurfaceShader->m_RendererID, "view"), 1, GL_FALSE, &view.m[0][0]);
@@ -215,15 +276,6 @@ void OpenGLLayer::Render() {
 		glDrawElements(GL_TRIANGLES, m_MeshIndexCount, GL_UNSIGNED_INT, (void*)0);
 		glBindVertexArray(0);
 		m_SurfaceShader->Unbind();
-	}
-
-	// Particles (IISPH fluid): instanced GL_POINTS -> spheres in fragment shader.
-	// Hidden in pure-surface mode (m_ShowParticles = false).
-	if (m_ShowParticles && m_ParticleCount > 0) {
-		m_Shader->Bind();   // re-bind: the surface pass may have switched programs
-		glBindVertexArray(m_ParticleVAO);
-		glDrawArraysInstanced(GL_POINTS, 0, 1, (GLsizei)m_ParticleCount);
-		glBindVertexArray(0);
 	}
 
 	// Tank wireframe: drawn on top (depth test off) so the box is always visible.

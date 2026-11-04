@@ -1,20 +1,44 @@
 #pragma once
 #include <string>
 
+#include "FluidSolver.hpp"
+
+// Shared by the renderer and its tests so output cadence cannot drift from the
+// simulation clock. `frame` is zero-based; frame 0 is rendered after advancing
+// to the end of its first video-frame interval.
+namespace headless_timing {
+inline double FrameTargetSimTime(int frame, int fps, double timeScale) {
+    return static_cast<double>(frame + 1) * timeScale / static_cast<double>(fps);
+}
+
+template <typename AfterStep>
+void AdvanceTo(FluidSolver& solver, double targetSimTime, AfterStep afterStep) {
+    while (static_cast<double>(solver.SimTime()) < targetSimTime) {
+        solver.Step();
+        afterStep();
+    }
+}
+
+inline void AdvanceTo(FluidSolver& solver, double targetSimTime) {
+    AdvanceTo(solver, targetSimTime, [] {});
+}
+} // namespace headless_timing
+
 // Command-line options for the headless (offline) mode.
 struct HeadlessOptions {
     int    fps       = 30;      // output video frame rate
-    int    frames    = 300;     // total simulated frames
-    double seconds   = 0.0;     // convenience: video length in seconds (frames = seconds * fps); 0 = use `frames`
+    int    frames    = 300;     // total rendered frames
+    double seconds   = 0.0;     // video length in seconds (frames = seconds * fps); 0 = use `frames`
+    double timeScale = 1.0;     // simulated seconds per video second (1 = real-time playback)
     int    width     = 1280;    // output resolution
     int    height    = 720;
     std::string output = "out"; // output directory (frames/ + video)
     enum class Mode { Particles, Surface } mode = Mode::Surface;
     std::string scene = "dam";    // "dam" | "inflow" (dam = open-top tank + optional --drop)
     std::string solver = "iisph"; // "iisph" | "df sph" (DFSPH, Bender & Koschier 2017)
-    int    dropFrame = -1;    // spawn the one-shot water drop at this frame (-1 = never)
+    double dropVideoSeconds = -1.0; // drop event on the video timeline (-1 = never)
     int    particles = 8000;    // approx. fluid particle count (adjusts spacing)
-    float  dt        = 0.0f;    // fixed timestep (0 = solver default / CFL)
+    float  dt        = 0.0f;    // maximum nominal timestep (0 = solver default; CFL may shorten it)
     float  gridScale = 1.0f;    // surface-reconstruction grid: 1.0 = r (fast), 0.5 = r/2 high quality
     int    threads   = 0;       // OpenMP threads (0 = all)
     bool   noVideo   = false;   // skip ffmpeg assembly, keep the BMP frames

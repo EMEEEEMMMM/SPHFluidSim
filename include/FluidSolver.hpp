@@ -76,6 +76,7 @@ public:
     const std::vector<float>&         Colors() const { return m_Colors; }   // 3 floats per particle
     float SimTime() const { return m_Time; }
     float AvgDensityError() const { return m_AvgErr; }
+    float MeanDensity() const;   // arithmetic mean density [kg/m^3] from the current rho field
     int   LastIterations() const { return m_LastIter; }
     float LastPressureTimeMs() const { return m_LastPressureMs; }   // wall time of the last pressure solve
     int   DivergenceIterations() const { return m_LastIterV; }   // DFSPH divergence solver

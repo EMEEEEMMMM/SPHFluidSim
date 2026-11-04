@@ -1,19 +1,29 @@
-cmake_minimum_required(VERSION 3.10)
-project(IISPH)
+cmake_minimum_required(VERSION 3.16)
+project(SPHFluidSim)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_AUTOMOC ON)
+set(CMAKE_AUTORCC ON)
 
 if(POLICY CMP0072)
   cmake_policy(SET CMP0072 NEW)
 endif()
+
+if(NOT DEFINED CMAKE_PREFIX_PATH AND NOT DEFINED Qt6_DIR)
+  foreach(_qt_candidate "D:/msys64/ucrt64" "C:/msys64/ucrt64"
+                        "D:/Qt/6.12.0/mingw_64" "D:/Qt/6.9.0/mingw_64")
+    if(EXISTS "${_qt_candidate}/lib/cmake/Qt6")
+      set(CMAKE_PREFIX_PATH "${_qt_candidate}" CACHE PATH "Qt 6 prefix")
+      break()
+    endif()
+  endforeach()
+endif()
+
 find_package(OpenGL REQUIRED)
 find_package(OpenMP REQUIRED)
-find_package(glfw3 CONFIG REQUIRED)
+find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets Quick QuickControls2 OpenGL OpenGLWidgets)
 
-# OpenCL for the GPU surface reconstruction (Akinci et al. 2012 GPU pipeline).
-# Prefer CMake's FindOpenCL; fall back to the CUDA toolkit's shipped headers +
-# import library (NVIDIA OpenCL.dll comes with the driver).
 find_package(OpenCL)
 if(NOT OpenCL_FOUND)
     set(_cuda_root "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.1")
@@ -32,52 +42,84 @@ else()
 endif()
 
 set(GLAD_DIR "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/glad")
-set(IMGUI_DIR "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/imgui")
-set(IMGUI_SOURCES
-    ${IMGUI_DIR}/imgui.cpp
-    ${IMGUI_DIR}/imgui_demo.cpp
-    ${IMGUI_DIR}/imgui_draw.cpp
-    ${IMGUI_DIR}/imgui_tables.cpp
-    ${IMGUI_DIR}/imgui_widgets.cpp
-    ${IMGUI_DIR}/backends/imgui_impl_glfw.cpp
-    ${IMGUI_DIR}/backends/imgui_impl_opengl3.cpp
-)
+set(SHADER_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src/ShaderProgram")
 
-include_directories(
-    include
-    src/ShaderProgram
-    ${IMGUI_DIR}
-    ${IMGUI_DIR}/backends
-    ${GLFW_INCLUDE_DIRS}
-    ${GLAD_DIR}/include
-    ${OpenCL_INCLUDE_DIRS}
-)
-
-add_executable(${PROJECT_NAME}
-    src/main.cpp
-    src/Application.cpp
+add_library(sph_core STATIC
+    src/FluidSolver.cpp
     src/FrameBuffer.cpp
     src/ShaderProgram/Shader.cpp
     src/OpenGLLayer.cpp
-    src/ImguiLayer.cpp
-    src/FluidSolver.cpp
     src/SurfaceReconstructor.cpp
     src/SurfaceReconstructorCL.cpp
-    src/HeadlessRunner.cpp
-    ${IMGUI_SOURCES}
+    src/Render/CameraRig.cpp
+    src/Render/GlView.cpp
     ${GLAD_DIR}/src/glad.c
 )
-
-target_link_libraries(${PROJECT_NAME}
-    glfw
+target_include_directories(sph_core PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/ShaderProgram
+    ${GLAD_DIR}/include
+    ${OpenCL_INCLUDE_DIRS}
+)
+target_link_libraries(sph_core PUBLIC
     OpenGL::GL
     OpenMP::OpenMP_CXX
-    -fopenmp
     ${OpenCL_LIBRARIES}
+)
+target_compile_options(sph_core PRIVATE -fopenmp)
+
+add_library(sph_session STATIC
+    include/Session/SimulationSession.hpp
+    src/Session/SimulationSession.cpp
+)
+target_link_libraries(sph_session PUBLIC sph_core Qt6::Core)
+
+add_library(sph_theme STATIC
+    include/Ui/Theme.hpp
+    src/Ui/Theme.cpp
+)
+target_include_directories(sph_theme PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(sph_theme PUBLIC Qt6::Core Qt6::Gui)
+
+add_executable(${PROJECT_NAME}
+    src/main.cpp
+    src/HeadlessRunner.cpp
+    include/Render/QtOffscreenContext.hpp
+    src/Render/QtOffscreenContext.cpp
+    src/Ui/Icons.cpp
+    include/Ui/Icons.hpp
+    include/Ui/Widgets/Controls.hpp
+    include/Ui/Widgets/MainWindow.hpp
+    include/Ui/Widgets/Panels.hpp
+    include/Ui/Widgets/Viewport.hpp
+    src/Ui/Widgets/Controls.cpp
+    src/Ui/Widgets/MainWindow.cpp
+    src/Ui/Widgets/Panels.cpp
+    src/Ui/Widgets/Viewport.cpp
+    include/Ui/Qml/CaptureHelper.hpp
+    include/Ui/Qml/IconItem.hpp
+    include/Ui/Qml/QmlFrontend.hpp
+    include/Ui/Qml/ViewportItem.hpp
+    src/Ui/Qml/CaptureHelper.cpp
+    src/Ui/Qml/IconItem.cpp
+    src/Ui/Qml/QmlFrontend.cpp
+    src/Ui/Qml/ViewportItem.cpp
+    qml/qml.qrc
+)
+target_link_libraries(${PROJECT_NAME} PRIVATE
+    sph_session
+    sph_theme
+    Qt6::Core
+    Qt6::Gui
+    Qt6::Widgets
+    Qt6::Quick
+    Qt6::QuickControls2
+    Qt6::OpenGL
+    Qt6::OpenGLWidgets
 )
 
 if(WIN32)
-    target_link_libraries(${PROJECT_NAME}
+    target_link_libraries(${PROJECT_NAME} PRIVATE
         gdi32
         user32
         kernel32
@@ -86,9 +128,15 @@ if(WIN32)
     )
 endif()
 
-target_compile_options(${PROJECT_NAME} PRIVATE -fopenmp)
+add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:${PROJECT_NAME}>/shaders"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${SHADER_DIR}/vertex_shader.vert" "${SHADER_DIR}/fragment_shader.frag"
+            "${SHADER_DIR}/surface_vertex.glsl" "${SHADER_DIR}/surface_fragment.glsl"
+            "$<TARGET_FILE_DIR:${PROJECT_NAME}>/shaders"
+    COMMENT "Copying shaders next to the executable"
+)
 
-# --- headless verification tests (no GUI) -----------------------------------
 function(add_headless_test name)
     add_executable(${name} tests/${name}.cpp src/FluidSolver.cpp)
     target_include_directories(${name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -99,23 +147,21 @@ add_headless_test(test_solver)
 add_headless_test(test_inflow)
 add_headless_test(test_drop)
 add_headless_test(test_boundary)
+add_headless_test(test_timeline)
 add_headless_test(verify_hydrostatic)
 add_headless_test(benchmark)
 add_headless_test(surface_reconstruct)
-# the surface test also needs the reconstructor
+
 target_sources(surface_reconstruct PRIVATE src/SurfaceReconstructor.cpp src/SurfaceReconstructorCL.cpp)
+target_include_directories(surface_reconstruct PRIVATE ${OpenCL_INCLUDE_DIRS})
 target_link_libraries(surface_reconstruct PRIVATE ${OpenCL_LIBRARIES})
 
-# ctest integration: `ctest --test-dir build` runs the numerical regressions.
-# (Previously there were no add_test() calls at all, so ctest reported
-# "No tests were found" and nothing could fail the suite.)
 enable_testing()
 add_test(NAME solver      COMMAND test_solver)
 add_test(NAME inflow      COMMAND test_inflow)
 add_test(NAME drop        COMMAND test_drop)
 add_test(NAME boundary    COMMAND test_boundary)
+add_test(NAME timeline    COMMAND test_timeline)
 add_test(NAME hydrostatic COMMAND verify_hydrostatic 200)
 add_test(NAME surface     COMMAND surface_reconstruct)
-# DFSPH path: separate case because the warm start and the divergence solver
-# are only exercised with solver == 1 (and the test asserts the iteration count).
 add_test(NAME dfsph       COMMAND test_solver 120 0.003 0 0.1 DFSPH)

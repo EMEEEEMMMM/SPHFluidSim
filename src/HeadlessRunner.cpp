@@ -17,7 +17,7 @@
 #include "SurfaceReconstructor.hpp"
 #include "OpenGLLayer.hpp"
 #include <glad/glad.h>
-#include <GLFW/glfw3.h>
+#include "Render/QtOffscreenContext.hpp"
 #include <cstdio>
 #include <cmath>
 #include <cstdlib>
@@ -143,7 +143,7 @@ bool WriteParticlePLY(const std::string& path, const std::vector<Math::Vector3>&
 } // namespace
 
 // ---------------------------------------------------------------------------
-// Offline rendering: hidden GLFW window + OpenGL FBO, reused OpenGLLayer.
+// Offline rendering: Qt offscreen GL context + OpenGL FBO, reused OpenGLLayer.
 // ---------------------------------------------------------------------------
 int RunHeadless(const HeadlessOptions& opt) {
     if (opt.threads > 0) omp_set_num_threads(opt.threads);
@@ -173,17 +173,17 @@ int RunHeadless(const HeadlessOptions& opt) {
         }
     }
 
-    // Hidden GLFW window providing a GL context (off-screen rendering).
-    glfwInit();
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
-    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
-    glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
-    GLFWwindow* win = glfwCreateWindow(opt.width, opt.height, "IISPH headless", nullptr, nullptr);
-    if (!win) { printf("[headless] failed to create GL context\n"); glfwTerminate(); return 1; }
-    glfwMakeContextCurrent(win);
-    if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress)) {
-        printf("[headless] failed to load GL\n"); return 1;
+    // Qt supplies the same hidden GL 3.3 core context previously provided by
+    // GLFW. This owner is declared before the renderer so the renderer and its
+    // GL resources are destroyed while the context is still current.
+    render::QtOffscreenContext glContext;
+    if (!glContext.Create()) {
+        printf("[headless] failed to create Qt offscreen GL 3.3 context\n");
+        return 1;
+    }
+    if (!gladLoadGLLoader(render::QtOffscreenContext::ProcAddress)) {
+        printf("[headless] failed to load GL\n");
+        return 1;
     }
 
     OpenGLLayer layer(opt.width, opt.height);
@@ -237,7 +237,6 @@ int RunHeadless(const HeadlessOptions& opt) {
 
     if (!MakeDirs(dir)) {
         printf("[headless] ERROR: cannot create output directory '%s' (does its parent exist?)\n", dir.c_str());
-        glfwTerminate();
         return 1;
     }
     // Default path: stream frames straight into ffmpeg over a pipe (no BMPs on
@@ -248,12 +247,10 @@ int RunHeadless(const HeadlessOptions& opt) {
     std::string framesDir = dir + "/frames";
     if (!usePipe && !MakeDirs(framesDir)) {
         printf("[headless] ERROR: cannot create frames directory '%s'\n", framesDir.c_str());
-        glfwTerminate();
         return 1;
     }
     if (opt.exportParticles && !MakeDirs(particlesDir)) {
         printf("[headless] ERROR: cannot create particle dump directory '%s'\n", particlesDir.c_str());
-        glfwTerminate();
         return 1;
     }
     FILE* pipe = nullptr;
@@ -268,7 +265,6 @@ int RunHeadless(const HeadlessOptions& opt) {
             printf("[headless] WARNING: could not start ffmpeg pipe, falling back to BMP frames\n");
             if (!MakeDirs(framesDir)) {
                 printf("[headless] ERROR: cannot create frames directory '%s'\n", framesDir.c_str());
-                glfwTerminate();
                 return 1;
             }
         }
@@ -282,22 +278,31 @@ int RunHeadless(const HeadlessOptions& opt) {
     std::vector<float> plyScratch;
     const int reconInterval = 3;   // rebuild mesh every N frames
 
-    printf("[headless] particles=%d (spacing=%.4f)  frames=%d  fps=%d  mode=%s  res=%dx%d\n",
-           solver.FluidCount(), spacing, opt.frames, opt.fps,
+    printf("[headless] particles=%d (spacing=%.4f)  frames=%d  fps=%d  time-scale=%.4g  mode=%s  res=%dx%d\n",
+           solver.FluidCount(), spacing, opt.frames, opt.fps, opt.timeScale,
            showSurface ? "surface" : "particles", opt.width, opt.height);
 
     double tWall0 = omp_get_wtime();
-    const int dropFrame = opt.dropFrame;   // -1 = never (spawn at this frame)
+    const double dropSimTime = opt.dropVideoSeconds >= 0.0
+        ? opt.dropVideoSeconds * opt.timeScale
+        : -1.0;
+    auto spawnDropIfDue = [&] {
+        if (isInflow || dropSimTime < 0.0 || solver.HasDrop() ||
+            static_cast<double>(solver.SimTime()) < dropSimTime) return;
+        // Check after every solver step, not just at rendered-frame boundaries.
+        // The event therefore occurs after the same physical step at every fps.
+        solver.SpawnDrop(0.2f, 1.0f, 1.6f, 0.5f);
+        printf("[headless] drop spawned at video t=%.3fs, sim t=%.3fs (N=%d)\n",
+               opt.dropVideoSeconds, solver.SimTime(), solver.FluidCount());
+    };
+    spawnDropIfDue();   // --drop 0 / 0f happens before the first simulation step
     for (int f = 0; f < opt.frames; f++) {
-        if (!isInflow && dropFrame >= 0 && f == dropFrame && !solver.HasDrop()) {
-            // one-shot: spherical blob above the tank rim, falls in (R=0.2)
-            solver.SpawnDrop(0.2f, 1.0f, 1.6f, 0.5f);
-            printf("[headless] drop spawned at frame %d (N=%d)\n", f, solver.FluidCount());
-        }
-        solver.Step();
+        const double targetSimTime =
+            headless_timing::FrameTargetSimTime(f, opt.fps, opt.timeScale);
+        headless_timing::AdvanceTo(solver, targetSimTime, spawnDropIfDue);
 
         if (opt.exportParticles) {
-            char name[256];
+            char name[512];
             snprintf(name, sizeof(name), "%s/frame_%04d.ply", particlesDir.c_str(), f);
             if (!WriteParticlePLY(name, solver.Positions(), plyScratch)) {
                 if (plyFailures == 0) printf("[export] ERROR: cannot write %s\n", name);
@@ -336,7 +341,7 @@ int RunHeadless(const HeadlessOptions& opt) {
                 fwrite(row.data(), 1, row.size(), pipe);
             }
         } else {
-            char name[64];
+            char name[512];
             snprintf(name, sizeof(name), "%s/frames/frame_%04d.bmp", dir.c_str(), f);
             if (!WriteBMP(name, pixels.data(), opt.width, opt.height)) {
                 if (bmpFailures == 0) printf("[headless] ERROR: cannot write %s\n", name);
@@ -368,8 +373,9 @@ int RunHeadless(const HeadlessOptions& opt) {
         }
     }
     double tWall1 = omp_get_wtime();
-    printf("[headless] done: %d frames in %.1f s (%.1f fps wall), sim time %.2f s\n",
-           opt.frames, tWall1 - tWall0, opt.frames / (tWall1 - tWall0), solver.SimTime());
+    printf("[headless] done: %d frames in %.1f s (%.1f fps wall), video time %.2f s, sim time %.3f s (time scale %.4g)\n",
+           opt.frames, tWall1 - tWall0, opt.frames / (tWall1 - tWall0),
+           static_cast<double>(opt.frames) / opt.fps, solver.SimTime(), opt.timeScale);
 
     // Streaming path: closing the pipe makes ffmpeg finish the mp4; its exit
     // code is the real success signal (previously ignored -> "No space left on
@@ -404,7 +410,7 @@ int RunHeadless(const HeadlessOptions& opt) {
                 // on the whole folder, which also deleted unrelated
                 // files the user kept there.
                 for (int k = 0; k < opt.frames; k++) {
-                    char name[128];
+                    char name[512];
                     snprintf(name, sizeof(name), "%s/frame_%04d.bmp", framesDir.c_str(), k);
                     ::remove(name);
                 }
@@ -419,7 +425,6 @@ int RunHeadless(const HeadlessOptions& opt) {
         if (plyFailures > 0) {
             printf("[export] ERROR: %d of %d particle frames could not be written to %s/\n",
                    plyFailures, opt.frames, particlesDir.c_str());
-            glfwTerminate();
             return 1;
         }
         printf("[export] wrote %d PLY frames to %s/ (~%.2f GiB)\n", opt.frames, particlesDir.c_str(),
@@ -429,11 +434,9 @@ int RunHeadless(const HeadlessOptions& opt) {
     if (bmpFailures > 0) {
         printf("[headless] ERROR: %d of %d frames could not be written to %s/frames\n",
                bmpFailures, opt.frames, dir.c_str());
-        glfwTerminate();
         return 1;
     }
 
-    glfwTerminate();
     return 0;
 }
 
