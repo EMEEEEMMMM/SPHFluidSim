@@ -3,6 +3,7 @@
 #include <QAction>
 #include <QApplication>
 #include <QComboBox>
+#include <QCursor>
 #include <QDateTime>
 #include <QDesktopServices>
 #include <QDir>
@@ -31,6 +32,13 @@
 
 #include <algorithm>
 #include <cmath>
+
+#ifdef Q_OS_WIN
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 #include "Render/GlView.hpp"
 #include "Session/SimulationSession.hpp"
@@ -1001,6 +1009,40 @@ void MainWindow::applyTheme() {
 // ---------------------------------------------------------------------------
 // Frameless window plumbing
 // ---------------------------------------------------------------------------
+bool MainWindow::nativeEvent(const QByteArray& eventType, void* message, qintptr* result) {
+#ifdef Q_OS_WIN
+    Q_UNUSED(eventType)
+    auto* msg = static_cast<MSG*>(message);
+    if (msg && msg->message == WM_NCHITTEST &&
+        msg->hwnd == reinterpret_cast<HWND>(winId()) && !isMaximized() && !isFullScreen()) {
+        const QPoint pos = mapFromGlobal(QCursor::pos());
+        if (rect().contains(pos)) {
+            constexpr int margin = 7;
+            const bool left = pos.x() <= margin;
+            const bool right = pos.x() >= width() - margin;
+            const bool top = pos.y() <= margin;
+            const bool bottom = pos.y() >= height() - margin;
+
+            LRESULT hit = 0;
+            if (left && top) hit = HTTOPLEFT;
+            else if (right && top) hit = HTTOPRIGHT;
+            else if (left && bottom) hit = HTBOTTOMLEFT;
+            else if (right && bottom) hit = HTBOTTOMRIGHT;
+            else if (left) hit = HTLEFT;
+            else if (right) hit = HTRIGHT;
+            else if (top) hit = HTTOP;
+            else if (bottom) hit = HTBOTTOM;
+
+            if (hit != 0) {
+                *result = hit;
+                return true;
+            }
+        }
+    }
+#endif
+    return QWidget::nativeEvent(eventType, message, result);
+}
+
 void MainWindow::mousePressEvent(QMouseEvent* event) {
     if (isMaximized() || isFullScreen()) return;
     if (event->button() != Qt::LeftButton) return;

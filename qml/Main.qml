@@ -210,6 +210,79 @@ Window {
         }
     }
 
+    ResizeHandle {
+        targetWindow: root
+        edges: Qt.LeftEdge
+        width: 7
+        anchors.left: parent.left
+        anchors.top: parent.top
+        anchors.bottom: parent.bottom
+        cursorShape: Qt.SizeHorCursor
+    }
+    ResizeHandle {
+        targetWindow: root
+        edges: Qt.RightEdge
+        width: 7
+        anchors.right: parent.right
+        anchors.top: parent.top
+        anchors.bottom: parent.bottom
+        cursorShape: Qt.SizeHorCursor
+    }
+    ResizeHandle {
+        targetWindow: root
+        edges: Qt.TopEdge
+        height: 7
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.top: parent.top
+        cursorShape: Qt.SizeVerCursor
+    }
+    ResizeHandle {
+        targetWindow: root
+        edges: Qt.BottomEdge
+        height: 7
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.bottom: parent.bottom
+        cursorShape: Qt.SizeVerCursor
+    }
+    ResizeHandle {
+        targetWindow: root
+        edges: Qt.LeftEdge | Qt.TopEdge
+        width: 14
+        height: 14
+        anchors.left: parent.left
+        anchors.top: parent.top
+        cursorShape: Qt.SizeFDiagCursor
+    }
+    ResizeHandle {
+        targetWindow: root
+        edges: Qt.RightEdge | Qt.TopEdge
+        width: 14
+        height: 14
+        anchors.right: parent.right
+        anchors.top: parent.top
+        cursorShape: Qt.SizeBDiagCursor
+    }
+    ResizeHandle {
+        targetWindow: root
+        edges: Qt.LeftEdge | Qt.BottomEdge
+        width: 14
+        height: 14
+        anchors.left: parent.left
+        anchors.bottom: parent.bottom
+        cursorShape: Qt.SizeBDiagCursor
+    }
+    ResizeHandle {
+        targetWindow: root
+        edges: Qt.RightEdge | Qt.BottomEdge
+        width: 14
+        height: 14
+        anchors.right: parent.right
+        anchors.bottom: parent.bottom
+        cursorShape: Qt.SizeFDiagCursor
+    }
+
     Shortcut { sequence: "Space"; onActivated: root.sim.toggleRunning() }
     // Orbit only: in Fly mode S belongs to the WASD flight controls.
     Shortcut {

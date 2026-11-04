@@ -7,6 +7,7 @@
         <file>NavAction.qml</file>
         <file>InfoDialog.qml</file>
         <file>WindowButton.qml</file>
+        <file>ResizeHandle.qml</file>
         <file>StatusBar.qml</file>
         <file>LeftPanel.qml</file>
         <file>RightPanel.qml</file>
