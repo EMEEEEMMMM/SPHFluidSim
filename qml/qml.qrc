@@ -6,6 +6,13 @@
         <file>NavMenuButton.qml</file>
         <file>NavAction.qml</file>
         <file>InfoDialog.qml</file>
+        <file>DialogButton.qml</file>
+        <file>RenderDialog.qml</file>
+        <file>RenderField.qml</file>
+        <file>RenderProgressDialog.qml</file>
+        <file>RenderSection.qml</file>
+        <file>RenderSegmented.qml</file>
+        <file>RenderToggle.qml</file>
         <file>WindowButton.qml</file>
         <file>ResizeHandle.qml</file>
         <file>StatusBar.qml</file>

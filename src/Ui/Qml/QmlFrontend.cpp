@@ -12,6 +12,7 @@
 
 #include <cstdio>
 
+#include "Render/RenderJob.hpp"
 #include "Session/SimulationSession.hpp"
 #include "Ui/Qml/CaptureHelper.hpp"
 #include "Ui/Qml/IconItem.hpp"
@@ -32,7 +33,8 @@ int RunQmlFrontend(QApplication& app, SimulationSession& session, bool autoplay,
     qmlRegisterType<ViewportItem>("IISPH.View", 1, 0, "ViewportItem");
     qmlRegisterType<IconItem>("IISPH.View", 1, 0, "IconItem");
 
-    CaptureHelper capture(session);
+    CaptureHelper capture;
+    RenderJob renderJob;
 
     QQmlApplicationEngine engine;
     QObject::connect(&engine, &QQmlApplicationEngine::warnings,
@@ -44,6 +46,7 @@ int RunQmlFrontend(QApplication& app, SimulationSession& session, bool autoplay,
                      });
     engine.rootContext()->setContextProperty(QStringLiteral("session"), &session);
     engine.rootContext()->setContextProperty(QStringLiteral("capture"), &capture);
+    engine.rootContext()->setContextProperty(QStringLiteral("renderJob"), &renderJob);
     engine.load(QUrl(QStringLiteral("qrc:/qml/Main.qml")));
     if (engine.rootObjects().isEmpty()) {
         std::fprintf(stderr, "[ui] failed to load qrc:/qml/Main.qml\n");

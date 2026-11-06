@@ -427,9 +427,21 @@ QSlider::handle:horizontal { width: %24px; height: %25px; margin: -%26px 0; back
 QSlider::handle:horizontal:hover { border-color: %9; }
 QSlider::handle:horizontal:disabled { background: %13; }
 QToolTip { background: %16; color: %1; border: 1px solid %10; padding: 4px 6px; }
+QDialog { background: %5; color: %1; }
+QGroupBox { background: transparent; border: 1px solid %10; border-radius: %18px; margin-top: 14px; padding: 10px 10px 8px 10px; color: %7; font-size: 10px; font-weight: 600; }
+QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 4px; color: %7; }
+QLineEdit, QSpinBox, QDoubleSpinBox { background: %8; border: 1px solid %10; border-radius: %19px; padding: 4px 7px; color: %1; font-family: "%20"; font-size: 11px; selection-background-color: %9; selection-color: #FFFFFF; }
+QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus { border: 2px solid %9; }
+QLineEdit:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled { color: %7; }
+QCheckBox { color: %6; spacing: 6px; font-size: 11px; }
+QProgressBar { background: %14; border: none; border-radius: 4px; min-height: 8px; max-height: 8px; text-align: center; color: transparent; }
+QProgressBar::chunk { background: %9; border-radius: 4px; }
+QTabWidget::pane { border: 1px solid %10; border-radius: %19px; background: %5; }
+QTabBar::tab { background: transparent; color: %7; padding: 6px 12px; border-bottom: 2px solid transparent; }
+QTabBar::tab:selected { color: %1; border-bottom-color: %9; }
 )QSS");
     const QString numericFont =
-        t.numberFamily.isEmpty() ? QStringLiteral("Segoe UI Variable Text") : t.numberFamily;
+        t.numberFamily.isEmpty() ? QStringLiteral("Segoe UI") : t.numberFamily;
     const int trackPx = std::max(2, static_cast<int>(t.trackH));
     const int handleW = t.square ? 8 : 14;
     const int handleH = t.square ? 16 : 14;

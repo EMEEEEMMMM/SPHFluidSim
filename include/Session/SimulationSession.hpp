@@ -32,6 +32,7 @@
 #include <vector>
 
 #include "Math/Vector3.hpp"
+#include "Model.hpp"
 
 class FluidSolver;
 
@@ -78,6 +79,7 @@ public:
     // ---- thread-safe reads ------------------------------------------------
     SimSnapshotPtr snapshot() const;
     SurfaceSnapshotPtr surface() const;
+    ModelDataPtr model() const;
 
     bool running() const;
     QVariantMap params() const;
@@ -93,6 +95,9 @@ public:
     Q_INVOKABLE void toggleRunning();
     Q_INVOKABLE void stepOnce();
     Q_INVOKABLE void resetSimulation();
+    Q_INVOKABLE void importModel();
+    Q_INVOKABLE bool importModelFile(const QString& filePath);
+    Q_INVOKABLE void clearModel();
     Q_INVOKABLE void spawnDrop();
 
     // One generic entry point for every editable setting. Recognised keys:
@@ -104,6 +109,10 @@ public:
     // ---- experiment files --------------------------------------------------
     Q_INVOKABLE QString exportParamsJson() const;
     Q_INVOKABLE bool importParamsJson(const QString& json);
+    Q_INVOKABLE void importParameters();
+    Q_INVOKABLE void exportParameters();
+    Q_INVOKABLE bool importParametersFile(const QString& filePath);
+    Q_INVOKABLE bool exportParametersFile(const QString& filePath);
 
 Q_SIGNALS:
     void runningChanged();
@@ -111,6 +120,7 @@ Q_SIGNALS:
     void statusChanged();
     void traceChanged();
     void surfaceUpdated();
+    void modelChanged();
     void triangleCountChanged();
     void message(const QString& text);
 

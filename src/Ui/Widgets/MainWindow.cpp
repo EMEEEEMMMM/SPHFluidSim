@@ -8,6 +8,7 @@
 #include <QDesktopServices>
 #include <QDir>
 #include <QFile>
+#include <QFileInfo>
 #include <QGraphicsDropShadowEffect>
 #include <QGridLayout>
 #include <QGuiApplication>
@@ -41,11 +42,13 @@
 #endif
 
 #include "Render/GlView.hpp"
+#include "Render/RenderJob.hpp"
 #include "Session/SimulationSession.hpp"
 #include "Ui/Icons.hpp"
 #include "Ui/Theme.hpp"
 #include "Ui/Widgets/Controls.hpp"
 #include "Ui/Widgets/Panels.hpp"
+#include "Ui/Widgets/RenderDialogs.hpp"
 #include "Ui/Widgets/Viewport.hpp"
 
 namespace ui {
@@ -125,6 +128,7 @@ MainWindow::MainWindow(SimulationSession* session, QWidget* parent)
     const QRect avail = QGuiApplication::primaryScreen()->availableGeometry();
     resize(std::min(1580, avail.width() - 80), std::min(960, avail.height() - 90));
 
+    m_renderJob = new RenderJob(this);
     buildUi();
     wire();
     applyTheme();
@@ -221,9 +225,10 @@ QWidget* MainWindow::buildTitleBar() {
     m_playButton->setCircular(true);
     m_playButton->setPrimary(true);
     m_playButton->setToolTip(QStringLiteral("Pause (Space)"));
-    m_stepButton = new IconButton(IconKind::Step, bar);
-    m_stepButton->setFixedSize(28, 28);
-    m_stepButton->setToolTip(QStringLiteral("Step once (S)"));
+    m_screenshotButton = new IconButton(IconKind::Camera, bar);
+    m_screenshotButton->setFixedSize(28, 28);
+    m_screenshotButton->setIconSize(18);
+    m_screenshotButton->setToolTip(QStringLiteral("Save screenshot (Ctrl+S)"));
 
     m_clock = new QLabel(QStringLiteral("t 0.00 s"), bar);
     m_clock->setObjectName(QStringLiteral("Clock"));
@@ -240,9 +245,6 @@ QWidget* MainWindow::buildTitleBar() {
     m_viewModeSeg->setOptions({QStringLiteral("Particles"), QStringLiteral("Surface"),
                                QStringLiteral("Both")});
     m_viewModeSeg->setCurrentIndex(0);
-
-    m_saveButton = new IconButton(IconKind::Save, right);
-    m_saveButton->setToolTip(QStringLiteral("Save screenshot + parameters (Ctrl+S)"));
 
     m_fullscreenButton = new IconButton(IconKind::Fullscreen, right);
     m_fullscreenButton->setToolTip(QStringLiteral("Fullscreen (F11)"));
@@ -263,7 +265,6 @@ QWidget* MainWindow::buildTitleBar() {
 
     rightLayout->addWidget(m_viewModeSeg);
     rightLayout->addSpacing(4);
-    rightLayout->addWidget(m_saveButton);
     rightLayout->addWidget(m_fullscreenButton);
     rightLayout->addSpacing(4);
     rightLayout->addWidget(m_minimizeButton);
@@ -275,7 +276,7 @@ QWidget* MainWindow::buildTitleBar() {
 }
 
 void MainWindow::layoutTransport() {
-    if (!m_titleBar || !m_playButton || !m_resetButton || !m_stepButton || !m_clock) return;
+    if (!m_titleBar || !m_playButton || !m_resetButton || !m_screenshotButton || !m_clock) return;
 
     const int h = m_titleBar->height();
     const int cx = m_titleBar->width() / 2;
@@ -284,12 +285,12 @@ void MainWindow::layoutTransport() {
 
     const int smallTop = (h - 28) / 2;
     m_resetButton->setGeometry(m_playButton->x() - 6 - 28, smallTop, 28, 28);
-    m_stepButton->setGeometry(m_playButton->x() + 32 + 6, smallTop, 28, 28);
-    m_clock->setGeometry(m_stepButton->x() + 28 + 8, (h - 22) / 2, 84, 22);
+    m_screenshotButton->setGeometry(m_playButton->x() + 32 + 6, smallTop, 28, 28);
+    m_clock->setGeometry(m_screenshotButton->x() + 28 + 8, (h - 22) / 2, 84, 22);
 
     m_resetButton->raise();
     m_playButton->raise();
-    m_stepButton->raise();
+    m_screenshotButton->raise();
     m_clock->raise();
 }
 
@@ -300,6 +301,18 @@ QWidget* MainWindow::buildMenuBar() {
     bar->setFixedHeight(30);
 
     QMenu* file = bar->addMenu(QStringLiteral("File"));
+    QAction* importObj = file->addAction(QStringLiteral("Import 3D Model..."));
+    connect(importObj, &QAction::triggered, this,
+            [this] { m_session->importModel(); });
+    QAction* importParameters = file->addAction(QStringLiteral("Import Parameter (Json)..."));
+    importParameters->setShortcut(QKeySequence(QStringLiteral("Ctrl+Shift+O")));
+    connect(importParameters, &QAction::triggered, this,
+            [this] { m_session->importParameters(); });
+    QAction* exportParameters = file->addAction(QStringLiteral("Export Parameter (Json)..."));
+    exportParameters->setShortcut(QKeySequence(QStringLiteral("Ctrl+Shift+S")));
+    connect(exportParameters, &QAction::triggered, this,
+            [this] { m_session->exportParameters(); });
+    file->addSeparator();
     QAction* restart = file->addAction(QStringLiteral("Restart scene"));
     connect(restart, &QAction::triggered, this,
             [this] { m_session->resetSimulation(); });
@@ -309,6 +322,10 @@ QWidget* MainWindow::buildMenuBar() {
     QAction* exit = file->addAction(QStringLiteral("Exit"));
     exit->setShortcut(QKeySequence::Quit);
     connect(exit, &QAction::triggered, this, &QWidget::close);
+
+    QAction* render = bar->addAction(QStringLiteral("Render"));
+    render->setShortcut(QKeySequence(QStringLiteral("Ctrl+Shift+R")));
+    connect(render, &QAction::triggered, this, &MainWindow::openRenderDialog);
 
     m_appearanceMenu = bar->addMenu(QStringLiteral("Appearance"));
     for (int i = 0; i < Theme::count(); ++i) {
@@ -335,6 +352,9 @@ QWidget* MainWindow::buildMenuBar() {
                            "R       Restart the scene\n"
                            "Ctrl+T  Cycle appearance\n"
                            "Ctrl+S  Save screenshot\n"
+                           "Ctrl+Shift+O  Import parameters (JSON)\n"
+                           "Ctrl+Shift+S  Export parameters (JSON)\n"
+                           "Ctrl+Shift+R  Open render settings\n"
                            "F11     Toggle fullscreen\n"
                            "1/2/3   Particles / surface / both\n\n"
                            "Camera has two modes: Orbit (left-drag orbits) and Fly "
@@ -609,7 +629,7 @@ QWidget* MainWindow::buildStatusBar() {
     layout->setContentsMargins(14, 0, 14, 0);
     layout->setSpacing(12);
 
-    m_statusLeft = new QLabel(QStringLiteral("OpenGL 3.3 core"), bar);
+    m_statusLeft = new QLabel(bar);
     m_statusLeft->setProperty("role", "status");
     m_statusRight = new QLabel(QStringLiteral("—"), bar);
     m_statusRight->setProperty("role", "status");
@@ -628,6 +648,7 @@ void MainWindow::wire() {
     connect(m_session, &SimulationSession::statusChanged, this, &MainWindow::syncStatus);
     connect(m_session, &SimulationSession::traceChanged, this, &MainWindow::syncTrace);
     connect(m_session, &SimulationSession::runningChanged, this, &MainWindow::updateTransport);
+    connect(m_session, &SimulationSession::message, this, &MainWindow::toast);
     connect(m_viewport, &Viewport::fpsChanged, this, &MainWindow::updateHud);
     connect(&Theme::instance(), &Theme::changed, this, &MainWindow::applyTheme);
 
@@ -635,9 +656,8 @@ void MainWindow::wire() {
             [this] { m_session->toggleRunning(); });
     connect(m_resetButton, &QAbstractButton::clicked, this,
             [this] { m_session->resetSimulation(); });
-    connect(m_stepButton, &QAbstractButton::clicked, this,
-            [this] { m_session->stepOnce(); });
-    connect(m_saveButton, &QAbstractButton::clicked, this, [this] { saveScreenshot(); });
+    connect(m_screenshotButton, &QAbstractButton::clicked, this,
+            [this] { saveScreenshot(); });
     connect(m_fullscreenButton, &QAbstractButton::clicked, this, [this] {
         if (isFullScreen()) showNormal();
         else showFullScreen();
@@ -812,10 +832,8 @@ void MainWindow::syncStatus() {
                                         : QStringLiteral("custom")));
 
     if (m_statusMessage.isEmpty()) {
-        m_statusLeft->setText(QStringLiteral("OpenGL 3.3 core · %1 threads · scene %2")
-                                  .arg(QThread::idealThreadCount())
-                                  .arg(scene == 0 ? QStringLiteral("dam break")
-                                                  : QStringLiteral("inflow")));
+        m_statusLeft->clear();
+        m_statusLeft->setStyleSheet(QString());
     }
 
     updateHud();
@@ -925,9 +943,46 @@ void MainWindow::changeSolver(int solver) {
     setParam(QStringLiteral("solver"), solver);
 }
 
+void MainWindow::openRenderDialog() {
+    if (!m_renderJob) return;
+    if (m_renderJob->running()) {
+        if (m_renderProgressDialog) {
+            m_renderProgressDialog->show();
+            m_renderProgressDialog->raise();
+            m_renderProgressDialog->activateWindow();
+        } else {
+            QMessageBox::information(this, QStringLiteral("Render"),
+                                     QStringLiteral("A render is already running."));
+        }
+        return;
+    }
+    if (m_renderOptionsDialog) {
+        m_renderOptionsDialog->show();
+        m_renderOptionsDialog->raise();
+        m_renderOptionsDialog->activateWindow();
+        return;
+    }
+
+    auto* dialog = new RenderOptionsDialog(m_session, m_renderJob, this);
+    dialog->setAttribute(Qt::WA_DeleteOnClose);
+    m_renderOptionsDialog = dialog;
+    connect(dialog, &RenderOptionsDialog::renderStarted, this, [this] {
+        if (m_renderProgressDialog) m_renderProgressDialog->close();
+        auto* progress = new RenderProgressDialog(m_renderJob, this);
+        progress->setAttribute(Qt::WA_DeleteOnClose);
+        m_renderProgressDialog = progress;
+        progress->show();
+    });
+    dialog->show();
+}
+
 void MainWindow::toast(const QString& text) {
     m_statusMessage = text;
     m_statusLeft->setText(text);
+    const ThemeTokens& t = Theme::instance().current();
+    m_statusLeft->setStyleSheet(
+        QStringLiteral("color: %1;")
+            .arg((text.startsWith(QStringLiteral("Saved to ")) ? t.ok : t.fg3).name()));
     QTimer::singleShot(2600, this, [this] {
         m_statusMessage.clear();
         syncStatus();
@@ -943,17 +998,14 @@ bool MainWindow::saveScreenshot(QString* savedPath) {
     const QString stamp =
         QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMdd-HHmmss"));
     const QString base = dir.filePath(QStringLiteral("iisph-") + stamp);
-    if (!m_viewport->saveFrame(base + QStringLiteral(".png"))) {
+    const QString imagePath = base + QStringLiteral(".png");
+    if (!m_viewport->saveFrame(imagePath)) {
         toast(QStringLiteral("Screenshot failed"));
         return false;
     }
-    QFile json(base + QStringLiteral(".json"));
-    if (json.open(QIODevice::WriteOnly | QIODevice::Text)) {
-        json.write(m_session->exportParamsJson().toUtf8());
-        json.close();
-    }
-    if (savedPath) *savedPath = base + QStringLiteral(".png");
-    toast(QStringLiteral("Saved ") + QDir().relativeFilePath(base + QStringLiteral(".png")));
+    const QString absolutePath = QDir::toNativeSeparators(QFileInfo(imagePath).absoluteFilePath());
+    if (savedPath) *savedPath = absolutePath;
+    toast(QStringLiteral("Saved to ") + absolutePath);
     return true;
 }
 

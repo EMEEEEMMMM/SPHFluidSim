@@ -39,6 +39,8 @@ public:
             if (snap != m_snapshot) m_snapshot = snap;
             SurfaceSnapshotPtr surf = m_session->surface();
             if (surf != m_surface) m_surface = surf;
+            ModelDataPtr model = m_session->model();
+            if (model != m_model) m_model = model;
         }
         const QColor bg = Theme::instance().current().bg;
         m_bg[0] = static_cast<float>(bg.redF());
@@ -82,6 +84,10 @@ public:
             else m_view->UpdateSurface({}, {});
             m_uploadedSurface = m_surface;
         }
+        if (m_model != m_uploadedModel) {
+            m_view->UpdateModel(m_model);
+            m_uploadedModel = m_model;
+        }
         m_view->SetSurfaceVisible(m_viewMode > 0);
         m_view->SetParticlesVisible(m_viewMode != 1);
         m_view->cameraState() = m_camera;
@@ -98,6 +104,8 @@ private:
     SimSnapshotPtr m_uploadedSnapshot;
     SurfaceSnapshotPtr m_surface;
     SurfaceSnapshotPtr m_uploadedSurface;
+    ModelDataPtr m_model;
+    ModelDataPtr m_uploadedModel;
     render::CameraState m_camera;
     int m_viewMode = 0;
     int m_tankScene = -1;

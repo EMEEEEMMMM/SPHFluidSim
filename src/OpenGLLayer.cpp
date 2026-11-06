@@ -6,6 +6,7 @@
 #include <iostream>
 #include <cstdlib>
 #include <filesystem>
+#include <limits>
 #include <vector>
 
 namespace {
@@ -71,6 +72,23 @@ OpenGLLayer::OpenGLLayer(uint32_t width, uint32_t height, const std::string& sha
 	glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)(3 * sizeof(float)));
 	glBindVertexArray(0);
 
+	// Imported model: same interleaved layout as the surface, but separate GL
+	// objects and shader state so an import can never disturb the water mesh.
+	m_ModelShader = new Shader(sVert, sFrag);
+	glGenVertexArrays(1, &m_ModelVAO);
+	glBindVertexArray(m_ModelVAO);
+	glGenBuffers(1, &m_ModelVBO);
+	glBindBuffer(GL_ARRAY_BUFFER, m_ModelVBO);
+	glBufferData(GL_ARRAY_BUFFER, 0, nullptr, GL_STATIC_DRAW);
+	glGenBuffers(1, &m_ModelEBO);
+	glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, m_ModelEBO);
+	glBufferData(GL_ELEMENT_ARRAY_BUFFER, 0, nullptr, GL_STATIC_DRAW);
+	glEnableVertexAttribArray(0);
+	glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)0);
+	glEnableVertexAttribArray(1);
+	glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)(3 * sizeof(float)));
+	glBindVertexArray(0);
+
 	// Particles: instanced GL_POINTS (rendered as spheres via fragment discard).
 	// aPosInst(2)/aColorInst(3) = per-instance data, divisor 1.
 	glGenVertexArrays(1, &m_ParticleVAO);
@@ -101,6 +119,10 @@ OpenGLLayer::~OpenGLLayer() {
 	glDeleteVertexArrays(1, &m_MeshVAO);
 	glDeleteBuffers(1, &m_MeshVBO);
 	glDeleteBuffers(1, &m_MeshEBO);
+	glDeleteVertexArrays(1, &m_ModelVAO);
+	glDeleteBuffers(1, &m_ModelVBO);
+	glDeleteBuffers(1, &m_ModelEBO);
+	delete m_ModelShader;
 	delete m_SurfaceShader;
 	delete m_Shader;
 	delete m_FrameBuffer;
@@ -247,6 +269,22 @@ void OpenGLLayer::Render() {
 		glBindVertexArray(0);
 	}
 
+	// Imported visual asset: opaque, neutral lit material. It uses its own VAO
+	// and shader program, so the asynchronously updated water path is untouched.
+	if (m_ModelIndexCount > 0 && m_ModelShader) {
+		m_ModelShader->Bind();
+		glUniformMatrix4fv(glGetUniformLocation(m_ModelShader->m_RendererID, "model"), 1, GL_FALSE, &model.m[0][0]);
+		glUniformMatrix4fv(glGetUniformLocation(m_ModelShader->m_RendererID, "view"), 1, GL_FALSE, &view.m[0][0]);
+		glUniformMatrix4fv(glGetUniformLocation(m_ModelShader->m_RendererID, "projection"), 1, GL_FALSE, &projection.m[0][0]);
+		glUniform3f(glGetUniformLocation(m_ModelShader->m_RendererID, "viewPos"),
+		            m_Camera.Position.x, m_Camera.Position.y, m_Camera.Position.z);
+		glUniform1i(glGetUniformLocation(m_ModelShader->m_RendererID, "uImportedModel"), 1);
+		glBindVertexArray(m_ModelVAO);
+		glDrawElements(GL_TRIANGLES, m_ModelIndexCount, GL_UNSIGNED_INT, (void*)0);
+		glBindVertexArray(0);
+		m_ModelShader->Unbind();
+	}
+
 	// Particles first, then the opaque surface. Particles outside the mesh stay
 	// visible (closer depth), while particles inside it are correctly hidden.
 	// This order also keeps "both" consistent on Qt Quick, whose compositor can
@@ -272,6 +310,7 @@ void OpenGLLayer::Render() {
 		glUniformMatrix4fv(glGetUniformLocation(m_SurfaceShader->m_RendererID, "projection"), 1, GL_FALSE, &projection.m[0][0]);
 		glUniform3f(glGetUniformLocation(m_SurfaceShader->m_RendererID, "viewPos"),
 		            m_Camera.Position.x, m_Camera.Position.y, m_Camera.Position.z);
+		glUniform1i(glGetUniformLocation(m_SurfaceShader->m_RendererID, "uImportedModel"), 0);
 		glBindVertexArray(m_MeshVAO);
 		glDrawElements(GL_TRIANGLES, m_MeshIndexCount, GL_UNSIGNED_INT, (void*)0);
 		glBindVertexArray(0);
@@ -334,6 +373,32 @@ void OpenGLLayer::UpdateParticles(const std::vector<Math::Vector3>& positions,
 void OpenGLLayer::ResizeFrameBuffer(uint32_t width, uint32_t height) {
 	m_FrameBuffer->Resize(width, height);
 	glViewport(0, 0, width, height);
+}
+
+void OpenGLLayer::UpdateModel(const ModelDataPtr& model) {
+	m_ModelIndexCount = 0;
+	if (!model || model->vertices.empty() || model->indices.empty()) return;
+	if (model->vertices.size() % 6u != 0 || model->indices.size() % 3u != 0 ||
+	    model->indices.size() > static_cast<size_t>(std::numeric_limits<GLsizei>::max())) {
+		return;
+	}
+	const size_t vertexCount = model->vertices.size() / 6u;
+	for (uint32_t index : model->indices) {
+		if (index >= vertexCount) return;
+	}
+
+	glBindVertexArray(m_ModelVAO);
+	glBindBuffer(GL_ARRAY_BUFFER, m_ModelVBO);
+	glBufferData(GL_ARRAY_BUFFER,
+	             static_cast<GLsizeiptr>(model->vertices.size() * sizeof(float)),
+	             model->vertices.data(), GL_STATIC_DRAW);
+	glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, m_ModelEBO);
+	glBufferData(GL_ELEMENT_ARRAY_BUFFER,
+	             static_cast<GLsizeiptr>(model->indices.size() * sizeof(uint32_t)),
+	             model->indices.data(), GL_STATIC_DRAW);
+	glBindBuffer(GL_ARRAY_BUFFER, 0);
+	glBindVertexArray(0);
+	m_ModelIndexCount = static_cast<GLsizei>(model->indices.size());
 }
 
 void OpenGLLayer::UpdateSurfaceMesh(const std::vector<float>& verts,

@@ -1,5 +1,9 @@
 #include <QApplication>
+#include <QFile>
 #include <QFont>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QPixmap>
 #include <QSettings>
 #include <QSurfaceFormat>
@@ -90,10 +94,118 @@ double ParseDropVideoSeconds(const std::string& v, int fps) {
     return static_cast<double>(atoi(v.c_str())) / static_cast<double>(fps);
 }
 
+// Reads the same versioned JSON document the GUI writes for a render job.
+// Missing keys keep existing defaults; malformed values are reported before
+// any output directory or GL context is created.
+bool ApplyRenderConfig(const std::string& path, HeadlessOptions& opt, std::string& error) {
+    QFile file(QString::fromStdString(path));
+    if (!file.open(QIODevice::ReadOnly)) {
+        error = "cannot open config file '" + path + "'";
+        return false;
+    }
+    QJsonParseError parseError{};
+    const QJsonDocument doc = QJsonDocument::fromJson(file.readAll(), &parseError);
+    if (parseError.error != QJsonParseError::NoError || !doc.isObject()) {
+        error = "invalid JSON config: " + parseError.errorString().toStdString();
+        return false;
+    }
+    const QJsonObject root = doc.object();
+    if (root.contains(QStringLiteral("app")) &&
+        root.value(QStringLiteral("app")).toString() != QStringLiteral("IISPH")) {
+        error = "config belongs to a different application";
+        return false;
+    }
+    if (root.contains(QStringLiteral("schemaVersion")) &&
+        root.value(QStringLiteral("schemaVersion")).toInt() != 1) {
+        error = "unsupported config schema version";
+        return false;
+    }
+
+    const QJsonObject simulation = root.value(QStringLiteral("simulation")).toObject();
+    const QJsonObject render = root.value(QStringLiteral("render")).toObject();
+    auto number = [](const QJsonObject& object, const char* key, double& out) {
+        const QJsonValue value = object.value(QLatin1String(key));
+        if (!value.isDouble()) return false;
+        out = value.toDouble();
+        return std::isfinite(out);
+    };
+    double value = 0.0;
+
+    if (simulation.value(QStringLiteral("scene")).isString())
+        opt.scene = simulation.value(QStringLiteral("scene")).toString().toStdString();
+    if (simulation.value(QStringLiteral("solver")).isString()) {
+        const std::string normalized =
+            NormalizeSolver(simulation.value(QStringLiteral("solver")).toString().toStdString());
+        if (!normalized.empty()) opt.solver = normalized;
+    }
+    if (number(simulation, "particleCount", value) && value > 0.0)
+        opt.particles = static_cast<int>(value);
+    if (simulation.contains(QStringLiteral("spacing")) &&
+        number(simulation, "spacing", value))
+        opt.spacing = static_cast<float>(value);
+    if (simulation.contains(QStringLiteral("dt")) && number(simulation, "dt", value))
+        opt.dt = static_cast<float>(value);
+    if (simulation.value(QStringLiteral("useCFL")).isBool())
+        opt.useCFL = simulation.value(QStringLiteral("useCFL")).toBool();
+    if (simulation.contains(QStringLiteral("omega")) && number(simulation, "omega", value))
+        opt.omega = static_cast<float>(value);
+    if (simulation.contains(QStringLiteral("eta")) && number(simulation, "eta", value))
+        opt.eta = static_cast<float>(value);
+    if (simulation.contains(QStringLiteral("etaV")) && number(simulation, "etaV", value))
+        opt.etaV = static_cast<float>(value);
+    if (simulation.contains(QStringLiteral("maxIter")) && number(simulation, "maxIter", value))
+        opt.maxIter = static_cast<int>(value);
+    if (simulation.contains(QStringLiteral("viscosity")) &&
+        number(simulation, "viscosity", value))
+        opt.viscosity = static_cast<float>(value);
+    if (simulation.contains(QStringLiteral("surfaceTension")) &&
+        number(simulation, "surfaceTension", value))
+        opt.surfaceTension = static_cast<float>(value);
+    if (simulation.contains(QStringLiteral("wallAdhesion")) &&
+        number(simulation, "wallAdhesion", value))
+        opt.wallAdhesion = static_cast<float>(value);
+
+    if (render.value(QStringLiteral("mode")).isString())
+        opt.mode = render.value(QStringLiteral("mode")).toString() == QStringLiteral("particles")
+            ? HeadlessOptions::Mode::Particles : HeadlessOptions::Mode::Surface;
+    if (number(render, "fps", value)) opt.fps = static_cast<int>(value);
+    if (number(render, "frames", value)) opt.frames = static_cast<int>(value);
+    if (number(render, "seconds", value)) opt.seconds = value;
+    if (number(render, "timeScale", value)) opt.timeScale = value;
+    if (number(render, "width", value)) opt.width = static_cast<int>(value);
+    if (number(render, "height", value)) opt.height = static_cast<int>(value);
+    if (number(render, "gridScale", value)) opt.gridScale = static_cast<float>(value);
+    if (number(render, "surfaceThreshold", value))
+        opt.surfaceThreshold = static_cast<float>(value);
+    if (number(render, "reconInterval", value))
+        opt.reconInterval = static_cast<int>(value);
+    if (number(render, "threads", value)) opt.threads = static_cast<int>(value);
+    if (render.value(QStringLiteral("output")).isString())
+        opt.output = render.value(QStringLiteral("output")).toString().toStdString();
+    if (render.value(QStringLiteral("exportParticles")).isBool())
+        opt.exportParticles = render.value(QStringLiteral("exportParticles")).toBool();
+    if (render.value(QStringLiteral("keepFrames")).isBool())
+        opt.keepFrames = render.value(QStringLiteral("keepFrames")).toBool();
+    if (render.value(QStringLiteral("noVideo")).isBool())
+        opt.noVideo = render.value(QStringLiteral("noVideo")).toBool();
+
+    const QJsonArray events = root.value(QStringLiteral("events")).toArray();
+    for (const QJsonValue& eventValue : events) {
+        const QJsonObject event = eventValue.toObject();
+        if (event.value(QStringLiteral("type")).toString() != QStringLiteral("drop")) continue;
+        if (number(event, "time", value) && value >= 0.0) opt.dropVideoSeconds = value;
+    }
+    return true;
+}
+
 int RunGui(QApplication& app, const std::string& uiKind, const std::string& screenshotPath,
            int screenshotDelayMs, bool autoplay, int viewMode) {
+    // Use a font family that actually ships with Windows 10/11. The previous
+    // "Segoe UI Variable Text" is only present on newer Windows builds; when it
+    // is missing Qt falls back to the legacy bitmap MS Sans Serif, which
+    // DirectWrite cannot load and logs CreateFontFaceFromHDC() failures for.
     QFont base = app.font();
-    base.setFamily(QStringLiteral("Segoe UI Variable Text"));
+    base.setFamily(QStringLiteral("Segoe UI"));
     base.setPointSizeF(10.0);
     app.setFont(base);
 
@@ -127,6 +239,7 @@ int main(int argc, char** argv) {
     std::string dropSpec;
     std::string uiKind = "qml";
     std::string screenshotPath;
+    std::string configPath;
     int screenshotDelayMs = 1500;
     int themeOverride = -1;
     bool autoplay = false;
@@ -137,6 +250,12 @@ int main(int argc, char** argv) {
         const char* a = argv[i];
         if (Match(a, "--headless")) {
             headless = true;
+        } else if (Match(a, "--control")) {
+            opt.control = true;
+        } else if (MatchPrefix(a, "--config=")) {
+            configPath = ValueAfter(a, "--config=");
+        } else if (Match(a, "--config") && i + 1 < argc) {
+            configPath = argv[++i];
         } else if (Match(a, "--gui")) {
             headless = false;
         } else if (MatchPrefix(a, "--ui=")) {
@@ -274,6 +393,13 @@ int main(int argc, char** argv) {
         }
     }
 
+    if (!configPath.empty()) {
+        std::string configError;
+        if (!ApplyRenderConfig(configPath, opt, configError)) {
+            printf("[args] ERROR: %s\n", configError.c_str());
+            return 1;
+        }
+    }
     if (!dropSpec.empty()) opt.dropVideoSeconds = ParseDropVideoSeconds(dropSpec, opt.fps);
 
     if (opt.width <= 0 || opt.height <= 0 || opt.width > 16384 || opt.height > 16384) {

@@ -38,7 +38,6 @@ Requirements:
 ```powershell
 cmake -S . -B build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="YOUR_PATH_TO/msys64/ucrt64"
 cmake --build build --parallel
-ctest --test-dir build --output-on-failure
 .\build\SPHFluidSim.exe
 ```
 

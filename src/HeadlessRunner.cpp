@@ -23,6 +23,12 @@
 #include <cstdlib>
 #include <cstring>
 #include <cerrno>
+#include <condition_variable>
+#include <iostream>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <thread>
 #include <vector>
 #include <io.h>   // _popen / _pclose (MinGW)
 #include <algorithm>
@@ -32,6 +38,90 @@
 #include <omp.h>
 
 namespace {
+
+// Parent <-> renderer control channel. Commands arrive on stdin as plain text
+// while structured progress leaves on stdout, one JSON object per line. State
+// is shared with a detached reader so a blocked getline can never delay the
+// render loop or process shutdown.
+struct RenderControl {
+    struct State {
+        std::mutex mutex;
+        std::mutex outputMutex;
+        std::condition_variable cv;
+        bool paused = false;
+        bool cancelled = false;
+    };
+
+    std::shared_ptr<State> state = std::make_shared<State>();
+    bool enabled = false;
+
+    explicit RenderControl(bool controlEnabled) : enabled(controlEnabled) {
+        if (!enabled) return;
+        const auto shared = state;
+        std::thread([shared] {
+            std::string line;
+            while (std::getline(std::cin, line)) {
+                while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
+                if (line == "pause") {
+                    {
+                        std::lock_guard<std::mutex> lk(shared->mutex);
+                        shared->paused = true;
+                    }
+                    std::lock_guard<std::mutex> out(shared->outputMutex);
+                    std::printf("@STATE {\"state\":\"paused\"}\n");
+                    std::fflush(stdout);
+                } else if (line == "resume") {
+                    {
+                        std::lock_guard<std::mutex> lk(shared->mutex);
+                        shared->paused = false;
+                    }
+                    shared->cv.notify_all();
+                    std::lock_guard<std::mutex> out(shared->outputMutex);
+                    std::printf("@STATE {\"state\":\"running\"}\n");
+                    std::fflush(stdout);
+                } else if (line == "cancel") {
+                    {
+                        std::lock_guard<std::mutex> lk(shared->mutex);
+                        shared->cancelled = true;
+                        shared->paused = false;
+                    }
+                    shared->cv.notify_all();
+                    break;
+                }
+            }
+        }).detach();
+    }
+
+    // Blocks while paused and returns false as soon as cancellation is asked.
+    // Called between solver steps, stages, and rendered frames.
+    bool Checkpoint() {
+        if (!enabled) return true;
+        std::unique_lock<std::mutex> lk(state->mutex);
+        if (state->cancelled) return false;
+        if (!state->paused) return true;
+        state->cv.wait(lk, [this] { return state->cancelled || !state->paused; });
+        return !state->cancelled;
+    }
+
+    void ReportProgress(int frame, int totalFrames, double overall, double stage,
+                        const char* stageName, double elapsed, double eta) {
+        if (!enabled) return;
+        std::lock_guard<std::mutex> out(state->outputMutex);
+        std::printf("@PROGRESS {\"frame\":%d,\"totalFrames\":%d,\"overall\":%.6f,"
+                    "\"stageProgress\":%.6f,\"stage\":\"%s\",\"elapsed\":%.3f,\"eta\":%.3f}\n",
+                    frame, totalFrames, std::clamp(overall, 0.0, 1.0),
+                    std::clamp(stage, 0.0, 1.0), stageName, std::max(0.0, elapsed), eta);
+        std::fflush(stdout);
+    }
+
+    void ReportState(const char* value) {
+        if (!enabled) return;
+        std::lock_guard<std::mutex> out(state->outputMutex);
+        std::printf("@STATE {\"state\":\"%s\"}\n", value);
+        std::fflush(stdout);
+    }
+};
+
 
 bool MakeDirs(const std::string& dir) {
     if (_mkdir(dir.c_str()) == 0) return true;
@@ -147,6 +237,11 @@ bool WriteParticlePLY(const std::string& path, const std::vector<Math::Vector3>&
 // ---------------------------------------------------------------------------
 int RunHeadless(const HeadlessOptions& opt) {
     if (opt.threads > 0) omp_set_num_threads(opt.threads);
+    RenderControl control(opt.control);
+    if (!control.Checkpoint()) {
+        control.ReportState("cancelled");
+        return 0;
+    }
 
     // Resolve the output directory and validate the particle dump BEFORE any GL
     // or solver work: a full disk must abort before the simulation starts.
@@ -189,24 +284,37 @@ int RunHeadless(const HeadlessOptions& opt) {
     OpenGLLayer layer(opt.width, opt.height);
     FluidSolver solver;
 
-    solver.GetParams().solver = (opt.solver == "dfsph") ? 1 : 0;
+    auto& params = solver.GetParams();
+    params.solver = (opt.solver == "dfsph") ? 1 : 0;
+    if (opt.useCFL) params.useCFL = *opt.useCFL;
+    if (opt.omega) params.omega = *opt.omega;
+    if (opt.eta) params.eta = *opt.eta;
+    if (opt.etaV) params.etaV = *opt.etaV;
+    if (opt.maxIter) params.maxIter = *opt.maxIter;
+    if (opt.viscosity) params.viscosity = *opt.viscosity;
+    if (opt.surfaceTension) params.surfaceTension = *opt.surfaceTension;
+    if (opt.wallAdhesion) params.surfaceTensionBoundary = *opt.wallAdhesion;
 
     // --particles -> spacing: each scene defines a FIXED water volume, and the
     // spacing is derived so that N particles always fill that volume:
     //   volume = N * spacing^3  ->  spacing = (volume / N)^(1/3).
-    // Choosing 8000 or 16000 particles therefore gives the SAME water volume
-    // (the water looks identical, just more/less resolved).
+    // A JSON job may instead provide the GUI spacing directly, which reproduces
+    // the exact resolution (and therefore particle count) seen in the window.
     const bool isInflow = (opt.scene == "inflow");
     float waterVol = 0.512f;                       // dam: 0.8^3 water cube (open-top tank)
     if (isInflow) waterVol = 0.6f;                 // inflow: open tank filled to 60%
     const float waterSize = powf(waterVol, 1.0f / 3.0f);
-    float spacing = powf(waterVol / (float)opt.particles, 1.0f / 3.0f);
-    solver.GetParams().spacing = spacing;
-    if (opt.dt > 0.0f) solver.GetParams().dt = opt.dt;
+    float spacing = opt.spacing && *opt.spacing > 0.0f
+        ? *opt.spacing
+        : powf(waterVol / (float)opt.particles, 1.0f / 3.0f);
+    params.spacing = spacing;
+    if (opt.dt > 0.0f) params.dt = opt.dt;
+    const int initParticles = std::max(1, (int)std::lround(waterVol / powf(spacing, 3.0f))) +
+                              (isInflow ? 8 : 0);
     if (isInflow) {
         // open-top cubic container (side 1 m at x=1, z=0.5) + central jet
         // falling 0.5 m from above (stronger jet)
-        solver.InitInflow(1.0f, 0.5f, 100, 0.12f, 1.0f, 0.5f, opt.particles);
+        solver.InitInflow(1.0f, 0.5f, 100, 0.12f, 1.0f, 0.5f, initParticles);
         layer.SetTankSize(1.0f, 1.0f, 1.0f, 1.0f, 0.5f, true);
     } else {
         // dam break in an OPEN-TOP tank: splash may leave the tank. With
@@ -234,6 +342,7 @@ int RunHeadless(const HeadlessOptions& opt) {
     layer.SetParticlesVisible(!showSurface);
     SurfaceReconstructor recon;
     recon.SetGridScale(opt.gridScale);   // 1.0 = paper r (fast), 0.5 = r/2 high-quality
+    recon.SetSurfaceThreshold(opt.surfaceThreshold);
 
     if (!MakeDirs(dir)) {
         printf("[headless] ERROR: cannot create output directory '%s' (does its parent exist?)\n", dir.c_str());
@@ -276,7 +385,7 @@ int RunHeadless(const HeadlessOptions& opt) {
     int bmpFailures = 0;
     int plyFailures = 0;
     std::vector<float> plyScratch;
-    const int reconInterval = 3;   // rebuild mesh every N frames
+    const int reconInterval = std::max(1, opt.reconInterval);
 
     printf("[headless] particles=%d (spacing=%.4f)  frames=%d  fps=%d  time-scale=%.4g  mode=%s  res=%dx%d\n",
            solver.FluidCount(), spacing, opt.frames, opt.fps, opt.timeScale,
@@ -296,10 +405,44 @@ int RunHeadless(const HeadlessOptions& opt) {
                opt.dropVideoSeconds, solver.SimTime(), solver.FluidCount());
     };
     spawnDropIfDue();   // --drop 0 / 0f happens before the first simulation step
+    bool cancelled = false;
+    int lastFrame = 0;
+    double lastTargetTime = 0.0;
     for (int f = 0; f < opt.frames; f++) {
+        lastFrame = f;
+        if (!control.Checkpoint()) {
+            cancelled = true;
+            break;
+        }
         const double targetSimTime =
             headless_timing::FrameTargetSimTime(f, opt.fps, opt.timeScale);
-        headless_timing::AdvanceTo(solver, targetSimTime, spawnDropIfDue);
+        double elapsed = omp_get_wtime() - tWall0;
+        double eta = f > 0 ? elapsed / (double)(f + 1) * (double)(opt.frames - f - 1) : -1.0;
+        control.ReportProgress(f, opt.frames, (double)f / (double)opt.frames, 0.0,
+                               "Simulating", elapsed, eta);
+
+        // Advance one video frame, checking pause/cancel between every solver
+        // step. During slow-motion renders a single frame can be hundreds of
+        // steps, so frame-boundary checks alone would feel unresponsive.
+        while (static_cast<double>(solver.SimTime()) < targetSimTime) {
+            solver.Step();
+            spawnDropIfDue();
+            if (!control.Checkpoint()) {
+                cancelled = true;
+                break;
+            }
+        }
+        if (cancelled) break;
+        const double simFraction = targetSimTime > lastTargetTime
+            ? std::clamp((static_cast<double>(solver.SimTime()) - lastTargetTime) /
+                         (targetSimTime - lastTargetTime), 0.0, 1.0)
+            : 1.0;
+        lastTargetTime = targetSimTime;
+
+        elapsed = omp_get_wtime() - tWall0;
+        eta = f > 0 ? elapsed / (double)(f + 1) * (double)(opt.frames - f - 1) : -1.0;
+        control.ReportProgress(f, opt.frames, (double)f / (double)opt.frames,
+                               simFraction * 0.55, "Simulating", elapsed, eta);
 
         if (opt.exportParticles) {
             char name[512];
@@ -312,10 +455,22 @@ int RunHeadless(const HeadlessOptions& opt) {
 
         layer.UpdateParticles(solver.Positions(), solver.Colors());
         if (showSurface && (f % reconInterval == 0)) {
+            control.ReportProgress(f, opt.frames, (double)f / (double)opt.frames,
+                                   0.6, "Reconstructing surface", elapsed, eta);
+            if (!control.Checkpoint()) {
+                cancelled = true;
+                break;
+            }
             if (recon.Reconstruct(solver.Positions(), solver.Spacing()))
                 layer.UpdateSurfaceMesh(recon.Vertices(), recon.Indices());
         }
 
+        if (!control.Checkpoint()) {
+            cancelled = true;
+            break;
+        }
+        control.ReportProgress(f, opt.frames, (double)f / (double)opt.frames,
+                               0.78, "Rendering image", elapsed, eta);
         layer.Render();
 
         // Read the FBO back to CPU: GL_BGRA is 4-byte aligned and needs no
@@ -326,6 +481,12 @@ int RunHeadless(const HeadlessOptions& opt) {
         glReadPixels(0, 0, opt.width, opt.height, GL_BGRA, GL_UNSIGNED_BYTE, pixels.data());
         fb->UBind();
 
+        if (!control.Checkpoint()) {
+            cancelled = true;
+            break;
+        }
+        control.ReportProgress(f, opt.frames, (double)f / (double)opt.frames,
+                               0.9, "Encoding video", elapsed, eta);
         if (pipe) {
             // rawvideo bgr24 expects top-down rows; glReadPixels gives
             // bottom-up, so write rows in reverse order (row h-1 first).
@@ -349,12 +510,16 @@ int RunHeadless(const HeadlessOptions& opt) {
             }
         }
 
+        elapsed = omp_get_wtime() - tWall0;
+        eta = elapsed / (double)(f + 1) * (double)(opt.frames - f - 1);
+        control.ReportProgress(f, opt.frames, (double)(f + 1) / (double)opt.frames,
+                               1.0, "Encoding video", elapsed, eta);
+
         if (f % 30 == 0 || f == opt.frames - 1) {
             // Elapsed / remaining wall time. The estimate is the average cost
             // of the frames done so far, so it self-corrects when a drop is
             // spawned or the mesh gets denser; on frame 0 there is nothing to
             // average yet and it prints "--:--".
-            const double elapsed = omp_get_wtime() - tWall0;
             char elStr[32], etaStr[32];
             FormatDuration(elapsed, elStr, sizeof(elStr));
             if (f > 0) {
@@ -371,6 +536,25 @@ int RunHeadless(const HeadlessOptions& opt) {
                    solver.LastIterations(), layer.SurfaceTriangleCount(), elStr, etaStr);
             fflush(stdout);
         }
+    }
+
+    if (cancelled) {
+        if (pipe) {
+            _pclose(pipe);
+            pipe = nullptr;
+        }
+        control.ReportProgress(lastFrame, opt.frames,
+                               (double)lastFrame / (double)opt.frames,
+                               0.0, "Cancelled", omp_get_wtime() - tWall0, -1.0);
+        control.ReportState("cancelled");
+        return 0;
+    }
+
+    // ffmpeg drains the remaining pipe data here; this is the final encoding
+    // stage and can take a noticeable moment for long videos.
+    if (pipe) {
+        control.ReportProgress(opt.frames, opt.frames, 1.0, 0.95,
+                               "Encoding video", omp_get_wtime() - tWall0, 0.0);
     }
     double tWall1 = omp_get_wtime();
     printf("[headless] done: %d frames in %.1f s (%.1f fps wall), video time %.2f s, sim time %.3f s (time scale %.4g)\n",
@@ -437,6 +621,9 @@ int RunHeadless(const HeadlessOptions& opt) {
         return 1;
     }
 
+    control.ReportProgress(opt.frames, opt.frames, 1.0, 1.0, "Completed",
+                           omp_get_wtime() - tWall0, 0.0);
+    control.ReportState("completed");
     return 0;
 }
 

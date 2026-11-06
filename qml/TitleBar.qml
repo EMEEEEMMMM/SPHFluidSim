@@ -99,18 +99,19 @@ Rectangle {
     }
 
     IconBtn {
-        id: stepButton
+        id: screenshotButton
         anchors.left: playButton.right
         anchors.leftMargin: 6
         anchors.verticalCenter: parent.verticalCenter
         z: 1
-        kind: 2
-        onClicked: bar.session.stepOnce()
+        kind: 4
+        iconRatio: 0.68
+        onClicked: bar.screenshotRequested()
     }
 
     Rectangle {
         id: clock
-        anchors.left: stepButton.right
+        anchors.left: screenshotButton.right
         anchors.leftMargin: 8
         anchors.verticalCenter: parent.verticalCenter
         z: 1
@@ -144,7 +145,6 @@ Rectangle {
             onActivated: (index) => bar.viewModeRequested(index)
         }
 
-        IconBtn { kind: 7; onClicked: bar.screenshotRequested() }
         IconBtn { kind: 5; onClicked: bar.fullscreenRequested() }
 
         Rectangle {

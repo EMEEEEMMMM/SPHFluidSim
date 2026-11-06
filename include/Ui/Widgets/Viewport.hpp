@@ -93,6 +93,7 @@ private:
     int m_tankScene = 0;
     SimSnapshotPtr m_lastSnapshot;
     SurfaceSnapshotPtr m_lastSurface;
+    ModelDataPtr m_lastModel;
 
     QSet<int> m_keys;
 };

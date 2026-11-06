@@ -111,6 +111,11 @@ void Viewport::paintGL() {
         else m_view->UpdateSurface({}, {});
         m_lastSurface = surf;
     }
+    ModelDataPtr model = m_session->model();
+    if (model != m_lastModel) {
+        m_view->UpdateModel(model);
+        m_lastModel = model;
+    }
 
     m_view->SetSurfaceVisible(m_viewMode > 0);
     m_view->SetParticlesVisible(m_viewMode != 1);

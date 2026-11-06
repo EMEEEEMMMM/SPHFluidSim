@@ -23,6 +23,7 @@ Window {
 
     property real fpsValue: 0
     property string message: ""
+    property bool renderFlowActive: false
     // 0 = Orbit, 1 = Fly. Drives the camera card and the S shortcut: in Fly
     // mode S is "move backwards" and must not trigger a single step.
     property int cameraMode: 0
@@ -51,6 +52,7 @@ Window {
             Layout.fillWidth: true
             session: root.sim
             onScreenshotRequested: root.saveScreenshot()
+            onRenderRequested: root.openRenderDialog()
         }
 
         Item {
@@ -119,9 +121,7 @@ Window {
         StatusBar {
             Layout.fillWidth: true
             session: root.sim
-            leftText: root.message !== ""
-                      ? root.message
-                      : "OpenGL 3.3 core · Qt Quick · " + (root.sim.params.scene === 1 ? "inflow" : "dam break")
+            leftText: root.message
         }
     }
 
@@ -210,6 +210,85 @@ Window {
         }
     }
 
+    Connections {
+        target: root.sim
+        function onMessage(text) {
+            root.message = text;
+            messageTimer.restart();
+        }
+    }
+
+    Connections {
+        target: renderJob
+        function onCompleted() {
+            root.renderFlowActive = false;
+            root.message = "The rendering has ended";
+            messageTimer.restart();
+            if (renderProgressLoader.status === Loader.Ready)
+                renderProgressLoader.item.close();
+            renderCompletedDialog.open();
+        }
+        function onFailed(message) {
+            if (!root.renderFlowActive) {
+                root.message = message;
+                messageTimer.restart();
+                return;
+            }
+            root.renderFlowActive = false;
+            if (renderProgressLoader.status === Loader.Ready)
+                renderProgressLoader.item.close();
+            renderFailedDialog.bodyText = message;
+            renderFailedDialog.open();
+        }
+        function onCancelled() {
+            root.renderFlowActive = false;
+            if (renderProgressLoader.status === Loader.Ready)
+                renderProgressLoader.item.close();
+            root.message = "Render cancelled";
+            messageTimer.restart();
+        }
+    }
+
+    Loader {
+        id: renderDialogLoader
+        active: false
+        asynchronous: true
+        source: "RenderDialog.qml"
+
+        onLoaded: {
+            item.session = root.sim;
+            item.job = renderJob;
+            item.started.connect(root.showRenderProgress);
+            item.closed.connect(function () { renderDialogLoader.active = false; });
+            item.open();
+        }
+    }
+
+    Loader {
+        id: renderProgressLoader
+        active: false
+        asynchronous: true
+        source: "RenderProgressDialog.qml"
+
+        onLoaded: {
+            item.job = renderJob;
+            item.closed.connect(function () { renderProgressLoader.active = false; });
+            item.open();
+        }
+    }
+
+    InfoDialog {
+        id: renderCompletedDialog
+        title: qsTr("Render")
+        bodyText: qsTr("The rendering has ended")
+    }
+
+    InfoDialog {
+        id: renderFailedDialog
+        title: qsTr("Render failed")
+        bodyText: ""
+    }
+
     ResizeHandle {
         targetWindow: root
         edges: Qt.LeftEdge
@@ -293,6 +372,9 @@ Window {
     Shortcut { sequence: "R"; onActivated: root.sim.resetSimulation() }
     Shortcut { sequence: "Ctrl+T"; onActivated: Theme.cycle() }
     Shortcut { sequence: "Ctrl+S"; onActivated: root.saveScreenshot() }
+    Shortcut { sequence: "Ctrl+Shift+O"; onActivated: root.sim.importParameters() }
+    Shortcut { sequence: "Ctrl+Shift+S"; onActivated: root.sim.exportParameters() }
+    Shortcut { sequence: "Ctrl+Shift+R"; onActivated: root.openRenderDialog() }
     Shortcut { sequence: "F11"; onActivated: root.toggleFullscreen() }
 
     function hudText() {
@@ -338,8 +420,26 @@ Window {
 
     function saveScreenshot() {
         const path = capture.save(root);
-        root.message = path === "" ? "Screenshot failed" : "Saved " + path;
+        root.message = path === "" ? "Screenshot failed" : "Saved to " + path;
         messageTimer.restart();
+    }
+
+    function openRenderDialog() {
+        if (renderJob.running) {
+            root.message = "A render is already running";
+            messageTimer.restart();
+            return;
+        }
+        if (renderDialogLoader.status === Loader.Ready) {
+            renderDialogLoader.item.open();
+        } else {
+            renderDialogLoader.active = true;
+        }
+    }
+
+    function showRenderProgress() {
+        renderFlowActive = true;
+        renderProgressLoader.active = true;
     }
 
     Timer {

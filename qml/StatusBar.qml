@@ -28,8 +28,9 @@ Rectangle {
 
         Text {
             text: status.leftText
-            color: status.c.fg3
+            color: status.leftText.indexOf("Saved to ") === 0 ? status.c.ok : status.c.fg3
             font.pixelSize: 10
+            font.weight: status.leftText.indexOf("Saved to ") === 0 ? Font.DemiBold : Font.Normal
         }
 
         Item { Layout.fillWidth: true }

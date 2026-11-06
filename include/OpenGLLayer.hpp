@@ -9,6 +9,7 @@
 #include "Shader.h"
 #include "Camera.hpp"
 #include "Math/Vector3.hpp"
+#include "Model.hpp"
 #include <vector>
 
 enum class ProjectionMode { Perspective, Orthographic };
@@ -49,6 +50,11 @@ public:
     // Reconstructed fluid surface mesh (Akinci 2012): verts = 3 floats/vertex,
     // indices = triangles. Drawn with the Phong surface shader when visible.
     void UpdateSurfaceMesh(const std::vector<float>& verts, const std::vector<unsigned>& indices);
+
+    // Imported visual asset. This path owns separate GL buffers from the
+    // asynchronously rebuilt water surface. A null pointer clears the model.
+    void UpdateModel(const ModelDataPtr& model);
+
     void SetSurfaceVisible(bool v) { m_ShowSurface = v; }
     void SetParticlesVisible(bool v) { m_ShowParticles = v; }
     bool SurfaceVisible() const { return m_ShowSurface; }
@@ -72,6 +78,13 @@ private:
     Shader* m_SurfaceShader = nullptr;
     bool m_ShowSurface = false;
     bool m_ShowParticles = true;   // false in pure-surface mode
+
+    // Imported model (neutral Phong material, independent of the water mesh).
+    GLuint m_ModelVAO = 0;
+    GLuint m_ModelVBO = 0;
+    GLuint m_ModelEBO = 0;
+    GLsizei m_ModelIndexCount = 0;
+    Shader* m_ModelShader = nullptr;
 
     ProjectionMode m_CurrentMode = ProjectionMode::Perspective;
     Camera m_Camera = Camera(2.8f, 1.4f, 2.2f, 0.0f, 1.0f, 0.0f, -136.7f, -18.0f);

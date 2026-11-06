@@ -41,6 +41,16 @@ else()
     message(WARNING "OpenCL not found — GPU surface reconstruction disabled (CPU path only)")
 endif()
 
+find_package(assimp CONFIG QUIET)
+if(TARGET assimp::assimp)
+    set(ASSIMP_TARGET assimp::assimp)
+else()
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(ASSIMP REQUIRED IMPORTED_TARGET assimp)
+    set(ASSIMP_TARGET PkgConfig::ASSIMP)
+endif()
+message(STATUS "Assimp: ${ASSIMP_TARGET}")
+
 set(GLAD_DIR "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/glad")
 set(SHADER_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src/ShaderProgram")
 
@@ -69,10 +79,16 @@ target_link_libraries(sph_core PUBLIC
 target_compile_options(sph_core PRIVATE -fopenmp)
 
 add_library(sph_session STATIC
+    include/Model.hpp
     include/Session/SimulationSession.hpp
+    src/Model.cpp
     src/Session/SimulationSession.cpp
 )
-target_link_libraries(sph_session PUBLIC sph_core Qt6::Core)
+target_link_libraries(sph_session PUBLIC
+    sph_core
+    Qt6::Core
+    Qt6::Widgets
+    ${ASSIMP_TARGET})
 
 add_library(sph_theme STATIC
     include/Ui/Theme.hpp
@@ -91,10 +107,12 @@ add_executable(${PROJECT_NAME}
     include/Ui/Widgets/Controls.hpp
     include/Ui/Widgets/MainWindow.hpp
     include/Ui/Widgets/Panels.hpp
+    include/Ui/Widgets/RenderDialogs.hpp
     include/Ui/Widgets/Viewport.hpp
     src/Ui/Widgets/Controls.cpp
     src/Ui/Widgets/MainWindow.cpp
     src/Ui/Widgets/Panels.cpp
+    src/Ui/Widgets/RenderDialogs.cpp
     src/Ui/Widgets/Viewport.cpp
     include/Ui/Qml/CaptureHelper.hpp
     include/Ui/Qml/IconItem.hpp
@@ -104,6 +122,8 @@ add_executable(${PROJECT_NAME}
     src/Ui/Qml/IconItem.cpp
     src/Ui/Qml/QmlFrontend.cpp
     src/Ui/Qml/ViewportItem.cpp
+    include/Render/RenderJob.hpp
+    src/Render/RenderJob.cpp
     qml/qml.qrc
 )
 target_link_libraries(${PROJECT_NAME} PRIVATE
@@ -152,6 +172,13 @@ add_headless_test(verify_hydrostatic)
 add_headless_test(benchmark)
 add_headless_test(surface_reconstruct)
 
+add_executable(test_model_import tests/test_model_import.cpp src/Model.cpp)
+target_include_directories(test_model_import PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(test_model_import PRIVATE Qt6::Core ${ASSIMP_TARGET})
+
+add_executable(test_params_json tests/test_params_json.cpp)
+target_link_libraries(test_params_json PRIVATE sph_session Qt6::Core Qt6::Widgets)
+
 target_sources(surface_reconstruct PRIVATE src/SurfaceReconstructor.cpp src/SurfaceReconstructorCL.cpp)
 target_include_directories(surface_reconstruct PRIVATE ${OpenCL_INCLUDE_DIRS})
 target_link_libraries(surface_reconstruct PRIVATE ${OpenCL_LIBRARIES})
@@ -165,3 +192,5 @@ add_test(NAME timeline    COMMAND test_timeline)
 add_test(NAME hydrostatic COMMAND verify_hydrostatic 200)
 add_test(NAME surface     COMMAND surface_reconstruct)
 add_test(NAME dfsph       COMMAND test_solver 120 0.003 0 0.1 DFSPH)
+add_test(NAME model_import COMMAND test_model_import)
+add_test(NAME params_json COMMAND test_params_json)

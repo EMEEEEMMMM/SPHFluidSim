@@ -40,6 +40,8 @@ struct GlView::Impl {
     bool surfaceDirty = false;
     std::vector<float> verts;
     std::vector<unsigned> indices;
+    bool modelDirty = false;
+    ModelDataPtr model;
 
     void PushCamera() {
         if (!layer) return;
@@ -117,6 +119,10 @@ void GlView::Render() {
     if (d.surfaceDirty) {
         d.layer->UpdateSurfaceMesh(d.verts, d.indices);
         d.surfaceDirty = false;
+    }
+    if (d.modelDirty) {
+        d.layer->UpdateModel(d.model);
+        d.modelDirty = false;
     }
     d.PushCamera();
     d.layer->Render();
@@ -198,6 +204,11 @@ void GlView::UpdateSurface(const std::vector<float>& verts,
     m_impl->verts = verts;
     m_impl->indices = indices;
     m_impl->surfaceDirty = true;
+}
+
+void GlView::UpdateModel(const ModelDataPtr& model) {
+    m_impl->model = model;
+    m_impl->modelDirty = true;
 }
 
 void GlView::SetSurfaceVisible(bool visible) {

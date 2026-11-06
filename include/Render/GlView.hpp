@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "Math/Vector3.hpp"
+#include "Model.hpp"
 #include "Render/CameraRig.hpp"
 
 namespace render {
@@ -62,6 +63,8 @@ public:
                          const std::vector<float>& colors);
     void UpdateSurface(const std::vector<float>& verts,
                        const std::vector<unsigned>& indices);
+    // Queues an imported visual model for upload during Render(). Null clears it.
+    void UpdateModel(const ModelDataPtr& model);
     void SetSurfaceVisible(bool visible);
     void SetParticlesVisible(bool visible);
     void SetTank(float x, float y, float z, float cx, float cz, bool openTop);

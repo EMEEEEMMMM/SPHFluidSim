@@ -3,6 +3,11 @@
 #include <QDateTime>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QFile>
+#include <QDebug>
+#include <QFileDialog>
+#include <QFileInfo>
+#include <QSaveFile>
 
 #include <algorithm>
 #include <chrono>
@@ -127,6 +132,7 @@ struct SimulationSession::Impl {
     mutable std::mutex pubMutex;
     SimSnapshotPtr snapshot;
     SurfaceSnapshotPtr surface;
+    ModelDataPtr model;
     uint64_t surfaceVersion = 0;
 
     // ---- UI copies (read by bindings) -------------------------------------
@@ -224,6 +230,11 @@ SurfaceSnapshotPtr SimulationSession::surface() const {
     return m_impl->surface;
 }
 
+ModelDataPtr SimulationSession::model() const {
+    std::lock_guard<std::mutex> lk(m_impl->pubMutex);
+    return m_impl->model;
+}
+
 bool SimulationSession::running() const { return m_impl->running.load(); }
 
 QVariantMap SimulationSession::params() const {
@@ -282,6 +293,48 @@ void SimulationSession::resetSimulation() {
     Q_EMIT surfaceUpdated();
 }
 
+void SimulationSession::importModel() {
+    const QString filePath = QFileDialog::getOpenFileName(
+        nullptr, QStringLiteral("Import 3D Model"), QDir::homePath(),
+        QStringLiteral("3D Model Files (*.obj *.fbx *.stl *.dae *.3ds);;All Files (*)"));
+    if (!filePath.isEmpty()) importModelFile(filePath);
+}
+
+bool SimulationSession::importModelFile(const QString& filePath) {
+    if (!QFileInfo::exists(filePath)) {
+        Q_EMIT message(QStringLiteral("Model import failed: file does not exist"));
+        return false;
+    }
+
+    QString error;
+    ModelDataPtr loaded = Model::Load(filePath, &error);
+    if (!loaded) {
+        Q_EMIT message(QStringLiteral("Model import failed: %1").arg(error));
+        return false;
+    }
+
+    const qulonglong triangleCount = static_cast<qulonglong>(loaded->indices.size() / 3);
+    {
+        std::lock_guard<std::mutex> lk(m_impl->pubMutex);
+        m_impl->model = std::move(loaded);
+    }
+    Q_EMIT modelChanged();
+    Q_EMIT message(QStringLiteral("Imported %1 (%2 triangles)")
+                       .arg(QFileInfo(filePath).fileName())
+                       .arg(triangleCount));
+    return true;
+}
+
+void SimulationSession::clearModel() {
+    {
+        std::lock_guard<std::mutex> lk(m_impl->pubMutex);
+        if (!m_impl->model) return;
+        m_impl->model.reset();
+    }
+    Q_EMIT modelChanged();
+    Q_EMIT message(QStringLiteral("Imported model cleared"));
+}
+
 void SimulationSession::spawnDrop() {
     postCommand([](FluidSolver& solver) {
         if (solver.HasDrop()) return;
@@ -335,14 +388,99 @@ void SimulationSession::setParam(const QString& key, const QVariant& value) {
 }
 
 QString SimulationSession::exportParamsJson() const {
+    const QVariantMap p = params();
+    const bool inflow = p.value(QStringLiteral("scene")).toInt() == 1;
+    const double spacing = p.value(QStringLiteral("spacing"), 0.025).toDouble();
+    const double volume = inflow ? 0.6 : 0.512;
+    const int particleCount = static_cast<int>(
+        std::lround(volume / std::pow(std::max(1.0e-6, spacing), 3.0))) + (inflow ? 8 : 0);
+
+    QVariantMap simulation;
+    simulation.insert(QStringLiteral("scene"), inflow ? QStringLiteral("inflow")
+                                                      : QStringLiteral("dam"));
+    simulation.insert(QStringLiteral("solver"),
+                      p.value(QStringLiteral("solver")).toInt() == 1 ? QStringLiteral("DFSPH")
+                                                                     : QStringLiteral("IISPH"));
+    simulation.insert(QStringLiteral("particleCount"), particleCount);
+    simulation.insert(QStringLiteral("spacing"), spacing);
+    simulation.insert(QStringLiteral("dt"), p.value(QStringLiteral("dt")));
+    simulation.insert(QStringLiteral("useCFL"), p.value(QStringLiteral("cfl")));
+    simulation.insert(QStringLiteral("omega"), p.value(QStringLiteral("omega")));
+    simulation.insert(QStringLiteral("eta"), p.value(QStringLiteral("eta")));
+    simulation.insert(QStringLiteral("etaV"), p.value(QStringLiteral("etaV")));
+    simulation.insert(QStringLiteral("maxIter"), p.value(QStringLiteral("maxIter")));
+    simulation.insert(QStringLiteral("viscosity"), p.value(QStringLiteral("viscosity")));
+    simulation.insert(QStringLiteral("surfaceTension"),
+                      p.value(QStringLiteral("surfaceTension")));
+    simulation.insert(QStringLiteral("wallAdhesion"), p.value(QStringLiteral("wallAdhesion")));
+    simulation.insert(QStringLiteral("viewMode"), p.value(QStringLiteral("viewMode")));
+    simulation.insert(QStringLiteral("speed"), p.value(QStringLiteral("speed")));
+
+    QVariantMap render;
+    render.insert(QStringLiteral("mode"),
+                  p.value(QStringLiteral("viewMode")).toInt() == 1 ? QStringLiteral("surface")
+                                                                  : QStringLiteral("particles"));
+    render.insert(QStringLiteral("gridScale"), p.value(QStringLiteral("gridScale")));
+    render.insert(QStringLiteral("surfaceThreshold"),
+                  p.value(QStringLiteral("surfaceThreshold")));
+    render.insert(QStringLiteral("reconInterval"), p.value(QStringLiteral("reconInterval")));
+
     QVariantMap root;
     root.insert(QStringLiteral("app"), QStringLiteral("IISPH"));
-    root.insert(QStringLiteral("version"), 1);
+    root.insert(QStringLiteral("schemaVersion"), 1);
     root.insert(QStringLiteral("savedAt"),
                 QDateTime::currentDateTime().toString(Qt::ISODate));
-    root.insert(QStringLiteral("settings"), params());
+    root.insert(QStringLiteral("simulation"), simulation);
+    root.insert(QStringLiteral("events"), QVariantList{});
+    root.insert(QStringLiteral("render"), render);
     const QJsonDocument doc(QJsonObject::fromVariantMap(root));
     return QString::fromUtf8(doc.toJson(QJsonDocument::Indented));
+}
+
+void SimulationSession::importParameters() {
+    const QString filePath = QFileDialog::getOpenFileName(
+        nullptr, QStringLiteral("Import Parameter (Json)"), QDir::homePath(),
+        QStringLiteral("JSON Files (*.json);;All Files (*)"));
+    if (!filePath.isEmpty()) importParametersFile(filePath);
+}
+
+void SimulationSession::exportParameters() {
+    QString filePath = QFileDialog::getSaveFileName(
+        nullptr, QStringLiteral("Export Parameter (Json)"),
+        QDir::homePath() + QStringLiteral("/parameters.json"),
+        QStringLiteral("JSON Files (*.json);;All Files (*)"));
+    if (filePath.isEmpty()) return;
+    if (QFileInfo(filePath).suffix().isEmpty()) filePath += QStringLiteral(".json");
+    exportParametersFile(filePath);
+}
+
+bool SimulationSession::importParametersFile(const QString& filePath) {
+    QFile file(filePath);
+    if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        Q_EMIT message(QStringLiteral("Parameter import failed: cannot open %1").arg(filePath));
+        return false;
+    }
+    if (!importParamsJson(QString::fromUtf8(file.readAll()))) {
+        Q_EMIT message(QStringLiteral("Parameter import failed: invalid or incompatible JSON"));
+        return false;
+    }
+    Q_EMIT message(QStringLiteral("Parameters imported: %1").arg(filePath));
+    return true;
+}
+
+bool SimulationSession::exportParametersFile(const QString& filePath) {
+    QSaveFile file(filePath);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Text)) {
+        Q_EMIT message(QStringLiteral("Parameter export failed: cannot write %1").arg(filePath));
+        return false;
+    }
+    const QByteArray json = exportParamsJson().toUtf8();
+    if (file.write(json) != json.size() || !file.commit()) {
+        Q_EMIT message(QStringLiteral("Parameter export failed: cannot write %1").arg(filePath));
+        return false;
+    }
+    Q_EMIT message(QStringLiteral("Parameters exported: %1").arg(filePath));
+    return true;
 }
 
 bool SimulationSession::importParamsJson(const QString& json) {
@@ -351,17 +489,108 @@ bool SimulationSession::importParamsJson(const QString& json) {
     if (err.error != QJsonParseError::NoError || !doc.isObject()) return false;
 
     const QJsonObject root = doc.object();
+    if (root.value(QStringLiteral("app")).isString() &&
+        root.value(QStringLiteral("app")).toString() != QStringLiteral("IISPH")) {
+        return false;
+    }
+    if (root.value(QStringLiteral("schemaVersion")).isDouble() &&
+        root.value(QStringLiteral("schemaVersion")).toInt() != 1) {
+        return false;
+    }
+
+    QVariantMap incoming;
     const QJsonObject settings = root.value(QStringLiteral("settings")).toObject();
-    const QVariantMap incoming = settings.toVariantMap();
+    if (!settings.isEmpty()) {
+        // Legacy files written by the first parameter-JSON exporter.
+        incoming = settings.toVariantMap();
+    } else {
+        const QJsonObject simulation = root.value(QStringLiteral("simulation")).toObject();
+        const QJsonObject render = root.value(QStringLiteral("render")).toObject();
+        const auto addNumber = [&incoming](const QJsonObject& source, const char* sourceKey,
+                                           const char* targetKey = nullptr) {
+            const QJsonValue value = source.value(QLatin1String(sourceKey));
+            if (!value.isDouble()) return;
+            incoming.insert(QString::fromLatin1(targetKey ? targetKey : sourceKey),
+                            value.toDouble());
+        };
+        const auto addBool = [&incoming](const QJsonObject& source, const char* sourceKey,
+                                         const char* targetKey = nullptr) {
+            const QJsonValue value = source.value(QLatin1String(sourceKey));
+            if (value.isBool()) {
+                incoming.insert(QString::fromLatin1(targetKey ? targetKey : sourceKey),
+                                value.toBool());
+            }
+        };
+
+        const QJsonValue sceneValue = simulation.value(QStringLiteral("scene"));
+        if (sceneValue.isString()) {
+            incoming.insert(QStringLiteral("scene"),
+                            sceneValue.toString().compare(QStringLiteral("inflow"),
+                                                         Qt::CaseInsensitive) == 0
+                                ? 1 : 0);
+        } else if (sceneValue.isDouble()) {
+            incoming.insert(QStringLiteral("scene"), sceneValue.toInt() == 1 ? 1 : 0);
+        }
+
+        const QJsonValue solverValue = simulation.value(QStringLiteral("solver"));
+        if (solverValue.isString()) {
+            incoming.insert(QStringLiteral("solver"),
+                            solverValue.toString().compare(QStringLiteral("DFSPH"),
+                                                           Qt::CaseInsensitive) == 0
+                                ? 1 : 0);
+        } else if (solverValue.isDouble()) {
+            incoming.insert(QStringLiteral("solver"), solverValue.toInt() == 1 ? 1 : 0);
+        }
+
+        addNumber(simulation, "spacing");
+        const bool hasSpacing = simulation.value(QStringLiteral("spacing")).isDouble();
+        if (!hasSpacing) {
+            const QJsonValue countValue = simulation.value(QStringLiteral("particleCount"));
+            if (countValue.isDouble() && countValue.toDouble() > 0.0) {
+                const double count = countValue.toDouble();
+                const int scene = incoming.contains(QStringLiteral("scene"))
+                    ? incoming.value(QStringLiteral("scene")).toInt()
+                    : params().value(QStringLiteral("scene")).toInt();
+                const double volume = scene == 1 ? 0.6 : 0.512;
+                incoming.insert(QStringLiteral("spacing"), std::cbrt(volume / count));
+            }
+        }
+        addNumber(simulation, "dt");
+        addBool(simulation, "useCFL", "cfl");
+        addNumber(simulation, "omega");
+        addNumber(simulation, "eta");
+        addNumber(simulation, "etaV");
+        addNumber(simulation, "maxIter");
+        addNumber(simulation, "viscosity");
+        addNumber(simulation, "surfaceTension");
+        addNumber(simulation, "wallAdhesion");
+        addNumber(simulation, "viewMode");
+        addNumber(simulation, "speed");
+
+        addNumber(render, "gridScale");
+        addNumber(render, "surfaceThreshold");
+        addNumber(render, "reconInterval");
+        const QString mode = render.value(QStringLiteral("mode")).toString();
+        if (!mode.isEmpty() && !simulation.contains(QStringLiteral("viewMode"))) {
+            incoming.insert(QStringLiteral("viewMode"),
+                            mode.compare(QStringLiteral("surface"), Qt::CaseInsensitive) == 0
+                                ? 1 : 0);
+        }
+    }
     if (incoming.isEmpty()) return false;
 
     QVariantMap merged;
     {
         std::lock_guard<std::mutex> lk(m_impl->uiMutex);
         merged = m_impl->params;
+        bool recognized = false;
         for (auto it = incoming.constBegin(); it != incoming.constEnd(); ++it) {
-            if (merged.contains(it.key())) merged.insert(it.key(), it.value());
+            if (merged.contains(it.key())) {
+                merged.insert(it.key(), it.value());
+                recognized = true;
+            }
         }
+        if (!recognized) return false;
         m_impl->params = merged;
     }
 

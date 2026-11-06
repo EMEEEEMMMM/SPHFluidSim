@@ -1,4 +1,5 @@
 #pragma once
+#include <optional>
 #include <string>
 
 #include "FluidSolver.hpp"
@@ -39,8 +40,22 @@ struct HeadlessOptions {
     double dropVideoSeconds = -1.0; // drop event on the video timeline (-1 = never)
     int    particles = 8000;    // approx. fluid particle count (adjusts spacing)
     float  dt        = 0.0f;    // maximum nominal timestep (0 = solver default; CFL may shorten it)
+    // Optional values are used by the JSON/GUI path. Leaving them unset keeps
+    // the solver defaults and the original command-line behaviour.
+    std::optional<float> spacing;
+    std::optional<bool> useCFL;
+    std::optional<float> omega;
+    std::optional<float> eta;
+    std::optional<float> etaV;
+    std::optional<int> maxIter;
+    std::optional<float> viscosity;
+    std::optional<float> surfaceTension;
+    std::optional<float> wallAdhesion;
     float  gridScale = 1.0f;    // surface-reconstruction grid: 1.0 = r (fast), 0.5 = r/2 high quality
+    float  surfaceThreshold = 0.8f;
+    int    reconInterval = 3;
     int    threads   = 0;       // OpenMP threads (0 = all)
+    bool   control   = false;   // machine-readable progress + stdin pause/resume/cancel
     bool   noVideo   = false;   // skip ffmpeg assembly, keep the BMP frames
     bool   keepFrames = false;  // keep frames/ after assembling the video
     // Headless only: dump every frame's particle positions as <output>/particles/

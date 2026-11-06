@@ -4,6 +4,7 @@ in vec3 vWorldPos;
 out vec4 FragColor;
 
 uniform vec3 viewPos;
+uniform int uImportedModel;
 
 void main(){
     vec3 N = normalize(vNormal);
@@ -22,6 +23,19 @@ void main(){
     vec3 H = normalize(L + V);
     float spec = pow(max(dot(N, H), 0.0), 96.0);
     sky += vec3(1.0, 0.98, 0.92) * spec * 1.1;
+
+    if (uImportedModel == 1) {
+        // Neutral studio material for imported meshes, deliberately distinct
+        // from the blue water surface so the two never read as one object.
+        float diff = max(dot(N, L), 0.0);
+        vec3 base = vec3(0.58, 0.62, 0.68);
+        vec3 col = base * (0.28 + 0.72 * diff);
+        col += vec3(1.0, 0.97, 0.90) * spec * 0.45;
+        float rim = pow(1.0 - max(dot(N, V), 0.0), 3.0);
+        col = mix(col, vec3(0.82, 0.87, 0.94), rim * 0.22);
+        FragColor = vec4(col, 1.0);
+        return;
+    }
 
     // --- Transmitted water colour (opaque approximation of the volume) ---
     float diff = max(dot(N, L), 0.0);

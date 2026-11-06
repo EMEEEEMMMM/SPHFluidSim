@@ -5,16 +5,21 @@
 // panel edits parameters, the viewport sits in between.
 #pragma once
 
+#include <QDialog>
 #include <QPoint>
+#include <QPointer>
 #include <QWidget>
 
 class QComboBox;
 class QLabel;
 class QMenu;
 class QPushButton;
+class RenderJob;
 class SimulationSession;
 
 namespace ui {
+
+class RenderProgressDialog;
 
 class Card;
 class IconButton;
@@ -68,9 +73,13 @@ private:
     void changeScene(int scene);
     void changeResolution(int index);
     void changeSolver(int solver);
+    void openRenderDialog();
     void toast(const QString& text);
 
     SimulationSession* m_session = nullptr;
+    RenderJob* m_renderJob = nullptr;
+    QPointer<QDialog> m_renderOptionsDialog;
+    QPointer<QDialog> m_renderProgressDialog;
     Viewport* m_viewport = nullptr;
     SidePanel* m_leftPanel = nullptr;
     SidePanel* m_rightPanel = nullptr;
@@ -79,8 +88,7 @@ private:
     QWidget* m_titleBar = nullptr;
     IconButton* m_resetButton = nullptr;
     IconButton* m_playButton = nullptr;
-    IconButton* m_stepButton = nullptr;
-    IconButton* m_saveButton = nullptr;
+    IconButton* m_screenshotButton = nullptr;
     IconButton* m_fullscreenButton = nullptr;
     IconButton* m_minimizeButton = nullptr;
     IconButton* m_maximizeButton = nullptr;
