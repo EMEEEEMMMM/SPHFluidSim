@@ -49,6 +49,52 @@ If you move the executable outside the Qt environment, deploy its runtime next t
 windeployqt .\build\SPHFluidSim.exe
 ```
 
+### CUDA backend
+
+The optional CUDA backend is compiled when `cuda.h` and `nvrtc.h` are found. It
+loads `nvcuda` and NVRTC at runtime, so no CUDA import library or `nvcc` is
+required at link time (MinGW keeps working). NVRTC installations from CUDA 11
+through 13 are discovered from `CUDA_PATH`/`CUDA_HOME` and the standard install
+directories; the same source also builds on Linux with `libcuda.so.1` and
+`libnvrtc.so`.
+
+```powershell
+# correctness: CPU vs GPU, IISPH + DFSPH
+.\build\test_cuda_parity.exe
+
+# MS/step for 8k / 32.8k, solver-only and render-synchronised
+.\build\benchmark_gpu.exe 30
+
+# add ~125k-particle cases and print max neighbor count
+.\build\benchmark_gpu.exe 10 --large
+```
+
+On Linux:
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DSPH_ENABLE_CUDA=ON
+cmake --build build --parallel
+./build/test_cuda_parity
+./build/benchmark_gpu 30 --large
+```
+
+Implementation notes:
+
+- particle state and neighbor data stay on the device; accessors synchronise
+  only the requested field, so a pure simulation loop has no per-step D2H copy;
+- the spatial hash uses device-side count/scan/scatter; cells are sorted once so
+  neighbor traversal is deterministic without sorting every particle's list;
+- per-pair gradient/distance is cached once per neighborhood rebuild and reused
+  by density, IISPH Jacobi iterations and both DFSPH solvers;
+- DFSPH boundary pressure terms use the precomputed `gradB`, and paired passes
+  (density + stiffness, integrate + wall clamp, finalize + warm start) are fused;
+- `SPH_CUDA_DEVICE=N` selects a GPU, `SPH_CUDA_PROFILE=1` prints build/predict/
+  solve timings, `SPH_CUDA_DUMP_PTX=path` writes the generated PTX for inspection.
+
+The paper's Table 1 benchmark is **WCSPH**, not DFSPH, and explicitly excludes
+prefix-sum time. It is therefore not a like-for-like target for this project's
+IISPH/DFSPH numbers. Use the same scene and particle count when comparing GPUs.
+
 ### Desktop frontends
 
 The default UI is **Qt Quick/QML**. Both frontends share the same session, renderer and four themes:

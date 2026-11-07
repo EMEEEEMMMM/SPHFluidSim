@@ -14,6 +14,7 @@
 #include <cmath>
 
 #include "FluidSolver.hpp"
+#include "SolverFactory.hpp"
 #include "SurfaceReconstructor.hpp"
 
 namespace {
@@ -46,7 +47,7 @@ int InflowCapFor(float spacing) {
     return static_cast<int>(0.6f / cell) + 8;
 }
 
-void SetupScene(FluidSolver& solver, int scene, float spacing) {
+void SetupScene(IFluidSolver& solver, int scene, float spacing) {
     solver.GetParams().spacing = spacing;
     if (scene == 0) {
         solver.InitDamOpen(2.0f, 1.2f, 1.0f, 0.8f);
@@ -55,7 +56,7 @@ void SetupScene(FluidSolver& solver, int scene, float spacing) {
     }
 }
 
-void ApplySingleParam(FluidSolver::Params& p, const QString& key, const QVariant& v) {
+void ApplySingleParam(FluidParams& p, const QString& key, const QVariant& v) {
     const float f = v.toFloat();
     if (key == QLatin1String("omega")) p.omega = f;
     else if (key == QLatin1String("eta")) p.eta = f;
@@ -70,7 +71,7 @@ void ApplySingleParam(FluidSolver::Params& p, const QString& key, const QVariant
     else if (key == QLatin1String("spacing")) p.spacing = f;
 }
 
-void ApplyParamsToSolver(FluidSolver& solver, const QVariantMap& m) {
+void ApplyParamsToSolver(IFluidSolver& solver, const QVariantMap& m) {
     auto& p = solver.GetParams();
     for (auto it = m.constBegin(); it != m.constEnd(); ++it) {
         ApplySingleParam(p, it.key(), it.value());
@@ -84,6 +85,7 @@ QVariantMap DefaultParams() {
     m.insert(QStringLiteral("scene"), 0);
     m.insert(QStringLiteral("spacing"), p.spacing);
     m.insert(QStringLiteral("solver"), p.solver);
+    m.insert(QStringLiteral("backend"), QStringLiteral("auto"));
     m.insert(QStringLiteral("viewMode"), 0);
     m.insert(QStringLiteral("speed"), 60);
     m.insert(QStringLiteral("omega"), p.omega);
@@ -115,7 +117,7 @@ struct SimulationSession::Impl {
     std::atomic<int> viewMode{0};
     std::condition_variable cmdCv;
     std::mutex cmdMutex;
-    std::deque<std::function<void(FluidSolver&)>> commands;
+    std::deque<std::function<void(IFluidSolver&)>> commands;
 
     // ---- surface reconstruction thread ------------------------------------
     std::thread recon;
@@ -212,7 +214,7 @@ void SimulationSession::shutdown() {
     if (m_impl->recon.joinable()) m_impl->recon.join();
 }
 
-void SimulationSession::postCommand(std::function<void(FluidSolver&)> fn) {
+void SimulationSession::postCommand(std::function<void(IFluidSolver&)> fn) {
     {
         std::lock_guard<std::mutex> lk(m_impl->cmdMutex);
         m_impl->commands.push_back(std::move(fn));
@@ -276,7 +278,7 @@ void SimulationSession::stepOnce() {
 }
 
 void SimulationSession::resetSimulation() {
-    postCommand([this](FluidSolver& solver) {
+    postCommand([this](IFluidSolver& solver) {
         SetupScene(solver, m_impl->scene, m_impl->spacing);
     });
     {
@@ -336,7 +338,7 @@ void SimulationSession::clearModel() {
 }
 
 void SimulationSession::spawnDrop() {
-    postCommand([](FluidSolver& solver) {
+    postCommand([](IFluidSolver& solver) {
         if (solver.HasDrop()) return;
         solver.SpawnDrop(0.2f, 1.0f, 1.6f, 0.5f);
     });
@@ -363,10 +365,20 @@ void SimulationSession::setParam(const QString& key, const QVariant& value) {
         m_impl->reconInterval.store(std::max(1, value.toInt()));
     }
 
+    if (key == QLatin1String("backend")) {
+        // A different backend needs a new solver object. Restarting the worker
+        // re-creates it from the stored params (and resets the scene, which is
+        // the honest thing to do when the solver itself changes).
+        shutdown();
+        start();
+        Q_EMIT paramsChanged();
+        return;
+    }
+
     if (key == QLatin1String("scene") || key == QLatin1String("spacing") ||
         key == QLatin1String("solver")) {
         // These rebuild the solver state, so they run as one atomic command.
-        postCommand([this, snapshotParams](FluidSolver& solver) {
+        postCommand([this, snapshotParams](IFluidSolver& solver) {
             ApplyParamsToSolver(solver, snapshotParams);
             m_impl->scene = snapshotParams.value(QStringLiteral("scene")).toInt();
             m_impl->spacing = snapshotParams.value(QStringLiteral("spacing")).toFloat();
@@ -379,7 +391,7 @@ void SimulationSession::setParam(const QString& key, const QVariant& value) {
         Q_EMIT surfaceUpdated();
     } else {
         const QVariant v = value;
-        postCommand([key, v](FluidSolver& solver) {
+        postCommand([key, v](IFluidSolver& solver) {
             ApplySingleParam(solver.GetParams(), key, v);
         });
     }
@@ -602,7 +614,7 @@ bool SimulationSession::importParamsJson(const QString& json) {
     m_impl->reconInterval.store(
         std::max(1, merged.value(QStringLiteral("reconInterval")).toInt()));
 
-    postCommand([this, merged](FluidSolver& solver) {
+    postCommand([this, merged](IFluidSolver& solver) {
         ApplyParamsToSolver(solver, merged);
         m_impl->scene = merged.value(QStringLiteral("scene")).toInt();
         m_impl->spacing = merged.value(QStringLiteral("spacing")).toFloat();
@@ -624,7 +636,18 @@ bool SimulationSession::importParamsJson(const QString& json) {
 // ---------------------------------------------------------------------------
 void SimulationSession::workerLoop() {
     Impl& d = *m_impl;
-    FluidSolver solver;
+    std::string backendError;
+    SolverBackend backendKind = SolverBackend::Auto;
+    {
+        std::lock_guard<std::mutex> lk(d.uiMutex);
+        bool ok = false;
+        backendKind = ParseBackend(
+            d.params.value(QStringLiteral("backend"), QStringLiteral("auto"))
+                .toString().toStdString(), &ok);
+    }
+    auto solverHolder = CreateSolver(backendKind, &backendError);
+    if (!solverHolder) solverHolder = std::make_unique<FluidSolver>();
+    IFluidSolver& solver = *solverHolder;
     {
         std::lock_guard<std::mutex> lk(d.uiMutex);
         ApplyParamsToSolver(solver, d.params);
@@ -679,6 +702,7 @@ void SimulationSession::workerLoop() {
         st.insert(QStringLiteral("msPerStep"), msPerStep);
         st.insert(QStringLiteral("hasDrop"), solver.HasDrop());
         st.insert(QStringLiteral("stepCount"), static_cast<qulonglong>(steps));
+        st.insert(QStringLiteral("backend"), QString::fromLatin1(solver.BackendName()));
         st.insert(QStringLiteral("scene"), d.scene);
         st.insert(QStringLiteral("spacing"), static_cast<double>(d.spacing));
         st.insert(QStringLiteral("waterVolume"),
@@ -742,7 +766,7 @@ void SimulationSession::workerLoop() {
     while (!d.quit.load()) {
         bool commandsApplied = false;
         {
-            std::deque<std::function<void(FluidSolver&)>> pending;
+            std::deque<std::function<void(IFluidSolver&)>> pending;
             {
                 std::lock_guard<std::mutex> lk(d.cmdMutex);
                 pending.swap(d.commands);

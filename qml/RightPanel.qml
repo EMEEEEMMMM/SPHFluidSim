@@ -8,6 +8,7 @@ Flickable {
     property var session
 
     signal solverRequested(int solver)
+    signal backendRequested(int backend)
     // Property-change signal name is taken by `cameraMode`, so the user
     // action gets its own name (matches sceneRequested / resolutionRequested).
     signal cameraModeRequested(int mode)
@@ -43,6 +44,16 @@ Flickable {
                 options: ["IISPH", "DFSPH"]
                 currentIndex: panel.p.solver !== undefined ? panel.p.solver : 0
                 onActivated: (index) => panel.solverRequested(index)
+            }
+
+            Segmented {
+                Layout.fillWidth: true
+                options: ["Auto", "CPU", "CUDA"]
+                currentIndex: {
+                    const b = panel.p.backend;
+                    return b === "cpu" ? 1 : (b === "cuda" ? 2 : 0);
+                }
+                onActivated: (index) => panel.backendRequested(index)
             }
 
             RowLayout {

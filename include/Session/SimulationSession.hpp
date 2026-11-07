@@ -34,7 +34,7 @@
 #include "Math/Vector3.hpp"
 #include "Model.hpp"
 
-class FluidSolver;
+class IFluidSolver;
 
 struct SimSnapshot {
     std::vector<Math::Vector3> positions;
@@ -128,7 +128,7 @@ private:
     struct Impl;
     friend struct Impl;
 
-    void postCommand(std::function<void(FluidSolver&)> fn);
+    void postCommand(std::function<void(IFluidSolver&)> fn);
     void workerLoop();
     void reconLoop();
 

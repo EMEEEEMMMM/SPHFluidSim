@@ -2,7 +2,7 @@
 #include <optional>
 #include <string>
 
-#include "FluidSolver.hpp"
+#include "IFluidSolver.hpp"
 
 // Shared by the renderer and its tests so output cadence cannot drift from the
 // simulation clock. `frame` is zero-based; frame 0 is rendered after advancing
@@ -13,14 +13,14 @@ inline double FrameTargetSimTime(int frame, int fps, double timeScale) {
 }
 
 template <typename AfterStep>
-void AdvanceTo(FluidSolver& solver, double targetSimTime, AfterStep afterStep) {
+void AdvanceTo(IFluidSolver& solver, double targetSimTime, AfterStep afterStep) {
     while (static_cast<double>(solver.SimTime()) < targetSimTime) {
         solver.Step();
         afterStep();
     }
 }
 
-inline void AdvanceTo(FluidSolver& solver, double targetSimTime) {
+inline void AdvanceTo(IFluidSolver& solver, double targetSimTime) {
     AdvanceTo(solver, targetSimTime, [] {});
 }
 } // namespace headless_timing
@@ -37,6 +37,7 @@ struct HeadlessOptions {
     enum class Mode { Particles, Surface } mode = Mode::Surface;
     std::string scene = "dam";    // "dam" | "inflow" (dam = open-top tank + optional --drop)
     std::string solver = "iisph"; // "iisph" | "df sph" (DFSPH, Bender & Koschier 2017)
+    std::string backend = "auto"; // "auto" | "cpu" | "cuda"
     double dropVideoSeconds = -1.0; // drop event on the video timeline (-1 = never)
     int    particles = 8000;    // approx. fluid particle count (adjusts spacing)
     float  dt        = 0.0f;    // maximum nominal timestep (0 = solver default; CFL may shorten it)

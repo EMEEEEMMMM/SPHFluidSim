@@ -1,4 +1,5 @@
 #include "HeadlessRunner.hpp"
+#include "FluidSolver.hpp"
 
 #include <algorithm>
 #include <cmath>

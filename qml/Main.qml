@@ -107,6 +107,7 @@ Window {
                     fieldOfView: viewportProbe.fieldOfView
                     cameraMode: root.cameraMode
                     onSolverRequested: (solver) => root.requestSolver(solver)
+                    onBackendRequested: (backend) => root.sim.setParam("backend", ["auto", "cpu", "cuda"][backend])
                     onCameraModeRequested: (mode) => {
                         root.cameraMode = mode;
                         viewportProbe.orbitOnly = mode === 0;

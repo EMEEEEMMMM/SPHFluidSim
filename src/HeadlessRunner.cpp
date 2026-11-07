@@ -14,6 +14,7 @@
 
 #include "HeadlessRunner.hpp"
 #include "FluidSolver.hpp"
+#include "SolverFactory.hpp"
 #include "SurfaceReconstructor.hpp"
 #include "OpenGLLayer.hpp"
 #include <glad/glad.h>
@@ -282,7 +283,17 @@ int RunHeadless(const HeadlessOptions& opt) {
     }
 
     OpenGLLayer layer(opt.width, opt.height);
-    FluidSolver solver;
+    std::string backendError;
+    auto solverPtr = CreateSolver(ParseBackend(opt.backend), &backendError);
+    if (!solverPtr) {
+        printf("[headless] backend '%s' unavailable: %s\n",
+               opt.backend.c_str(), backendError.c_str());
+        return 1;
+    }
+    if (!backendError.empty())
+        printf("[headless] backend fallback to CPU: %s\n", backendError.c_str());
+    printf("[headless] backend: %s\n", solverPtr->BackendName());
+    IFluidSolver& solver = *solverPtr;
 
     auto& params = solver.GetParams();
     params.solver = (opt.solver == "dfsph") ? 1 : 0;

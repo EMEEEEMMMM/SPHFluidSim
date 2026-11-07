@@ -16,6 +16,7 @@
 #include <string>
 
 #include "HeadlessRunner.hpp"
+#include "SolverFactory.hpp"
 #include "Session/SimulationSession.hpp"
 #include "Ui/Qml/QmlFrontend.hpp"
 #include "Ui/Theme.hpp"
@@ -339,6 +340,10 @@ int main(int argc, char** argv) {
                 opt.solver = "df sph";
                 i++;
             }
+        } else if (MatchPrefix(a, "--backend=")) {
+            opt.backend = ValueAfter(a, "--backend=");
+        } else if (Match(a, "--backend") && i + 1 < argc) {
+            opt.backend = argv[++i];
         } else if (MatchPrefix(a, "--drop=")) {
             dropSpec = ValueAfter(a, "--drop=");
         } else if (Match(a, "--drop") && i + 1 < argc) {
@@ -446,6 +451,15 @@ int main(int argc, char** argv) {
         } else {
             opt.solver = norm;
         }
+    }
+    {
+        bool ok = false;
+        const SolverBackend b = ParseBackend(opt.backend, &ok);
+        if (!ok) {
+            printf("[args] WARNING: unknown --backend '%s' -> using auto (valid: auto | cpu | cuda)\n",
+                   opt.backend.c_str());
+        }
+        opt.backend = BackendToken(ok ? b : SolverBackend::Auto);
     }
 
     if (!benchName.empty()) return RunBench(benchName, opt);

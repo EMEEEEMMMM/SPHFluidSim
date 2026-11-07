@@ -1,4 +1,5 @@
 #pragma once
+#include "IFluidSolver.hpp"
 #include "Math/Vector3.hpp"
 #include <vector>
 
@@ -7,58 +8,36 @@
 //   Predict advection -> pressure solve (relaxed Jacobi) -> integrate.
 // Boundary handling follows paper Sec.4 (Akinci et al. 2012 rigid-fluid coupling):
 // boundary particles contribute to density/forces but carry no pressure.
-class FluidSolver {
+//
+// This is the CPU reference implementation of IFluidSolver. It is
+// deterministic: repeated runs of the same scene are bit-identical (the
+// pressure solve is strict relaxed Jacobi, neighbor order is stable).
+class FluidSolver : public IFluidSolver {
 public:
-    struct Params {
-        float spacing = 0.025f;   // particle spacing [m] (0.04 -> 8k particles for the 0.8m dam)
-        float rho0 = 1000.0f;    // rest density [kg/m^3]
-        float dt = 0.003f;       // time step [s]
-        float omega = 0.5f;      // relaxation factor (paper: 0.5 optimal)
-        float eta = 0.0001f;     // pressure-solve convergence: avg density error < 0.01%
-                                 // (paper Sec.4 enforces < 0.01%; SPlisHSPlasH default maxError)
-        int   maxIter = 100;     // Jacobi iteration cap (SPlisHSPlasH default: 100)
-        float etaV = 0.001f;     // DFSPH divergence-solver tolerance: avg |Drho/Dt| < etaV/h
-                                 // (paper Sec.4: density change rate error < 0.1%,
-                                 // applied as 0.1%/dt like SPlisHSPlasH maxErrorV)
-        int   solver = 0;        // 0 = IISPH (Ihmsen et al. 2013), 1 = DFSPH (Bender & Koschier 2017)
-        bool  warmStart = true;  // DFSPH: seed both solvers with 0.5x last step's stiffness
-        bool  useCFL = true;     // adaptive dt = min(dt, 0.4*d/vmax), d = particle diameter (paper Sec.3.1)
-        // Viscosity: XSPH variant of Schechter & Bridson 2012 (paper Sec.4),
-        // implemented as in SPlisHSPlasH:
-        //   dv_i = -xsph * sum_j (V_j/rhoN_j) * (v_i - v_j) * W_ij
-        // (velocity-space filter; xsph = 0.1 is the common choice in the
-        // SPlisHSPlasH dam-break scenes).
-        float viscosity = 0.1f;
-        // Surface tension (Akinci et al. 2013, used for the paper's results):
-        // color-field normals + cohesion + curvature + boundary adhesion.
-        // Defaults match SPlisHSPlasH (k = 0.05, kb = 0.01).
-        float surfaceTension = 0.05f;
-        float surfaceTensionBoundary = 0.01f;
-        float gravity = -9.81f;  // [m/s^2]
-    };
+    using Params = FluidParams;
 
     FluidSolver() = default;
 
     // boxX/Y/Z: tank dimensions; waterSize: side of the water cube in the corner.
-    void Init(float boxX, float boxY, float boxZ, float waterSize);
+    void Init(float boxX, float boxY, float boxZ, float waterSize) override;
     // Dam break in an OPEN-TOP tank (no lid): the same water cube in the corner,
     // but splash can leave the tank. A user-triggered SpawnDrop() adds one
     // spherical blob that falls in from above the rim.
-    void InitDamOpen(float boxX, float boxY, float boxZ, float waterSize);
+    void InitDamOpen(float boxX, float boxY, float boxZ, float waterSize) override;
     // Appends one spherical water blob (radius, centre) as a lattice of new
     // particles above the tank; a one-shot button calls this. No-op if already
     // spawned.
-    void SpawnDrop(float radius, float cx, float cy, float cz);
-    bool HasDrop() const { return m_DropSpawned; }
+    void SpawnDrop(float radius, float cx, float cy, float cz) override;
+    bool HasDrop() const override { return m_DropSpawned; }
     // water fills the whole tank cross-section up to waterHeight (hydrostatic test).
-    void InitFull(float boxX, float boxY, float boxZ, float waterHeight);
+    void InitFull(float boxX, float boxY, float boxZ, float waterHeight) override;
     // Open-top cubic container (side = tankSize, centred at (cx, 0, cz)) with a
     // continuous water jet injected from directly above the centre, falling a
     // distance `gap` before entering the container. A disk layer of particles
     // is emitted whenever the jet has fallen one spacing; injection STOPS once
     // the particle count reaches maxParticles (fixed water volume).
     void InitInflow(float tankSize, float gap, int inflowPerStep, float inflowRadius,
-                    float cx, float cz, int maxParticles);
+                    float cx, float cz, int maxParticles) override;
     // Open-top cubic container with a PRE-FILLED pool plus a separate SPHERICAL
     // drop hovering above the centre; the drop falls naturally into the pool.
     // poolHeight is the resting water level inside the container; dropRadius
@@ -66,44 +45,47 @@ public:
     // Pool and drop volumes are fixed -> the pool:drop volume ratio is fixed
     // for any particle count (spacing is derived externally).
     void InitDrop(float tankSize, float poolHeight, float dropRadius, float dropGap,
-                  float cx, float cz, int maxParticles);
-    void Reset();
-    void Step();
+                  float cx, float cz, int maxParticles) override;
+    void Reset() override;
+    void Step() override;
 
-    const std::vector<Math::Vector3>& Positions() const { return m_X; }
-    const std::vector<Math::Vector3>& Velocities() const { return m_V; }
-    const std::vector<float>&         Densities() const { return m_Rho; }   // rhoN: density incl. boundary-particle contribution
-    const std::vector<float>&         Colors() const { return m_Colors; }   // 3 floats per particle
-    float SimTime() const { return m_Time; }
-    float AvgDensityError() const { return m_AvgErr; }
-    float MeanDensity() const;   // arithmetic mean density [kg/m^3] from the current rho field
-    int   LastIterations() const { return m_LastIter; }
-    float LastPressureTimeMs() const { return m_LastPressureMs; }   // wall time of the last pressure solve
-    int   DivergenceIterations() const { return m_LastIterV; }   // DFSPH divergence solver
-    int   FluidCount() const { return m_N; }
-    int   BoundaryCount() const { return static_cast<int>(m_BoundX.size()); }
+    const std::vector<Math::Vector3>& Positions() const override { return m_X; }
+    const std::vector<Math::Vector3>& Velocities() const override { return m_V; }
+    const std::vector<float>&         Densities() const override { return m_Rho; }   // rhoN: density incl. boundary-particle contribution
+    const std::vector<float>&         Colors() const override { return m_Colors; }   // 3 floats per particle
+    float SimTime() const override { return m_Time; }
+    float AvgDensityError() const override { return m_AvgErr; }
+    float MeanDensity() const override;   // arithmetic mean density [kg/m^3] from the current rho field
+    int   LastIterations() const override { return m_LastIter; }
+    float LastPressureTimeMs() const override { return m_LastPressureMs; }   // wall time of the last pressure solve
+    int   DivergenceIterations() const override { return m_LastIterV; }   // DFSPH divergence solver
+    int   FluidCount() const override { return m_N; }
+    int   BoundaryCount() const override { return static_cast<int>(m_BoundX.size()); }
     // wall-particle positions (for boundary invariants in tests)
-    const std::vector<Math::Vector3>& BoundaryPositions() const { return m_BoundX; }
-    Params& GetParams() { return params; }
-    float  KernelRadius() const { return m_h; }
-    float  Spacing() const { return params.spacing; }
-    const std::vector<float>& Pressures() const { return m_P; }   // normalized pressure
+    const std::vector<Math::Vector3>& BoundaryPositions() const override { return m_BoundX; }
+    Params& GetParams() override { return params; }
+    const Params& GetParams() const override { return params; }
+    float  KernelRadius() const override { return m_h; }
+    float  Spacing() const override { return params.spacing; }
+    const std::vector<float>& Pressures() const override { return m_P; }   // normalized pressure
     // Density-error diagnostics. AvgDensityError() (above) is the SIGNED
     // average the solvers use internally (IISPH: algebraic residual, DFSPH:
     // mean rho*-1); a signed mean can cancel a compressed and a dilated region,
     // so these two report the local picture the mean hides. Normalized units
     // (1.0 = rest density).
-    float MeanAbsDensityError() const { return m_AvgAbsErr; }
-    float MaxDensityError() const { return m_MaxErr; }
+    float MeanAbsDensityError() const override { return m_AvgAbsErr; }
+    float MaxDensityError() const override { return m_MaxErr; }
     // fluid-neighbor count of particle i (free-surface detection)
-    int    NeighborCount(int i) const { return (int)m_FluidNb[i].size(); }
-    int    MaxNeighbors() const { int m = 0; for (const auto& n : m_FluidNb) m = std::max(m, (int)n.size()); return m; }
+    int    NeighborCount(int i) const override { return (int)m_FluidNb[i].size(); }
+    int    MaxNeighbors() const override { int m = 0; for (const auto& n : m_FluidNb) m = std::max(m, (int)n.size()); return m; }
 
     // --- paper Sec.5 reproduction helpers ---
     // Record the density-error trace of the NEXT pressure solve (one entry per
     // Jacobi iteration), then read it with ConvergenceTrace(). One-shot.
-    void EnableConvergenceTrace() { m_traceNext = true; }
-    const std::vector<float>& ConvergenceTrace() const { return m_convTrace; }
+    void EnableConvergenceTrace() override { m_traceNext = true; }
+    const std::vector<float>& ConvergenceTrace() const override { return m_convTrace; }
+
+    const char* BackendName() const override { return "CPU (OpenMP)"; }
 
 private:
     void PushFluid(float x, float y, float z);

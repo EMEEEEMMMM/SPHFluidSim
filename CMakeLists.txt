@@ -56,6 +56,7 @@ set(SHADER_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src/ShaderProgram")
 
 add_library(sph_core STATIC
     src/FluidSolver.cpp
+    src/SolverFactory.cpp
     src/FrameBuffer.cpp
     src/ShaderProgram/Shader.cpp
     src/OpenGLLayer.cpp
@@ -75,8 +76,47 @@ target_link_libraries(sph_core PUBLIC
     OpenGL::GL
     OpenMP::OpenMP_CXX
     ${OpenCL_LIBRARIES}
+    ${CMAKE_DL_LIBS}
 )
-target_compile_options(sph_core PRIVATE -fopenmp)
+if(MSVC)
+    target_compile_options(sph_core PRIVATE /openmp)
+else()
+    target_compile_options(sph_core PRIVATE -fopenmp)
+endif()
+
+# --- Optional CUDA backend ---------------------------------------------------
+# The backend is compiled only when cuda.h + nvrtc.h are available. It loads
+# nvcuda.dll / nvrtc64_*.dll at runtime (NVRTC JIT), so no CUDA import library
+# is linked and the MinGW build keeps working; on a machine without a CUDA
+# runtime, Create() fails and the caller falls back to the CPU solver.
+option(SPH_ENABLE_CUDA "Build the CUDA backend (NVRTC + Driver API, runtime loaded)" ON)
+if(SPH_ENABLE_CUDA)
+    find_path(SPH_CUDA_INCLUDE_DIR cuda.h HINTS
+        "$ENV{CUDA_PATH}/include"
+        "$ENV{CUDA_HOME}/include"
+        "/usr/local/cuda/include"
+        "/opt/cuda/include"
+        "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.1/include")
+    find_path(SPH_NVRTC_INCLUDE_DIR nvrtc.h HINTS
+        "$ENV{CUDA_PATH}/include"
+        "$ENV{CUDA_HOME}/include"
+        "/usr/local/cuda/include"
+        "/opt/cuda/include"
+        "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.1/include")
+    if(SPH_CUDA_INCLUDE_DIR AND SPH_NVRTC_INCLUDE_DIR)
+        target_sources(sph_core PRIVATE
+            src/Cuda/CudaDriverApi.cpp
+            src/Cuda/FluidSolverCuda.cpp)
+        target_include_directories(sph_core PRIVATE
+            ${SPH_CUDA_INCLUDE_DIR}
+            ${SPH_NVRTC_INCLUDE_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/Cuda)
+        target_compile_definitions(sph_core PRIVATE SPH_HAS_CUDA=1)
+        message(STATUS "CUDA backend: enabled (NVRTC JIT, headers at ${SPH_CUDA_INCLUDE_DIR})")
+    else()
+        message(STATUS "CUDA backend: disabled (cuda.h/nvrtc.h not found)")
+    endif()
+endif()
 
 add_library(sph_session STATIC
     include/Model.hpp
@@ -171,6 +211,37 @@ add_headless_test(test_timeline)
 add_headless_test(verify_hydrostatic)
 add_headless_test(benchmark)
 add_headless_test(surface_reconstruct)
+
+if(SPH_CUDA_INCLUDE_DIR AND SPH_NVRTC_INCLUDE_DIR)
+    add_executable(test_cuda_parity
+        tests/test_cuda_parity.cpp
+        src/FluidSolver.cpp
+        src/Cuda/CudaDriverApi.cpp
+        src/Cuda/FluidSolverCuda.cpp)
+    target_include_directories(test_cuda_parity PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/Cuda
+        ${SPH_CUDA_INCLUDE_DIR}
+        ${SPH_NVRTC_INCLUDE_DIR})
+    target_compile_definitions(test_cuda_parity PRIVATE SPH_HAS_CUDA=1)
+    target_link_libraries(test_cuda_parity PRIVATE OpenMP::OpenMP_CXX ${CMAKE_DL_LIBS})
+    target_compile_options(test_cuda_parity PRIVATE -fopenmp)
+    add_test(NAME cuda_parity COMMAND test_cuda_parity)
+
+    add_executable(benchmark_gpu
+        tests/benchmark_gpu.cpp
+        src/FluidSolver.cpp
+        src/Cuda/CudaDriverApi.cpp
+        src/Cuda/FluidSolverCuda.cpp)
+    target_include_directories(benchmark_gpu PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/Cuda
+        ${SPH_CUDA_INCLUDE_DIR}
+        ${SPH_NVRTC_INCLUDE_DIR})
+    target_compile_definitions(benchmark_gpu PRIVATE SPH_HAS_CUDA=1)
+    target_link_libraries(benchmark_gpu PRIVATE OpenMP::OpenMP_CXX ${CMAKE_DL_LIBS})
+    target_compile_options(benchmark_gpu PRIVATE -fopenmp)
+endif()
 
 add_executable(test_model_import tests/test_model_import.cpp src/Model.cpp)
 target_include_directories(test_model_import PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
