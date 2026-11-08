@@ -518,7 +518,10 @@ struct FluidSolverCuda::Impl {
                                   dKappaV, dKappaVPrev, dKappaSeed})
                 SetInt(p, 0, n);
         }
-        dirtyPos = dirtyVel = dirtyRho = dirtyP = dirtyColors = dirtyNb = false;
+        dirtyPos = dirtyVel = dirtyRho = dirtyP = dirtyNb = false;
+        // PushFluid seeds the host colors with black. Generate the initial
+        // velocity colors on demand just as we do after every simulation step.
+        dirtyColors = true;
         lastMaxNb = 0;
         neighborCacheValid = false;
         densityCacheValid = false;
@@ -557,6 +560,7 @@ struct FluidSolverCuda::Impl {
     }
     void SyncColors() {
         if (!dirtyColors) return;
+        UpdateColors();
         if (!Colors.empty()) FromDev(Colors.data(), dColors, Colors.size() * sizeof(float));
         dirtyColors = false;
     }
@@ -866,7 +870,8 @@ struct FluidSolverCuda::Impl {
             const void* a[] = {&dVel, &n, &dRed, &dColors};
             Launch(k.colors, n, a);
         }
-        dirtyColors = false;
+        // SyncColors owns the host-side dirty flag. Clearing it here used to
+        // suppress the device-to-host copy and left every GUI particle black.
     }
 
     // ------------------------------------------------------------------
@@ -1427,7 +1432,6 @@ const std::vector<float>& FluidSolverCuda::Densities() const {
     return m_impl->Rho;
 }
 const std::vector<float>& FluidSolverCuda::Colors() const {
-    if (m_impl->dirtyColors) m_impl->UpdateColors();
     m_impl->SyncColors();
     return m_impl->Colors;
 }

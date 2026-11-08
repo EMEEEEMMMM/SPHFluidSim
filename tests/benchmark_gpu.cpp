@@ -74,6 +74,14 @@ bool AllFinite(const FluidSolverCuda& s) {
     for (float r : s.Densities()) {
         if (!std::isfinite(r)) return false;
     }
+    const auto& colors = s.Colors();
+    if (colors.size() != s.Positions().size() * 3) return false;
+    for (size_t i = 0; i < colors.size(); ++i) {
+        if (!std::isfinite(colors[i])) return false;
+        // kColors always writes an opaque blue channel. A stale host mirror
+        // returns (0,0,0) here, so the performance pass also catches black.
+        if (i % 3 == 2 && std::fabs(colors[i] - 1.0f) > 1e-5f) return false;
+    }
     return true;
 }
 

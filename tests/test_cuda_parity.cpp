@@ -53,6 +53,43 @@ bool CheckCuda(std::string* error) {
     return true;
 }
 
+// Renderer-facing color mirror. The GPU colors are derived from the current
+// velocities, so checking only positions/densities misses a stale host copy
+// that makes every particle black.
+bool CheckColors(const char* label, const FluidSolverCuda& gpu, const char* stage) {
+    const int n = gpu.FluidCount();
+    const auto& colors = gpu.Colors();
+    const auto& velocities = gpu.Velocities();
+    bool ok = colors.size() == static_cast<size_t>(n) * 3 &&
+              velocities.size() == static_cast<size_t>(n);
+    float vmax = 1e-6f;
+    for (const auto& v : velocities) {
+        vmax = std::max(vmax, std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z));
+    }
+    for (int i = 0; ok && i < n; ++i) {
+        const auto& v = velocities[i];
+        const float speed = std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
+        const float s = std::min(1.0f, speed / vmax);
+        const float expected[3] = {0.15f + 0.85f * s, 0.35f + 0.65f * s, 1.0f};
+        for (int c = 0; c < 3; ++c) {
+            const float value = colors[3 * i + c];
+            if (!std::isfinite(value) || std::fabs(value - expected[c]) > 2e-5f) {
+                ok = false;
+                break;
+            }
+        }
+    }
+    if (n > 0) {
+        std::printf("[colors] %s %-11s n=%d first=(%.3f,%.3f,%.3f) -> %s\n",
+                    label, stage, n, colors[0], colors[1], colors[2],
+                    ok ? "PASS" : "FAIL");
+    } else {
+        std::printf("[colors] %s %-11s n=0 -> FAIL\n", label, stage);
+        ok = false;
+    }
+    return ok;
+}
+
 bool RunCase(const char* label, int solverKind, int steps, float spacing,
              float singlePosTol, float multiPosTol, float rhoTol) {
     FluidSolver cpu;
@@ -77,7 +114,7 @@ bool RunCase(const char* label, int solverKind, int steps, float spacing,
         return false;
     }
 
-    bool ok = true;
+    bool ok = CheckColors(label, *gpu, "initial");
     for (int s = 1; s <= steps; ++s) {
         cpu.Step();
         gpu->Step();
@@ -94,6 +131,7 @@ bool RunCase(const char* label, int solverKind, int steps, float spacing,
         }
         if (!pass) ok = false;
     }
+    ok &= CheckColors(label, *gpu, "after steps");
     const int maxNb = gpu->MaxNeighbors();
     for (const auto& p : gpu->Positions()) {
         if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) ok = false;
@@ -133,10 +171,11 @@ bool RunCachedSceneMutations() {
         if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) finite = false;
     }
     finite = finite && gpu->MaxNeighbors() <= 64;
-    const bool ok = inflowOk && dropOk && finite;
-    std::printf("[scene-cache] inflow %d->%d, drop %d->%d, finite/neighbors %s -> %s\n",
+    const bool colorsOk = CheckColors("scene-cache", *gpu, "after mutate");
+    const bool ok = inflowOk && dropOk && finite && colorsOk;
+    std::printf("[scene-cache] inflow %d->%d, drop %d->%d, finite/neighbors %s, colors %s -> %s\n",
                 n0, afterInflow, beforeDrop, gpu->FluidCount(), finite ? "ok" : "bad",
-                ok ? "PASS" : "FAIL");
+                colorsOk ? "ok" : "bad", ok ? "PASS" : "FAIL");
     return ok;
 }
 
