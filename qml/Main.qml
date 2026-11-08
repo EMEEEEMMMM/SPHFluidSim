@@ -69,7 +69,7 @@ Window {
                     Layout.fillHeight: true
                     session: root.sim
                     onSceneRequested: (scene) => root.requestScene(scene)
-                    onResolutionRequested: (index) => root.requestResolution(index)
+                    onParticleCountRequested: (count) => root.requestParticleCount(count)
                 }
 
                 Item {
@@ -404,11 +404,10 @@ Window {
         confirmPopup.open();
     }
 
-    function requestResolution(index) {
-        const spacings = [0.040, 0.030, 0.025, 0.020, 0.015, 0.0125, 0.010];
-        if (Math.abs(root.sim.params.spacing - spacings[index]) < 1e-5) return;
-        confirmPopup.text = "Changing the resolution rebuilds the scene from scratch. Continue?";
-        confirmPopup.onAccept = function () { root.sim.setParam("spacing", spacings[index]); };
+    function requestParticleCount(count) {
+        if (count === root.sim.params.particleCount) return;
+        confirmPopup.text = "Building " + count + " particles rebuilds the scene from scratch. Continue?";
+        confirmPopup.onAccept = function () { root.sim.setParam("particleCount", count); };
         confirmPopup.open();
     }
 

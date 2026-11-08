@@ -10,7 +10,7 @@ Flickable {
     signal solverRequested(int solver)
     signal backendRequested(int backend)
     // Property-change signal name is taken by `cameraMode`, so the user
-    // action gets its own name (matches sceneRequested / resolutionRequested).
+    // action gets its own name (matches sceneRequested / particleCountRequested).
     signal cameraModeRequested(int mode)
     signal resetViewRequested()
 

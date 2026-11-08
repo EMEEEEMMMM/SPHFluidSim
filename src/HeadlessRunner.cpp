@@ -33,6 +33,7 @@
 #include <vector>
 #include <io.h>   // _popen / _pclose (MinGW)
 #include <algorithm>
+#include <stdexcept>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <direct.h>
@@ -309,31 +310,42 @@ int RunHeadless(const HeadlessOptions& opt) {
     // --particles -> spacing: each scene defines a FIXED water volume, and the
     // spacing is derived so that N particles always fill that volume:
     //   volume = N * spacing^3  ->  spacing = (volume / N)^(1/3).
-    // A JSON job may instead provide the GUI spacing directly, which reproduces
-    // the exact resolution (and therefore particle count) seen in the window.
+    // The scene is then built with exactly N particles (the top lattice layer
+    // may be partial). A JSON job that only carries a spacing is converted to
+    // the corresponding count, so both paths agree.
     const bool isInflow = (opt.scene == "inflow");
     float waterVol = 0.512f;                       // dam: 0.8^3 water cube (open-top tank)
     if (isInflow) waterVol = 0.6f;                 // inflow: open tank filled to 60%
     const float waterSize = powf(waterVol, 1.0f / 3.0f);
-    float spacing = opt.spacing && *opt.spacing > 0.0f
-        ? *opt.spacing
-        : powf(waterVol / (float)opt.particles, 1.0f / 3.0f);
+    int particles = opt.particles;
+    if (opt.spacing && *opt.spacing > 0.0f) {
+        const double s = static_cast<double>(*opt.spacing);
+        particles = static_cast<int>(std::llround(waterVol / (s * s * s)));
+    }
+    particles = std::clamp(particles, 512, 4000000);
+    float spacing = powf(waterVol / (float)particles, 1.0f / 3.0f);
     params.spacing = spacing;
     if (opt.dt > 0.0f) params.dt = opt.dt;
-    const int initParticles = std::max(1, (int)std::lround(waterVol / powf(spacing, 3.0f))) +
-                              (isInflow ? 8 : 0);
-    if (isInflow) {
-        // open-top cubic container (side 1 m at x=1, z=0.5) + central jet
-        // falling 0.5 m from above (stronger jet)
-        solver.InitInflow(1.0f, 0.5f, 100, 0.12f, 1.0f, 0.5f, initParticles);
-        layer.SetTankSize(1.0f, 1.0f, 1.0f, 1.0f, 0.5f, true);
-    } else {
-        // dam break in an OPEN-TOP tank: splash may leave the tank. With
-        // --drop <frame> a spherical blob is spawned above the rim at that
-        // frame and falls in (one-shot, like the GUI button).
-        solver.InitDamOpen(2.0f, 1.2f, 1.0f, waterSize);
-        layer.SetTankSize(2.0f, 1.2f, 1.0f, 0.0f, 0.0f, true);   // open top
+    try {
+        solver.CheckParticleBudget(particles);
+        if (isInflow) {
+            // open-top cubic container (side 1 m at x=1, z=0.5) + central jet
+            // falling 0.5 m from above (stronger jet)
+            solver.InitInflow(1.0f, 0.5f, 100, 0.12f, 1.0f, 0.5f, particles);
+            layer.SetTankSize(1.0f, 1.0f, 1.0f, 1.0f, 0.5f, true);
+        } else {
+            // dam break in an OPEN-TOP tank: splash may leave the tank. With
+            // --drop <frame> a spherical blob is spawned above the rim at that
+            // frame and falls in (one-shot, like the GUI button).
+            solver.InitDamOpen(2.0f, 1.2f, 1.0f, waterSize);
+            layer.SetTankSize(2.0f, 1.2f, 1.0f, 0.0f, 0.0f, true);   // open top
+        }
+    } catch (const std::exception& ex) {
+        printf("[headless] cannot build the scene: %s\n", ex.what());
+        printf("[headless] lower --particles (currently %d) and try again.\n", particles);
+        return 1;
     }
+    spacing = solver.Spacing();
 
     // Camera: a closer three-quarter view centred on the tank.
     {
@@ -398,8 +410,9 @@ int RunHeadless(const HeadlessOptions& opt) {
     std::vector<float> plyScratch;
     const int reconInterval = std::max(1, opt.reconInterval);
 
-    printf("[headless] particles=%d (spacing=%.4f)  frames=%d  fps=%d  time-scale=%.4g  mode=%s  res=%dx%d\n",
-           solver.FluidCount(), spacing, opt.frames, opt.fps, opt.timeScale,
+    printf("[headless] particles=%d (target %d, spacing=%.4f)  frames=%d  fps=%d  "
+           "time-scale=%.4g  mode=%s  res=%dx%d\n",
+           solver.FluidCount(), particles, spacing, opt.frames, opt.fps, opt.timeScale,
            showSurface ? "surface" : "particles", opt.width, opt.height);
 
     double tWall0 = omp_get_wtime();

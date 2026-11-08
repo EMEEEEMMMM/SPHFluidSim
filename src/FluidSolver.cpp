@@ -530,6 +530,26 @@ void FluidSolver::BuildNeighborhood() {
         m_CellParticles[slot] = i;
     }
 
+    // The atomic scatter above assigns slots in scheduling order, so the
+    // neighbor list of a particle would otherwise depend on thread timing.
+    // Sorting every cell by global index makes the traversal order (and thus
+    // every floating-point sum below) reproducible across runs, which is what
+    // the CPU reference promises to the timeline/parity tests. Cells hold only
+    // a handful of particles, so insertion sort beats std::sort here.
+    #pragma omp parallel for schedule(static)
+    for (int c = 0; c < ncells; c++) {
+        const int begin = m_CellStart[c], end = m_CellStart[c + 1];
+        for (int i = begin + 1; i < end; ++i) {
+            const int v = m_CellParticles[i];
+            int j = i - 1;
+            while (j >= begin && m_CellParticles[j] > v) {
+                m_CellParticles[j + 1] = m_CellParticles[j];
+                --j;
+            }
+            m_CellParticles[j + 1] = v;
+        }
+    }
+
     #pragma omp parallel for
     for (int i = 0; i < m_N; i++) {
         auto& nb = m_FluidNb[i];

@@ -162,6 +162,11 @@ bool DriverApi::Load() {
     if (!MemAlloc) SPH_BIND_DRIVER(MemAlloc, "cuMemAlloc");
     SPH_BIND_DRIVER(MemFree, "cuMemFree_v2");
     if (!MemFree) SPH_BIND_DRIVER(MemFree, "cuMemFree");
+    SPH_BIND_DRIVER(MemAllocHost, "cuMemAllocHost_v2");
+    if (!MemAllocHost) SPH_BIND_DRIVER(MemAllocHost, "cuMemAllocHost");
+    SPH_BIND_DRIVER(MemFreeHost, "cuMemFreeHost");
+    SPH_BIND_DRIVER(MemGetInfo, "cuMemGetInfo_v2");
+    if (!MemGetInfo) SPH_BIND_DRIVER(MemGetInfo, "cuMemGetInfo");
     SPH_BIND_DRIVER(MemcpyHtoD, "cuMemcpyHtoD_v2");
     if (!MemcpyHtoD) SPH_BIND_DRIVER(MemcpyHtoD, "cuMemcpyHtoD");
     SPH_BIND_DRIVER(MemcpyDtoH, "cuMemcpyDtoH_v2");
@@ -176,6 +181,12 @@ bool DriverApi::Load() {
     SPH_BIND_DRIVER(StreamDestroy, "cuStreamDestroy_v2");
     if (!StreamDestroy) SPH_BIND_DRIVER(StreamDestroy, "cuStreamDestroy");
     SPH_BIND_DRIVER(StreamSynchronize, "cuStreamSynchronize");
+    SPH_BIND_DRIVER(EventCreate, "cuEventCreate");
+    SPH_BIND_DRIVER(EventRecord, "cuEventRecord");
+    SPH_BIND_DRIVER(EventSynchronize, "cuEventSynchronize");
+    SPH_BIND_DRIVER(EventElapsedTime, "cuEventElapsedTime");
+    SPH_BIND_DRIVER(EventDestroy, "cuEventDestroy_v2");
+    if (!EventDestroy) SPH_BIND_DRIVER(EventDestroy, "cuEventDestroy");
     SPH_BIND_DRIVER(MemcpyHtoDAsync, "cuMemcpyHtoDAsync_v2");
     if (!MemcpyHtoDAsync) SPH_BIND_DRIVER(MemcpyHtoDAsync, "cuMemcpyHtoDAsync");
     SPH_BIND_DRIVER(MemcpyDtoHAsync, "cuMemcpyDtoHAsync_v2");

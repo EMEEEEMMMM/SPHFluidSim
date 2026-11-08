@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -56,12 +57,20 @@ struct FluidSolverCuda::Impl {
     CUcontext ctx = nullptr;
     CUmodule module = nullptr;
     CUstream stream = nullptr;
+    void* hostPinned = nullptr;
     std::string deviceName;
+    struct KernelTiming { double ms = 0.0; int calls = 0; };
+    std::unordered_map<CUfunction, std::string> kernelNames;
+    std::unordered_map<std::string, KernelTiming> kernelTimings;
+    const bool profileKernels = std::getenv("SPH_CUDA_KERNEL_PROFILE") != nullptr;
+    const int profileSkip = profileKernels && std::getenv("SPH_CUDA_KERNEL_PROFILE_SKIP")
+        ? std::atoi(std::getenv("SPH_CUDA_KERNEL_PROFILE_SKIP")) : 0;
+    int stepCounter = 0;
 
     struct Kernels {
         CUfunction bounds{}, boundsFinal{};
         CUfunction cellOf{}, countCells{}, scanBlocks{}, scanAddOffsets{}, finalizeScan{}, copyInt{};
-        CUfunction scatter{}, sortCells{}, neighbors{};
+        CUfunction scatter{}, sortCells{}, neighbors{}, clampCounts{};
         CUfunction density{}, densityFactor{}, dii{}, normals{}, forces{}, rhoAdvAii{}, aii{};
         CUfunction pressureS{}, pressureP{}, reduceFinal{}, reduce3Final{}, integrate{};
         CUfunction clampV{}, vmag{}, reduceMaxFinal{}, colors{}, meanRho{};
@@ -76,17 +85,29 @@ struct FluidSolverCuda::Impl {
         if (!api || !api->loaded) return;
         if (ctx) api->CtxSetCurrent(ctx);
         if (ctx) api->CtxSynchronize();
+        if (!kernelTimings.empty()) {
+            std::vector<std::pair<std::string, KernelTiming>> rows(kernelTimings.begin(), kernelTimings.end());
+            std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) { return a.second.ms > b.second.ms; });
+            double total = 0.0;
+            for (const auto& row : rows) total += row.second.ms;
+            std::fprintf(stderr, "[kernel-profile] %s  total=%.3f ms\n", deviceName.c_str(), total);
+            for (const auto& row : rows) {
+                std::fprintf(stderr, "  %-28s %10.3f ms  %6d calls\n",
+                             row.first.c_str(), row.second.ms, row.second.calls);
+            }
+        }
         if (stream && api->StreamDestroy) api->StreamDestroy(stream);
         if (module) api->ModuleUnload(module);
         for (CUdeviceptr p : {dPos, dVel, dVadv, dDii, dS, dGradB, dNormals,
                               dRho, dRhoAdv, dP, dPPrev, dPTmp, dAii, dAlpha, dInvRho2, dPS,
                               dDeltaB, dKappaV, dKappaVPrev, dKappaSeed, dColors,
-                              dBpos, dBvol, dNb, dNbCount, dNbGeom, dBnb, dBnbCount,
+                              dBpos, dBvol, dNbCount, dNbGeom, dNbDist, dBnb, dBnbCount,
                               dCellOf, dCellCount, dCellStart, dCursor, dSorted,
                               dBlkErr, dBlkAbs, dBlkMax, dBlkBounds, dRed, dMaxNb}) {
             if (p) api->MemFree(p);
         }
         for (CUdeviceptr p : dScanLevels) if (p) api->MemFree(p);
+        if (hostPinned && api->MemFreeHost) api->MemFreeHost(hostPinned);
         if (ctx) api->DevicePrimaryCtxRelease(device);
     }
 
@@ -131,7 +152,7 @@ struct FluidSolverCuda::Impl {
     CUdeviceptr dRho{}, dRhoAdv{}, dP{}, dPPrev{}, dPTmp{}, dAii{}, dAlpha{}, dInvRho2{}, dPS{};
     CUdeviceptr dDeltaB{}, dKappaV{}, dKappaVPrev{}, dKappaSeed{};
     CUdeviceptr dColors{}, dBpos{}, dBvol{};
-    CUdeviceptr dNb{}, dNbCount{}, dNbGeom{}, dBnb{}, dBnbCount{};
+    CUdeviceptr dNbCount{}, dNbGeom{}, dNbDist{}, dBnb{}, dBnbCount{};
     CUdeviceptr dCellOf{}, dCellCount{}, dCellStart{}, dCursor{}, dSorted{};
     CUdeviceptr dBlkErr{}, dBlkAbs{}, dBlkMax{}, dBlkBounds{}, dRed{};
     CUdeviceptr dMaxNb{};
@@ -139,6 +160,43 @@ struct FluidSolverCuda::Impl {
     std::vector<size_t> scanCaps;
 
     size_t capN = 0, capB = 0, capCells = 0, capTotal = 0, capBlk = 0, capRed = 0;
+    // Set when an allocation failed halfway. The affected buffers are in an
+    // unknown state, so the next growth frees everything and starts over
+    // instead of reusing stale pointers.
+    bool buffersBroken = false;
+
+    // Device bytes one fluid particle holds in steady state. Must follow the
+    // allocation list in EnsureN(); used for the memory pre-flight.
+    static constexpr size_t kFluidBytesPerParticle =
+        7 * 16      // pos, vel, vadv, dii, S, gradB, normals
+        + 12 * 4    // rho, rhoAdv, p, pPrev, pTmp, aii, alpha, invRho2,
+                    // deltaB, kappaV, kappaVPrev, kappaSeed
+        + 3 * 4     // colors
+        + 2 * 4     // packed pressure (p, V/rho^2)
+        + kMaxNb * 16 + kMaxNb * 4 + 4   // nbGeom, nbDist, nbCount
+        + kMaxBnb * 4 + 4;                            // bnb, bnbCount
+
+    size_t HeldDeviceBytes() const {
+        return capN * kFluidBytesPerParticle + capB * 20 + capCells * 16 + capTotal * 4 +
+               capBlk * 34 + capRed;
+    }
+
+    // Free every fluid/boundary buffer and forget the capacities. Used when a
+    // previous allocation failed halfway, so no dangling size is reused.
+    void DropAllBuffers() {
+        for (CUdeviceptr* p : {&dPos, &dVel, &dVadv, &dDii, &dS, &dGradB, &dNormals,
+                               &dRho, &dRhoAdv, &dP, &dPPrev, &dPTmp, &dAii, &dAlpha,
+                               &dInvRho2, &dDeltaB, &dKappaV, &dKappaVPrev, &dKappaSeed,
+                               &dColors, &dPS, &dNbGeom, &dNbDist, &dNbCount,
+                               &dBnb, &dBnbCount, &dBpos, &dBvol, &dCellOf, &dCellCount,
+                               &dCellStart, &dCursor, &dSorted, &dBlkErr, &dBlkAbs,
+                               &dBlkMax, &dBlkBounds, &dRed}) {
+            if (*p) api->MemFree(*p);
+            *p = 0;
+        }
+        capN = capB = capCells = capTotal = capBlk = capRed = 0;
+        buffersBroken = false;
+    }
 
     // ------------------------------------------------------------------
     void Alloc(CUdeviceptr& p, size_t bytes, const char* tag) {
@@ -147,20 +205,26 @@ struct FluidSolverCuda::Impl {
     }
 
     void EnsureN(size_t n) {
-        if (n <= capN) return;
+        if (n <= capN && !buffersBroken) return;
+        if (buffersBroken) DropAllBuffers();
         const size_t cap = std::max<size_t>(n, capN ? capN * 2 : n);
-        for (CUdeviceptr* p : {&dPos, &dVel, &dVadv, &dDii, &dS, &dGradB, &dNormals})
-            Alloc(*p, cap * sizeof(F4), "fluid vec4");
-        for (CUdeviceptr* p : {&dRho, &dRhoAdv, &dP, &dPPrev, &dPTmp, &dAii, &dAlpha, &dInvRho2,
-                               &dDeltaB, &dKappaV, &dKappaVPrev, &dKappaSeed})
-            Alloc(*p, cap * sizeof(float), "fluid scalar");
-        Alloc(dColors, cap * 3 * sizeof(float), "colors");
-        Alloc(dPS, cap * 2 * sizeof(float), "pressureScaled");
-        Alloc(dNb, cap * kMaxNb * sizeof(int), "nb");
-        Alloc(dNbGeom, cap * kMaxNb * sizeof(F4), "nbGeom");
-        Alloc(dNbCount, cap * sizeof(int), "nbCount");
-        Alloc(dBnb, cap * kMaxBnb * sizeof(int), "bnb");
-        Alloc(dBnbCount, cap * sizeof(int), "bnbCount");
+        try {
+            for (CUdeviceptr* p : {&dPos, &dVel, &dVadv, &dDii, &dS, &dGradB, &dNormals})
+                Alloc(*p, cap * sizeof(F4), "fluid vec4");
+            for (CUdeviceptr* p : {&dRho, &dRhoAdv, &dP, &dPPrev, &dPTmp, &dAii, &dAlpha,
+                                   &dInvRho2, &dDeltaB, &dKappaV, &dKappaVPrev, &dKappaSeed})
+                Alloc(*p, cap * sizeof(float), "fluid scalar");
+            Alloc(dColors, cap * 3 * sizeof(float), "colors");
+            Alloc(dPS, cap * 2 * sizeof(float), "pressureScaled");
+            Alloc(dNbGeom, cap * kMaxNb * sizeof(F4), "nbGeom");
+            Alloc(dNbDist, cap * kMaxNb * sizeof(float), "nbDist");
+            Alloc(dNbCount, cap * sizeof(int), "nbCount");
+            Alloc(dBnb, cap * kMaxBnb * sizeof(int), "bnb");
+            Alloc(dBnbCount, cap * sizeof(int), "bnbCount");
+        } catch (...) {
+            buffersBroken = true;
+            throw;
+        }
         capN = cap;
     }
 
@@ -234,7 +298,11 @@ struct FluidSolverCuda::Impl {
 
     void ToDev(CUdeviceptr dst, const void* src, size_t bytes) {
         if (!bytes) return;
-        if (stream) {
+        if (stream && hostPinned && bytes <= 256) {
+            std::memcpy(hostPinned, src, bytes);
+            ThrowIf(api->MemcpyHtoDAsync(dst, hostPinned, bytes, stream), "HtoD");
+            ThrowIf(api->StreamSynchronize(stream), "stream sync");
+        } else if (stream) {
             ThrowIf(api->MemcpyHtoDAsync(dst, src, bytes, stream), "HtoD");
             ThrowIf(api->StreamSynchronize(stream), "stream sync");
         } else {
@@ -243,7 +311,11 @@ struct FluidSolverCuda::Impl {
     }
     void FromDev(void* dst, CUdeviceptr src, size_t bytes) {
         if (!bytes) return;
-        if (stream) {
+        if (stream && hostPinned && bytes <= 256) {
+            ThrowIf(api->MemcpyDtoHAsync(hostPinned, src, bytes, stream), "DtoH");
+            ThrowIf(api->StreamSynchronize(stream), "stream sync");
+            std::memcpy(dst, hostPinned, bytes);
+        } else if (stream) {
             ThrowIf(api->MemcpyDtoHAsync(dst, src, bytes, stream), "DtoH");
             ThrowIf(api->StreamSynchronize(stream), "stream sync");
         } else {
@@ -268,7 +340,26 @@ struct FluidSolverCuda::Impl {
         void* raw[N];
         for (size_t i = 0; i < N; ++i) raw[i] = const_cast<void*>(args[i]);
         int grid = (n + block - 1) / block;
+        CUevent begin = nullptr, end = nullptr;
+        const bool measure = profileKernels && stepCounter > profileSkip;
+        if (measure) {
+            ThrowIf(api->EventCreate(&begin, 0), "event create");
+            ThrowIf(api->EventCreate(&end, 0), "event create");
+            ThrowIf(api->EventRecord(begin, stream), "event record");
+        }
         ThrowIf(api->LaunchKernel(f, grid, 1, 1, block, 1, 1, 0, stream, raw, nullptr), "launch");
+        if (measure) {
+            ThrowIf(api->EventRecord(end, stream), "event record");
+            ThrowIf(api->EventSynchronize(end), "event sync");
+            float ms = 0.0f;
+            ThrowIf(api->EventElapsedTime(&ms, begin, end), "event elapsed");
+            auto it = kernelNames.find(f);
+            auto& timing = kernelTimings[it == kernelNames.end() ? "unknown" : it->second];
+            timing.ms += ms;
+            timing.calls++;
+            api->EventDestroy(begin);
+            api->EventDestroy(end);
+        }
     }
 
     int Blocks(int n) const { return (n + kBlock - 1) / kBlock; }
@@ -295,6 +386,50 @@ struct FluidSolverCuda::Impl {
         h = 2.0f * params.spacing;
         mass = params.rho0 * params.spacing * params.spacing * params.spacing;
         vol = params.spacing * params.spacing * params.spacing;
+    }
+
+    // ---- device memory budget ------------------------------------------
+    long long gpuFreeBytes = 0, gpuTotalBytes = 0;
+
+    void RefreshMemoryInfo() {
+        if (!api || !api->MemGetInfo) return;
+        size_t freeB = 0, totalB = 0;
+        if (api->MemGetInfo(&freeB, &totalB) == CUDA_SUCCESS) {
+            gpuFreeBytes = static_cast<long long>(freeB);
+            gpuTotalBytes = static_cast<long long>(totalB);
+        }
+    }
+
+    // Device bytes the scene needs for `n` fluid particles: the per-particle
+    // state plus a margin for the boundary layer and the grid scratch, which
+    // are both far smaller than the fluid arrays at these sizes.
+    size_t EstimateSceneBytes(size_t n) const {
+        return static_cast<size_t>(n * kFluidBytesPerParticle * 1.12) + (80ull << 20);
+    }
+
+    // Throws before anything on the device changes when the requested set does
+    // not fit. `available` counts the buffers of the current scene as reusable,
+    // because EnsureN frees them before the new allocation.
+    void CheckBudget(size_t n) const {
+        if (!api || !api->MemGetInfo || n == 0) return;
+        size_t freeB = 0, totalB = 0;
+        if (api->MemGetInfo(&freeB, &totalB) != CUDA_SUCCESS) return;
+        const size_t available = freeB + HeldDeviceBytes();
+        const size_t need = EstimateSceneBytes(n);
+        if (need <= available) return;
+        const size_t reserve = 96ull << 20;
+        const size_t budget = available > reserve ? available - reserve : 0;
+        const size_t fits = budget / static_cast<size_t>(kFluidBytesPerParticle * 1.12);
+        char msg[640];
+        std::snprintf(msg, sizeof(msg),
+                      "not enough GPU memory for about %zu particles: needs about %.0f MiB, "
+                      "only %.0f MiB usable (%.0f MiB free of %.0f MiB). "
+                      "Lower the particle count to about %zu.",
+                      n, static_cast<double>(need) / 1048576.0,
+                      static_cast<double>(available) / 1048576.0,
+                      static_cast<double>(freeB) / 1048576.0,
+                      static_cast<double>(totalB) / 1048576.0, fits);
+        throw std::runtime_error(msg);
     }
 
     void BuildBoundary(bool openTop) {
@@ -385,6 +520,9 @@ struct FluidSolverCuda::Impl {
         }
         dirtyPos = dirtyVel = dirtyRho = dirtyP = dirtyColors = dirtyNb = false;
         lastMaxNb = 0;
+        neighborCacheValid = false;
+        densityCacheValid = false;
+        RefreshMemoryInfo();
     }
 
     void SyncPositions() {
@@ -458,16 +596,6 @@ struct FluidSolverCuda::Impl {
     }
 
     // ------------------------------------------------------------------
-    float ReduceSumKernel(CUfunction f, int n) {
-        EnsureBlocks(Blocks(n));
-        EnsureRed();
-        const void* a[] = {&dBlkErr, &n, &dBlkErr};
-        // kMeanRho-style kernels take (src, n, blockVals); callers pass a base
-        // pointer through `srcFor`, so this helper only handles the final stage.
-        (void)a; (void)f;
-        return 0.0f;
-    }
-
     void FinalSum(int blocks) {
         EnsureRed();
         const void* a[] = {&dBlkErr, &blocks, &dRed};
@@ -519,6 +647,14 @@ struct FluidSolverCuda::Impl {
         float ox = 0, oy = 0, oz = 0, invh = 0;
         int gw = 0, gh = 0, gd = 0, ncells = 0;
     };
+    // Neighbor lists + boundary sums are position-dependent only. DFSPH ends
+    // its step with a rebuild at the final positions, so the next step can
+    // reuse it until another position integration/scene mutation invalidates it.
+    bool neighborCacheValid = false;
+    // rho/alpha are also position-only. The DFSPH end-of-step rebuild leaves
+    // them valid for the next step's force pass; normals are still recomputed
+    // because surface tension reads them from the current rho field.
+    bool densityCacheValid = false;
 
     Grid ComputeGrid() {
         const int n = (int)X.size();
@@ -599,11 +735,17 @@ struct FluidSolverCuda::Impl {
         if (bp) { api->CtxSynchronize(); t3 = Clock::now(); }
         if (!dMaxNb) Alloc(dMaxNb, sizeof(int), "maxNb");
         SetInt(dMaxNb, 0, 1);
+        SetInt(dNbCount, 0, n);
+        SetInt(dBnbCount, 0, n);
         {
             const void* a[] = {&dPos, &dBpos, &n, &nb, &ox, &oy, &oz, &invh, &g.gw, &g.gh, &g.gd, &hh,
-                         &dCellStart, &dSorted, &dBvol, &dNbGeom, &dDeltaB, &dGradB,
-                         &dNb, &dNbCount, &dBnb, &dBnbCount, &dMaxNb};
+                         &dCellStart, &dSorted, &dBvol, &dNbGeom, &dNbDist, &dDeltaB, &dGradB,
+                         &dNbCount, &dBnb, &dBnbCount, &dMaxNb};
             Launch(k.neighbors, n, a);
+        }
+        {
+            const void* a[] = {&dNbCount, &dBnbCount, &n, &dMaxNb};
+            Launch(k.clampCounts, n, a);
         }
         if (bp) { api->CtxSynchronize(); t4 = Clock::now(); }
         dirtyNb = true;
@@ -623,35 +765,38 @@ struct FluidSolverCuda::Impl {
         const int n = (int)X.size();
         float vv = vol, hh = h;
         if (params.solver == 1) {
-            const void* a[] = {&dNbGeom, &dNb, &dNbCount, &dGradB, &dDeltaB, &n, &vv, &hh,
-                         &dRho, &dInvRho2, &dDii, &dAlpha};
-            Launch(k.densityFactor, n, a);
+            if (!densityCacheValid) {
+                const void* a[] = {&dNbGeom, &dNbDist, &dNbCount, &dGradB, &dDeltaB, &n, &vv, &hh,
+                             &dRho, &dInvRho2, &dDii, &dAlpha};
+                Launch(k.densityFactor, n, a);
+                densityCacheValid = true;
+            }
         } else {
-            const void* a[] = {&dNbGeom, &dNb, &dNbCount, &n, &vv, &hh, &dDeltaB, &dRho, &dInvRho2};
+            const void* a[] = {&dNbGeom, &dNbDist, &dNbCount, &n, &vv, &hh, &dDeltaB, &dRho, &dInvRho2};
             Launch(k.density, n, a);
         }
         if (params.solver == 0) {
-            const void* a[] = {&dNbGeom, &dNb, &dNbCount, &dGradB, &dRho, &n, &vv, &hh, &dDii};
+            const void* a[] = {&dNbGeom, &dNbCount, &dGradB, &dRho, &n, &vv, &hh, &dDii};
             Launch(k.dii, n, a);
         }
         if (params.surfaceTension > 0.0f) {
-            const void* a[] = {&dNbGeom, &dNb, &dNbCount, &dRho, &n, &vv, &hh, &dNormals};
+            const void* a[] = {&dNbGeom, &dNbCount, &dRho, &n, &vv, &hh, &dNormals};
             Launch(k.normals, n, a);
         }
         float dtv = dt, grav = params.gravity, visc = params.viscosity;
         float tens = params.surfaceTension, tensB = params.surfaceTensionBoundary;
         float rho0 = params.rho0;
         {
-            const void* a[] = {&dPos, &dVel, &dBpos, &dNb, &dNbCount, &dNbGeom, &dBnb, &dBnbCount,
+            const void* a[] = {&dPos, &dVel, &dBpos, &dNbCount, &dNbGeom, &dNbDist, &dBnb, &dBnbCount,
                          &dNormals, &dRho, &dBvol, &n, &vv, &hh, &dtv, &grav,
                          &visc, &tens, &tensB, &rho0, &dVadv};
             Launch(k.forces, n, a);
         }
         if (params.solver == 0) {
-            const void* a[] = {&dPos, &dNb, &dNbCount, &dNbGeom, &dDii, &dGradB, &dVadv,
+            const void* a[] = {&dPos, &dNbCount, &dNbGeom, &dDii, &dGradB, &dVadv,
                          &dRho, &dInvRho2, &dPPrev, &n, &vv, &hh, &dtv, &dRhoAdv, &dP, &dPS};
             Launch(k.rhoAdvAii, n, a);
-            const void* b[] = {&dNbGeom, &dNb, &dNbCount, &dDii, &dGradB, &dRho, &n, &vv, &hh, &dAii};
+            const void* b[] = {&dNbGeom, &dNbCount, &dDii, &dGradB, &dRho, &n, &vv, &hh, &dAii};
             Launch(k.aii, n, b);
         }
     }
@@ -663,11 +808,11 @@ struct FluidSolverCuda::Impl {
         lastIter = 0;
         while (true) {
             {
-                const void* a[] = {&dNbGeom, &dNb, &dNbCount, &dPS, &n, &dS};
+                const void* a[] = {&dNbGeom, &dNbCount, &dPS, &n, &dS};
                 Launch(k.pressureS, n, a);
             }
             {
-                const void* a[] = {&dNbGeom, &dNb, &dNbCount, &dDii, &dS, &dGradB, &dPS,
+                const void* a[] = {&dNbGeom, &dNbCount, &dDii, &dS, &dGradB, &dPS,
                              &dRhoAdv, &dAii, &n, &vv, &hh, &dtv, &om, &nxt,
                              &dBlkErr, &dBlkAbs, &dBlkMax};
                 EnsureBlocks(Blocks(n));
@@ -704,6 +849,8 @@ struct FluidSolverCuda::Impl {
             const void* a[] = {&dVel, &n, &vmax};
             Launch(k.clampV, n, a);
         }
+        neighborCacheValid = false;   // positions moved in Integrate
+        densityCacheValid = false;
     }
 
     void UpdateColors() {
@@ -736,34 +883,40 @@ struct FluidSolverCuda::Impl {
 
         // constant-density solver (rho/alpha were produced by Predict)
         {
-            const void* b[] = {&dNbGeom, &dNb, &dNbCount, &dBnbCount, &dVadv, &dGradB, &dRho,
+            const void* b[] = {&dNbGeom, &dNbCount, &dBnbCount, &dVadv, &dGradB, &dRho,
                          &dAlpha, &dPPrev, &n, &vv, &hh, &dtv, &warm, &dRhoAdv, &dP};
             Launch(k.dfsphInit, n, b);
         }
         {
-            const void* a[] = {&dNbGeom, &dBpos, &dNb, &dNbCount, &dBnb, &dBnbCount, &dBvol, &dGradB, &dP,
+            const void* a[] = {&dNbGeom, &dNbCount, &dGradB, &dP,
                          &n, &vv, &hh, &dtv, &om, &dVadv};
             Launch(k.dfsphVel, n, a);
-            const void* b[] = {&dNbGeom, &dNb, &dNbCount, &dVadv, &dGradB, &dRho, &dAlpha,
-                         &n, &vv, &hh, &dtv, &dRhoAdv, &dP, &dBlkErr, &dBlkAbs, &dBlkMax};
+            const void* b[] = {&dNbGeom, &dNbCount, &dVadv, &dGradB, &dRho, &dAlpha,
+                         &n, &vv, &dtv, &dRhoAdv, &dP, &dBlkErr, &dBlkAbs, &dBlkMax};
             EnsureBlocks(Blocks(n));
             Launch(k.dfsphRhoAdv, n, b);
         }
-        Err3 e = reduce3();
+        // The first reduction cannot stop the solve: minIterations is 2. Skip
+        // it and let the second iteration produce the first decision point.
+        Err3 e{0.f, 0.f, 0.f};
         lastIter = 1;
         int iter = 1;
-        while ((e.sum / (float)n > params.eta || iter < 2) && iter < params.maxIter) {
-            iter++;
-            {
-                const void* a[] = {&dNbGeom, &dBpos, &dNb, &dNbCount, &dBnb, &dBnbCount, &dBvol, &dGradB, &dP,
-                             &n, &vv, &hh, &dtv, &om, &dVadv};
-                Launch(k.dfsphVel, n, a);
-                const void* b[] = {&dNbGeom, &dNb, &dNbCount, &dVadv, &dGradB, &dRho, &dAlpha,
-                             &n, &vv, &hh, &dtv, &dRhoAdv, &dP, &dBlkErr, &dBlkAbs, &dBlkMax};
-                Launch(k.dfsphRhoAdv, n, b);
-            }
+        if (params.maxIter <= 1) {
             e = reduce3();
-            lastIter = iter;
+        } else {
+            do {
+                iter++;
+                {
+                    const void* a[] = {&dNbGeom, &dNbCount, &dGradB, &dP,
+                                 &n, &vv, &hh, &dtv, &om, &dVadv};
+                    Launch(k.dfsphVel, n, a);
+                    const void* b[] = {&dNbGeom, &dNbCount, &dVadv, &dGradB, &dRho, &dAlpha,
+                                 &n, &vv, &dtv, &dRhoAdv, &dP, &dBlkErr, &dBlkAbs, &dBlkMax};
+                    Launch(k.dfsphRhoAdv, n, b);
+                }
+                e = reduce3();
+                lastIter = iter;
+            } while (e.sum / (float)n > params.eta && iter < params.maxIter);
         }
         avgErr = e.sum / (float)n;
         avgAbsErr = e.abs / (float)n;
@@ -781,20 +934,21 @@ struct FluidSolverCuda::Impl {
         }
 
         BuildNeighborhood();
+        neighborCacheValid = true;   // matches the positions at the next step start
         // density + stiffness on the new positions
         {
-            const void* a[] = {&dNbGeom, &dNb, &dNbCount, &dGradB, &dDeltaB, &n, &vv, &hh,
+            const void* a[] = {&dNbGeom, &dNbDist, &dNbCount, &dGradB, &dDeltaB, &n, &vv, &hh,
                          &dRho, &dInvRho2, &dDii, &dAlpha};
             Launch(k.densityFactor, n, a);
+            densityCacheValid = true;
             EnsureBlocks(Blocks(n));
-            const void* c[] = {&dNbGeom, &dNb, &dNbCount, &dBnbCount, &dVadv, &dGradB,
+            const void* c[] = {&dNbGeom, &dNbCount, &dBnbCount, &dVadv, &dGradB,
                          &n, &vv, &invH, &warm, &dKappaVPrev, &dKappaV, &dKappaSeed, &dBlkErr};
             Launch(k.dfsphKappaInit, n, c);
         }
-        FinalSum(Blocks(n));
-        float errSum0 = 0.0f;
-        FromDev(&errSum0, dRed, sizeof(float));
-        float err = errSum0 / (float)n;
+        // One divergence iteration is mandatory, so its initial residual does
+        // not affect the loop decision. Avoid a redundant full reduction.
+        float err = std::numeric_limits<float>::max();
         lastIterV = 0;
         int iterv = 0;
         while ((err > params.etaV / dtv || iterv < 1) && iterv < params.maxIter) {
@@ -802,10 +956,10 @@ struct FluidSolverCuda::Impl {
             {
                 const void* a[] = {&dAlpha, &n, &invH, &iterv, &warm, &dKappaSeed, &dKappaV};
                 Launch(k.dfsphKappaScale, n, a);
-                const void* b[] = {&dNbGeom, &dBpos, &dNb, &dNbCount, &dBnb, &dBnbCount, &dBvol, &dGradB,
-                             &dKappaV, &n, &vv, &hh, &dtv, &om, &dVadv};
+                const void* b[] = {&dNbGeom, &dNbCount, &dGradB, &dKappaV,
+                             &n, &vv, &dtv, &om, &dVadv};
                 Launch(k.dfsphVelV, n, b);
-                const void* c[] = {&dNbGeom, &dNb, &dNbCount, &dBnbCount, &dVadv, &dGradB,
+                const void* c[] = {&dNbGeom, &dNbCount, &dBnbCount, &dVadv, &dGradB,
                              &n, &vv, &hh, &dKappaV, &dBlkErr};
                 EnsureBlocks(Blocks(n));
                 Launch(k.dfsphRhoDot, n, c);
@@ -829,6 +983,7 @@ struct FluidSolverCuda::Impl {
     bool profile = (std::getenv("SPH_CUDA_PROFILE") != nullptr);
 
     float RunStep() {
+        ++stepCounter;
         const int n0 = (int)X.size();
         if (n0 == 0) return params.dt;
         using Clock = std::chrono::steady_clock;
@@ -846,7 +1001,10 @@ struct FluidSolverCuda::Impl {
         if (inflow) InjectFluid(dt);
 
         if (prof) { api->CtxSynchronize(); tB = Clock::now(); }
-        BuildNeighborhood();
+        if (!neighborCacheValid) {
+            BuildNeighborhood();
+            neighborCacheValid = true;
+        }
         if (prof) { api->CtxSynchronize(); tP = Clock::now(); }
         Predict(dt);
         if (prof) { api->CtxSynchronize(); tS = Clock::now(); }
@@ -882,7 +1040,7 @@ struct FluidSolverCuda::Impl {
         // Scene mutation appends to the host mirror and UploadAll() re-uploads
         // the whole state, so this rare path needs a current mirror.
         SyncHost();
-        const float yEmit = boxX + inflowGap;
+        const float yEmit = boxY + inflowGap;
         const int nn = (int)std::ceil(inflowRadius / params.spacing);
         const int cap = std::min(inflowPerStep, maxParticles - n);
         int spawned = 0;
@@ -919,6 +1077,7 @@ struct FluidSolverCuda::Impl {
         deviceName = name;
         ThrowIf(api->DevicePrimaryCtxRetain(&ctx, device), "primary ctx");
         ThrowIf(api->CtxSetCurrent(ctx), "ctx set");
+        RefreshMemoryInfo();
 
         int ccMajor = 6, ccMinor = 1;
         api->DeviceGetAttribute(&ccMajor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, device);
@@ -941,7 +1100,7 @@ struct FluidSolverCuda::Impl {
         static const char* kKernelNames[] = {
             "kBounds", "kBoundsFinal",
             "kCellOf", "kCountCells", "kScanBlocks", "kScanAddOffsets", "kFinalizeScan", "kCopyInt",
-            "kScatter", "kSortCells", "kNeighbors",
+            "kScatter", "kSortCells", "kNeighbors", "kClampCounts",
             "kDensity", "kDensityFactor", "kDii", "kNormalsIdx", "kForcesFull", "kRhoAdvAii", "kAii",
             "kPressureSIdx", "kPressureP", "kReduceFinal", "kReduce3Final", "kIntegrate", "kClampV", "kVMag",
             "kReduceMaxFinal", "kColors", "kMeanRho", "kDFSPHInit",
@@ -992,6 +1151,7 @@ struct FluidSolverCuda::Impl {
             CUresult r = api->ModuleGetFunction(&f, module, real);
             if (r != CUDA_SUCCESS)
                 throw std::runtime_error(std::string("missing kernel ") + name + " (" + real + ")");
+            kernelNames[f] = name;
             return f;
         };
         k.bounds = get("kBounds");
@@ -1005,6 +1165,7 @@ struct FluidSolverCuda::Impl {
         k.scatter = get("kScatter");
         k.sortCells = get("kSortCells");
         k.neighbors = get("kNeighbors");
+        k.clampCounts = get("kClampCounts");
         k.density = get("kDensity");
         k.densityFactor = get("kDensityFactor");
         k.dii = get("kDii");
@@ -1037,6 +1198,7 @@ struct FluidSolverCuda::Impl {
         // A non-default stream avoids the extra implicit-synchronisation cost
         // the legacy default stream carries under Windows/WDDM.
         if (api->StreamCreate) ThrowIf(api->StreamCreate(&stream, CU_STREAM_NON_BLOCKING), "stream");
+        if (api->MemAllocHost) ThrowIf(api->MemAllocHost(&hostPinned, 256), "pinned host");
 
         // Optional launch-latency probe: SPH_CUDA_LAUNCH_BENCH=1 prints the
         // per-launch cost, which is what dominates the 100-iteration pressure
@@ -1310,5 +1472,18 @@ int FluidSolverCuda::MaxNeighbors() const {
     return m_impl->lastMaxNb;
 }
 const char* FluidSolverCuda::BackendName() const { return m_impl->deviceName.c_str(); }
+
+GpuMemoryInfo FluidSolverCuda::GpuMemory() const {
+    GpuMemoryInfo info;
+    info.freeBytes = m_impl->gpuFreeBytes;
+    info.totalBytes = m_impl->gpuTotalBytes;
+    info.bytesPerParticle = static_cast<long long>(Impl::kFluidBytesPerParticle);
+    return info;
+}
+
+void FluidSolverCuda::CheckParticleBudget(int particleCount) const {
+    if (particleCount > 0)
+        m_impl->CheckBudget(static_cast<size_t>(particleCount));
+}
 
 #endif  // SPH_HAS_CUDA

@@ -39,7 +39,7 @@ struct HeadlessOptions {
     std::string solver = "iisph"; // "iisph" | "df sph" (DFSPH, Bender & Koschier 2017)
     std::string backend = "auto"; // "auto" | "cpu" | "cuda"
     double dropVideoSeconds = -1.0; // drop event on the video timeline (-1 = never)
-    int    particles = 8000;    // approx. fluid particle count (adjusts spacing)
+    int    particles = 8000;    // exact fluid particle count (spacing follows)
     float  dt        = 0.0f;    // maximum nominal timestep (0 = solver default; CFL may shorten it)
     // Optional values are used by the JSON/GUI path. Leaving them unset keeps
     // the solver defaults and the original command-line behaviour.

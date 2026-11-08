@@ -18,6 +18,13 @@
 //  - The accessors return host-side vectors that are valid after Step() and
 //    after scene construction. A GPU backend keeps a host mirror and refreshes
 //    it lazily.
+// Device-memory budget of a backend. Everything is zero for the CPU solver.
+struct GpuMemoryInfo {
+    long long freeBytes = 0;         // free device memory when last measured
+    long long totalBytes = 0;        // device memory in total
+    long long bytesPerParticle = 0;  // steady-state device bytes per fluid particle
+};
+
 class IFluidSolver {
 public:
     using Params = FluidParams;
@@ -62,6 +69,16 @@ public:
     virtual const Params& GetParams() const = 0;
     virtual float KernelRadius() const = 0;
     virtual float Spacing() const = 0;
+
+    // Device-memory budget for pre-flight checks. Cached at scene build time, so
+    // this is safe to call from the UI thread (no CUDA context switch).
+    virtual GpuMemoryInfo GpuMemory() const = 0;
+
+    // Throws std::runtime_error when a scene with roughly this many fluid
+    // particles cannot be built on this backend (device memory exhausted).
+    // No-op for the CPU backend. Callers use it before rebuilding a scene so a
+    // refused request leaves the running simulation untouched.
+    virtual void CheckParticleBudget(int particleCount) const = 0;
 
     // --- diagnostics (paper Sec.5 helpers) ---------------------------------
     virtual void EnableConvergenceTrace() = 0;

@@ -14,6 +14,7 @@ class QComboBox;
 class QLabel;
 class QMenu;
 class QPushButton;
+class QSpinBox;
 class RenderJob;
 class SimulationSession;
 
@@ -71,7 +72,7 @@ private:
 
     void setParam(const QString& key, const QVariant& value);
     void changeScene(int scene);
-    void changeResolution(int index);
+    void changeParticleCount(int count);
     void changeSolver(int solver);
     void openRenderDialog();
     void toast(const QString& text);
@@ -100,7 +101,8 @@ private:
     // left panel
     SegmentedControl* m_sceneSeg = nullptr;
     Card* m_playbackCard = nullptr;
-    QComboBox* m_resolution = nullptr;
+    QSpinBox* m_particles = nullptr;
+    QLabel* m_spacingHint = nullptr;
     QLabel* m_particleCount = nullptr;
     QPushButton* m_dropButton = nullptr;
     SliderRow* m_speed = nullptr;

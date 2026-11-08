@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -109,6 +110,78 @@ bool RunCase(const char* label, int solverKind, int steps, float spacing,
     return ok;
 }
 
+bool RunCachedSceneMutations() {
+    std::string error;
+    auto gpu = FluidSolverCuda::Create(&error);
+    if (!gpu) return false;
+    gpu->GetParams().spacing = 0.05f;
+    gpu->GetParams().solver = 1;   // DFSPH exercises the across-step caches
+    gpu->InitInflow(1.0f, 0.3f, 100, 0.08f, 0.5f, 0.5f, 4000);
+    const int n0 = gpu->FluidCount();
+    for (int i = 0; i < 20; ++i) gpu->Step();
+    const int afterInflow = gpu->FluidCount();
+    const bool inflowOk = afterInflow > n0;
+
+    gpu->InitDamOpen(1.0f, 0.8f, 1.0f, 0.4f);
+    for (int i = 0; i < 5; ++i) gpu->Step();
+    const int beforeDrop = gpu->FluidCount();
+    gpu->SpawnDrop(0.12f, 0.5f, 1.0f, 0.5f);
+    for (int i = 0; i < 5; ++i) gpu->Step();
+    const bool dropOk = gpu->FluidCount() > beforeDrop;
+    bool finite = true;
+    for (const auto& p : gpu->Positions()) {
+        if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) finite = false;
+    }
+    finite = finite && gpu->MaxNeighbors() <= 64;
+    const bool ok = inflowOk && dropOk && finite;
+    std::printf("[scene-cache] inflow %d->%d, drop %d->%d, finite/neighbors %s -> %s\n",
+                n0, afterInflow, beforeDrop, gpu->FluidCount(), finite ? "ok" : "bad",
+                ok ? "PASS" : "FAIL");
+    return ok;
+}
+
+// A request that cannot fit must be refused BEFORE the device is touched, so a
+// running scene survives a too-large particle count.
+bool RunMemoryGuard() {
+    std::string error;
+    auto gpu = FluidSolverCuda::Create(&error);
+    if (!gpu) return false;
+    gpu->GetParams().spacing = 0.05f;
+    gpu->GetParams().solver = 1;
+    gpu->InitDamOpen(2.0f, 1.2f, 1.0f, 0.8f);
+    const int before = gpu->FluidCount();
+    const GpuMemoryInfo mem = gpu->GpuMemory();
+    if (mem.totalBytes <= 0 || mem.bytesPerParticle <= 0) {
+        std::printf("[budget] no device memory info -> SKIP\n");
+        return true;
+    }
+    // Twice what the whole card could ever hold, whatever its size.
+    const int tooMany = static_cast<int>(
+        std::min<long long>(2000000000LL, 2 * mem.totalBytes / mem.bytesPerParticle));
+    bool refused = false;
+    std::string why;
+    try {
+        gpu->CheckParticleBudget(tooMany);
+    } catch (const std::exception& ex) {
+        refused = true;
+        why = ex.what();
+    }
+    const bool intact = gpu->FluidCount() == before;
+    bool steps = true;
+    try {
+        gpu->Step();
+        steps = gpu->FluidCount() == before;
+    } catch (const std::exception&) {
+        steps = false;
+    }
+    const bool ok = refused && intact && steps;
+    std::printf("[budget] %lld MiB total, %d particles refused=%d, scene intact=%d, "
+                "still stepping=%d -> %s\n%s%s\n",
+                mem.totalBytes / (1024 * 1024), tooMany, refused ? 1 : 0, intact ? 1 : 0,
+                steps ? 1 : 0, ok ? "PASS" : "FAIL", why.c_str(), why.empty() ? "" : "\n");
+    return ok;
+}
+
 }  // namespace
 
 int main() {
@@ -121,5 +194,7 @@ int main() {
     bool ok = true;
     ok &= RunCase("IISPH", 0, 20, sp, 1e-3f * sp, 5e-2f * sp, 2e-2f);
     ok &= RunCase("DFSPH", 1, 20, sp, 1e-3f * sp, 5e-2f * sp, 2e-2f);
+    ok &= RunCachedSceneMutations();
+    ok &= RunMemoryGuard();
     return ok ? 0 : 1;
 }

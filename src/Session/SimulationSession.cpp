@@ -36,23 +36,42 @@ TankInfo TankForScene(int scene) {
     return {2.0f, 1.2f, 1.0f, 0.0f, 0.0f, true};
 }
 
+// The scenes are defined by a fixed water volume; the caller picks the particle
+// count and the spacing follows from it. 0.512 m^3 = the 0.8 m dam-break cube,
+// 0.6 m^3 = the 60 %-filled inflow tank.
 float WaterVolumeForScene(int scene) {
     return scene == 1 ? 0.6f : 0.512f;   // matches the solver's own scene setup
 }
 
-// Particle cap of the inflow scene at the CURRENT spacing: keeps the injected
-// water volume fixed when the resolution changes (same rule as the old GUI).
-int InflowCapFor(float spacing) {
-    const float cell = spacing * spacing * spacing;
-    return static_cast<int>(0.6f / cell) + 8;
+constexpr int kMinParticles = 512;
+constexpr int kMaxParticles = 4000000;
+
+int ClampParticleCount(int count) {
+    return std::clamp(count, kMinParticles, kMaxParticles);
 }
 
-void SetupScene(IFluidSolver& solver, int scene, float spacing) {
+float SpacingForCount(int scene, int count) {
+    const float volume = WaterVolumeForScene(scene);
+    return std::cbrt(volume / static_cast<float>(std::max(1, count)));
+}
+
+int CountForSpacing(int scene, float spacing) {
+    const double s = std::max(1.0e-4, static_cast<double>(spacing));
+    const double volume = static_cast<double>(WaterVolumeForScene(scene));
+    return ClampParticleCount(static_cast<int>(std::llround(volume / (s * s * s))));
+}
+
+void SetupScene(IFluidSolver& solver, int scene, int particleCount) {
+    const int count = ClampParticleCount(particleCount);
+    const float spacing = SpacingForCount(scene, count);
+    // Refuse an impossible scene before touching the running one. CUDA checks
+    // the device budget here; the CPU backend accepts everything.
+    solver.CheckParticleBudget(count);
     solver.GetParams().spacing = spacing;
     if (scene == 0) {
         solver.InitDamOpen(2.0f, 1.2f, 1.0f, 0.8f);
     } else {
-        solver.InitInflow(1.0f, 0.3f, 100, 0.08f, 1.0f, 0.5f, InflowCapFor(spacing));
+        solver.InitInflow(1.0f, 0.3f, 100, 0.08f, 1.0f, 0.5f, count);
     }
 }
 
@@ -81,8 +100,10 @@ void ApplyParamsToSolver(IFluidSolver& solver, const QVariantMap& m) {
 QVariantMap DefaultParams() {
     FluidSolver probe;
     const FluidSolver::Params p = probe.GetParams();
+    const int defaultCount = CountForSpacing(0, p.spacing);
     QVariantMap m;
     m.insert(QStringLiteral("scene"), 0);
+    m.insert(QStringLiteral("particleCount"), defaultCount);
     m.insert(QStringLiteral("spacing"), p.spacing);
     m.insert(QStringLiteral("solver"), p.solver);
     m.insert(QStringLiteral("backend"), QStringLiteral("auto"));
@@ -152,9 +173,13 @@ struct SimulationSession::Impl {
 
     // ---- simulation-thread local ------------------------------------------
     int scene = 0;
+    int particleCount = 32768;
     float spacing = 0.025f;
     std::atomic<int> reconInterval{3};
     int reconCounter = 0;
+    // Set when a solver call threw (e.g. the GPU ran out of memory). The
+    // solver must be rebuilt by a scene command before stepping again.
+    bool solverBroken = false;
 };
 
 SimulationSession::SimulationSession(QObject* parent)
@@ -178,7 +203,8 @@ SimulationSession::SimulationSession(QObject* parent)
     m_impl->speed.store(m_impl->params.value(QStringLiteral("speed")).toInt());
     m_impl->viewMode.store(m_impl->params.value(QStringLiteral("viewMode")).toInt());
     m_impl->scene = m_impl->params.value(QStringLiteral("scene")).toInt();
-    m_impl->spacing = m_impl->params.value(QStringLiteral("spacing")).toFloat();
+    m_impl->particleCount = m_impl->params.value(QStringLiteral("particleCount")).toInt();
+    m_impl->spacing = SpacingForCount(m_impl->scene, m_impl->particleCount);
     m_impl->reconInterval.store(m_impl->params.value(QStringLiteral("reconInterval")).toInt());
     m_impl->reconThreshold.store(m_impl->params.value(QStringLiteral("surfaceThreshold")).toFloat());
     m_impl->reconGridScale.store(m_impl->params.value(QStringLiteral("gridScale")).toFloat());
@@ -279,7 +305,7 @@ void SimulationSession::stepOnce() {
 
 void SimulationSession::resetSimulation() {
     postCommand([this](IFluidSolver& solver) {
-        SetupScene(solver, m_impl->scene, m_impl->spacing);
+        SetupScene(solver, m_impl->scene, m_impl->particleCount);
     });
     {
         std::lock_guard<std::mutex> lk(m_impl->pubMutex);
@@ -376,14 +402,50 @@ void SimulationSession::setParam(const QString& key, const QVariant& value) {
     }
 
     if (key == QLatin1String("scene") || key == QLatin1String("spacing") ||
-        key == QLatin1String("solver")) {
+        key == QLatin1String("solver") || key == QLatin1String("particleCount")) {
         // These rebuild the solver state, so they run as one atomic command.
-        postCommand([this, snapshotParams](IFluidSolver& solver) {
-            ApplyParamsToSolver(solver, snapshotParams);
-            m_impl->scene = snapshotParams.value(QStringLiteral("scene")).toInt();
-            m_impl->spacing = snapshotParams.value(QStringLiteral("spacing")).toFloat();
-            m_impl->reconSpacing.store(m_impl->spacing);
-            SetupScene(solver, m_impl->scene, m_impl->spacing);
+        // particleCount is the source of truth; spacing is derived from it (and
+        // written back so the UI, the JSON export and the render jobs agree).
+        QVariantMap p = snapshotParams;
+        const int scene = p.value(QStringLiteral("scene")).toInt();
+        int count = p.value(QStringLiteral("particleCount")).toInt();
+        if (key == QLatin1String("spacing")) {
+            count = CountForSpacing(scene, p.value(QStringLiteral("spacing")).toFloat());
+        }
+        count = ClampParticleCount(count);
+        p.insert(QStringLiteral("particleCount"), count);
+        const float spacing = SpacingForCount(scene, count);
+        p.insert(QStringLiteral("spacing"), spacing);
+        QVariantMap previousParams;
+        {
+            std::lock_guard<std::mutex> lk(m_impl->uiMutex);
+            previousParams = m_impl->params;
+            m_impl->params = p;
+        }
+        postCommand([this, p, previousParams, scene, count, spacing](IFluidSolver& solver) {
+            try {
+                // Validate the budget BEFORE ApplyParamsToSolver: a refused
+                // scene must leave the running solver's spacing/params untouched,
+                // not half-updated while its particle state is still the old one.
+                solver.CheckParticleBudget(count);
+                ApplyParamsToSolver(solver, p);
+                SetupScene(solver, scene, count);
+            } catch (...) {
+                // The scene was refused (e.g. it does not fit in GPU memory).
+                // Put the previous settings back so the UI shows what is still
+                // running, then let the worker report the reason.
+                {
+                    std::lock_guard<std::mutex> lk(m_impl->uiMutex);
+                    m_impl->params = previousParams;
+                }
+                Q_EMIT paramsChanged();
+                throw;
+            }
+            m_impl->scene = scene;
+            m_impl->particleCount = count;
+            m_impl->spacing = spacing;
+            m_impl->reconSpacing.store(spacing);
+            m_impl->solverBroken = false;
         });
         std::lock_guard<std::mutex> lk(m_impl->pubMutex);
         m_impl->surface.reset();
@@ -403,9 +465,7 @@ QString SimulationSession::exportParamsJson() const {
     const QVariantMap p = params();
     const bool inflow = p.value(QStringLiteral("scene")).toInt() == 1;
     const double spacing = p.value(QStringLiteral("spacing"), 0.025).toDouble();
-    const double volume = inflow ? 0.6 : 0.512;
-    const int particleCount = static_cast<int>(
-        std::lround(volume / std::pow(std::max(1.0e-6, spacing), 3.0))) + (inflow ? 8 : 0);
+    const int particleCount = p.value(QStringLiteral("particleCount")).toInt();
 
     QVariantMap simulation;
     simulation.insert(QStringLiteral("scene"), inflow ? QStringLiteral("inflow")
@@ -554,19 +614,11 @@ bool SimulationSession::importParamsJson(const QString& json) {
             incoming.insert(QStringLiteral("solver"), solverValue.toInt() == 1 ? 1 : 0);
         }
 
+        // particleCount is authoritative; spacing is derived from it below.
+        const QJsonValue countValue = simulation.value(QStringLiteral("particleCount"));
+        if (countValue.isDouble() && countValue.toDouble() > 0.0)
+            incoming.insert(QStringLiteral("particleCount"), countValue.toInt());
         addNumber(simulation, "spacing");
-        const bool hasSpacing = simulation.value(QStringLiteral("spacing")).isDouble();
-        if (!hasSpacing) {
-            const QJsonValue countValue = simulation.value(QStringLiteral("particleCount"));
-            if (countValue.isDouble() && countValue.toDouble() > 0.0) {
-                const double count = countValue.toDouble();
-                const int scene = incoming.contains(QStringLiteral("scene"))
-                    ? incoming.value(QStringLiteral("scene")).toInt()
-                    : params().value(QStringLiteral("scene")).toInt();
-                const double volume = scene == 1 ? 0.6 : 0.512;
-                incoming.insert(QStringLiteral("spacing"), std::cbrt(volume / count));
-            }
-        }
         addNumber(simulation, "dt");
         addBool(simulation, "useCFL", "cfl");
         addNumber(simulation, "omega");
@@ -606,6 +658,26 @@ bool SimulationSession::importParamsJson(const QString& json) {
         m_impl->params = merged;
     }
 
+    // Normalise the particle budget. A file that only carried `spacing` (all
+    // files written before particleCount existed) is converted to a count, so
+    // the scene afterwards holds exactly the requested number of particles.
+    const int scene = merged.value(QStringLiteral("scene")).toInt();
+    int count;
+    if (incoming.contains(QStringLiteral("particleCount")))
+        count = incoming.value(QStringLiteral("particleCount")).toInt();
+    else if (incoming.contains(QStringLiteral("spacing")))
+        count = CountForSpacing(scene, incoming.value(QStringLiteral("spacing")).toFloat());
+    else
+        count = merged.value(QStringLiteral("particleCount")).toInt();
+    count = ClampParticleCount(count);
+    const float spacing = SpacingForCount(scene, count);
+    merged.insert(QStringLiteral("particleCount"), count);
+    merged.insert(QStringLiteral("spacing"), spacing);
+    {
+        std::lock_guard<std::mutex> lk(m_impl->uiMutex);
+        m_impl->params = merged;
+    }
+
     m_impl->speed.store(std::clamp(merged.value(QStringLiteral("speed")).toInt(), 1,
                                    static_cast<int>(kMaxStepsPerSecond)));
     m_impl->viewMode.store(merged.value(QStringLiteral("viewMode")).toInt());
@@ -614,12 +686,14 @@ bool SimulationSession::importParamsJson(const QString& json) {
     m_impl->reconInterval.store(
         std::max(1, merged.value(QStringLiteral("reconInterval")).toInt()));
 
-    postCommand([this, merged](IFluidSolver& solver) {
+    postCommand([this, merged, scene, count, spacing](IFluidSolver& solver) {
         ApplyParamsToSolver(solver, merged);
-        m_impl->scene = merged.value(QStringLiteral("scene")).toInt();
-        m_impl->spacing = merged.value(QStringLiteral("spacing")).toFloat();
-        m_impl->reconSpacing.store(m_impl->spacing);
-        SetupScene(solver, m_impl->scene, m_impl->spacing);
+        m_impl->scene = scene;
+        m_impl->particleCount = count;
+        m_impl->spacing = spacing;
+        m_impl->reconSpacing.store(spacing);
+        SetupScene(solver, scene, count);
+        m_impl->solverBroken = false;
     });
     {
         std::lock_guard<std::mutex> lk(m_impl->pubMutex);
@@ -646,17 +720,38 @@ void SimulationSession::workerLoop() {
                 .toString().toStdString(), &ok);
     }
     auto solverHolder = CreateSolver(backendKind, &backendError);
-    if (!solverHolder) solverHolder = std::make_unique<FluidSolver>();
+    if (!solverHolder) {
+        solverHolder = std::make_unique<FluidSolver>();
+        const QString reason = QString::fromStdString(backendError);
+        Q_EMIT message(reason.isEmpty()
+                           ? QStringLiteral("Requested backend unavailable — using the CPU solver")
+                           : QStringLiteral("Backend unavailable (%1) — using the CPU solver")
+                                 .arg(reason));
+    } else if (!backendError.empty()) {
+        // Auto selected the CPU because CUDA was not usable; say why instead of
+        // silently presenting a CPU run under an "Auto" label.
+        Q_EMIT message(QStringLiteral("CUDA unavailable (%1) — using the CPU solver")
+                           .arg(QString::fromStdString(backendError)));
+    }
     IFluidSolver& solver = *solverHolder;
     {
         std::lock_guard<std::mutex> lk(d.uiMutex);
         ApplyParamsToSolver(solver, d.params);
         d.scene = d.params.value(QStringLiteral("scene")).toInt();
-        d.spacing = d.params.value(QStringLiteral("spacing")).toFloat();
+        d.particleCount = d.params.value(QStringLiteral("particleCount")).toInt();
+        d.spacing = SpacingForCount(d.scene, d.particleCount);
         d.reconInterval.store(
             std::max(1, d.params.value(QStringLiteral("reconInterval")).toInt()));
     }
-    SetupScene(solver, d.scene, d.spacing);
+    try {
+        SetupScene(solver, d.scene, d.particleCount);
+    } catch (const std::exception& ex) {
+        // A scene that does not fit never leaves a half-built solver behind;
+        // report it and let the user pick a smaller particle count.
+        d.solverBroken = true;
+        Q_EMIT message(QStringLiteral("Scene setup failed: %1")
+                           .arg(QString::fromUtf8(ex.what())));
+    }
 
     auto lastStatus = Clock::now() - std::chrono::milliseconds(kStatusIntervalMs);
     auto lastTrace = Clock::now();
@@ -705,8 +800,16 @@ void SimulationSession::workerLoop() {
         st.insert(QStringLiteral("backend"), QString::fromLatin1(solver.BackendName()));
         st.insert(QStringLiteral("scene"), d.scene);
         st.insert(QStringLiteral("spacing"), static_cast<double>(d.spacing));
+        st.insert(QStringLiteral("particleTarget"), d.particleCount);
         st.insert(QStringLiteral("waterVolume"),
                   static_cast<double>(WaterVolumeForScene(d.scene)));
+        const GpuMemoryInfo mem = solver.GpuMemory();
+        st.insert(QStringLiteral("vramFreeBytes"), static_cast<qlonglong>(mem.freeBytes));
+        st.insert(QStringLiteral("vramTotalBytes"), static_cast<qlonglong>(mem.totalBytes));
+        st.insert(QStringLiteral("bytesPerParticle"),
+                  static_cast<qlonglong>(mem.bytesPerParticle));
+        st.insert(QStringLiteral("solverError"),
+                  d.solverBroken ? QStringLiteral("solver unavailable") : QString());
         {
             std::lock_guard<std::mutex> lk(d.uiMutex);
             d.status = st;
@@ -763,6 +866,22 @@ void SimulationSession::workerLoop() {
     refreshTrace();
     maybeRequestReconstruction(true);
 
+    // A solver call that throws (out of GPU memory, device lost, ...) must not
+    // take the window down with it: stop stepping, surface the reason, and wait
+    // for a scene command that rebuilds the state.
+    auto reportFailure = [&](const std::exception& ex) {
+        d.solverBroken = true;
+        d.running.store(false);
+        Q_EMIT runningChanged();
+        const QString text = QStringLiteral("Solver error: %1").arg(QString::fromUtf8(ex.what()));
+        Q_EMIT message(text);
+        {
+            std::lock_guard<std::mutex> lk(d.uiMutex);
+            d.status.insert(QStringLiteral("solverError"), text);
+        }
+        Q_EMIT statusChanged();
+    };
+
     while (!d.quit.load()) {
         bool commandsApplied = false;
         {
@@ -772,7 +891,11 @@ void SimulationSession::workerLoop() {
                 pending.swap(d.commands);
             }
             for (auto& fn : pending) {
-                fn(solver);
+                try {
+                    fn(solver);
+                } catch (const std::exception& ex) {
+                    reportFailure(ex);
+                }
                 commandsApplied = true;
             }
         }
@@ -787,15 +910,15 @@ void SimulationSession::workerLoop() {
                 publishStatus(lastStepMs);
                 refreshTrace();
             }
-            maybeRequestReconstruction(true);
+            if (!d.solverBroken) maybeRequestReconstruction(true);
         }
 
-        const bool wantRunning = d.running.load();
+        const bool wantRunning = d.running.load() && !d.solverBroken;
         int requests = d.stepRequests.load();
         bool doStep = false;
         if (wantRunning) {
             doStep = true;
-        } else if (requests > 0) {
+        } else if (requests > 0 && !d.solverBroken) {
             d.stepRequests.fetch_sub(1);
             doStep = true;
         }
@@ -810,7 +933,12 @@ void SimulationSession::workerLoop() {
         }
 
         const auto t0 = Clock::now();
-        solver.Step();
+        try {
+            solver.Step();
+        } catch (const std::exception& ex) {
+            reportFailure(ex);
+            continue;
+        }
         const auto t1 = Clock::now();
         lastStepMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
         ++steps;

@@ -86,6 +86,8 @@ public:
     const std::vector<float>& ConvergenceTrace() const override { return m_convTrace; }
 
     const char* BackendName() const override { return "CPU (OpenMP)"; }
+    GpuMemoryInfo GpuMemory() const override { return {}; }
+    void CheckParticleBudget(int particleCount) const override { (void)particleCount; }
 
 private:
     void PushFluid(float x, float y, float z);

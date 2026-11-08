@@ -83,9 +83,11 @@ int main(int argc, char** argv) {
     int steps = 30;
     bool large = false;
     bool renderPass = true;
+    std::string filter;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--large") == 0) large = true;
         else if (std::strncmp(argv[i], "--render=", 9) == 0) renderPass = std::atoi(argv[i] + 9) != 0;
+        else if (std::strncmp(argv[i], "--filter=", 9) == 0) filter = argv[i] + 9;
         else steps = std::max(1, std::atoi(argv[i]));
     }
 
@@ -115,6 +117,7 @@ int main(int argc, char** argv) {
 
     bool anyFail = false;
     for (const Case& c : cases) {
+        if (!filter.empty() && std::strstr(c.label, filter.c_str()) == nullptr) continue;
         // Less warmup for the large cases so the default invocation stays usable
         // on a small display GPU; the measured loop is still the same.
         const int warmup = c.large ? 3 : 5;
@@ -152,10 +155,13 @@ int main(int argc, char** argv) {
         const bool finite = AllFinite(*gpu) && (!gpuRenderSolver || AllFinite(*gpuRenderSolver));
         if (!finite) anyFail = true;
 
-        std::printf("%-26s %9.2f %9.2f %9.2f %7.2fx %7.2fx %6d  n=%d%s\n",
+        std::printf("%-26s %9.2f %9.2f %9.2f %7.2fx %7.2fx %6d  n=%d it=%d/%d div=%d/%d%s\n",
                     c.label, cpuMs, gpuMs, gpuRender,
                     cpuMs / gpuMs, gpuRender > 0 ? cpuMs / gpuRender : 0.0,
-                    gpu->MaxNeighbors(), gpu->FluidCount(), finite ? "" : "  NONFINITE");
+                    gpu->MaxNeighbors(), gpu->FluidCount(),
+                    cpu.LastIterations(), gpu->LastIterations(),
+                    cpu.DivergenceIterations(), gpu->DivergenceIterations(),
+                    finite ? "" : "  NONFINITE");
         if (cpuMs / gpuMs < 1.0) anyFail = true;
     }
     return anyFail ? 1 : 0;

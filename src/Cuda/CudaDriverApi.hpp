@@ -30,6 +30,9 @@ struct DriverApi {
     CUresult (*ModuleGetFunction)(CUfunction*, CUmodule, const char*) = nullptr;
     CUresult (*MemAlloc)(CUdeviceptr*, size_t) = nullptr;
     CUresult (*MemFree)(CUdeviceptr) = nullptr;
+    CUresult (*MemAllocHost)(void**, size_t) = nullptr;
+    CUresult (*MemFreeHost)(void*) = nullptr;
+    CUresult (*MemGetInfo)(size_t*, size_t*) = nullptr;
     CUresult (*MemcpyHtoD)(CUdeviceptr, const void*, size_t) = nullptr;
     CUresult (*MemcpyDtoH)(void*, CUdeviceptr, size_t) = nullptr;
     CUresult (*MemsetD32)(CUdeviceptr, unsigned int, size_t) = nullptr;
@@ -42,6 +45,11 @@ struct DriverApi {
     CUresult (*StreamCreate)(CUstream*, unsigned int) = nullptr;
     CUresult (*StreamDestroy)(CUstream) = nullptr;
     CUresult (*StreamSynchronize)(CUstream) = nullptr;
+    CUresult (*EventCreate)(CUevent*, unsigned int) = nullptr;
+    CUresult (*EventRecord)(CUevent, CUstream) = nullptr;
+    CUresult (*EventSynchronize)(CUevent) = nullptr;
+    CUresult (*EventElapsedTime)(float*, CUevent, CUevent) = nullptr;
+    CUresult (*EventDestroy)(CUevent) = nullptr;
     CUresult (*MemcpyHtoDAsync)(CUdeviceptr, const void*, size_t, CUstream) = nullptr;
     CUresult (*MemcpyDtoHAsync)(void*, CUdeviceptr, size_t, CUstream) = nullptr;
 

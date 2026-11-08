@@ -36,7 +36,8 @@ Rectangle {
         Item { Layout.fillWidth: true }
 
         Text {
-            text: (st.fluidCount !== undefined ? st.fluidCount : 0) + " fluid · "
+            text: (st.backend !== undefined && st.backend !== "" ? st.backend + "  ·  " : "")
+                  + (st.fluidCount !== undefined ? st.fluidCount : 0) + " fluid · "
                   + (st.boundaryCount !== undefined ? st.boundaryCount : 0) + " boundary"
             color: status.c.fg3
             font.pixelSize: 10

@@ -12,10 +12,12 @@
 //   32.8k, 7.7 GB at 10^7) and pushes the pressure-solve working set out of the
 //   1 MB L2 of small cards; the 100 Jacobi iterations then stream from DRAM.
 //   This is what SPlisHSPlasH does as well.
-// * Lists are fixed-slot (MAXNB / MAXBNB). The atomic scatter is followed by a
-//   cheap per-cell sort, so neighbor traversal order is deterministic without
-//   sorting every 30-50 entry particle list. Reductions use warp shuffles in a
-//   fixed order and no floating-point atomics -> run-to-run reproducible.
+// * Lists are fixed-slot (MAXNB / MAXBNB). Cell arrays are sorted once; each
+//   fluid pair is emitted by its lower index and mirrored into both lists, so
+//   discovery and gradient work are not duplicated. Mirror insertion uses
+//   atomic slot counters, therefore neighbor order and the last few FP bits can
+//   vary between runs. Reductions still use deterministic warp shuffles and no
+//   floating-point atomics.
 
 namespace sphkernels {
 
@@ -89,6 +91,10 @@ __device__ __forceinline__ float3 cellCoords(float3 p, float ox, float oy, float
 __device__ __forceinline__ int cellIndex(int cx, int cy, int cz, int gw, int gh) {
     return cz * gw * gh + cy * gw + cx;
 }
+
+// Neighbor gradients carry the neighbor index in .w. This removes a separate
+// 4-byte index stream from every pressure iteration.
+__device__ __forceinline__ int neighborIndex(float4 g) { return __float_as_int(g.w); }
 
 // ---------------------------------------------------------------------------
 // Spatial hash
@@ -252,15 +258,17 @@ __global__ void kNeighbors(const float4* pos, const float4* bpos, int n, int nb,
                            float ox, float oy, float oz, float invh,
                            int gw, int gh, int gd, float h,
                            const int* cellStart, const int* sorted,
-                           const float* bvol, float4* nbGeom, float* deltaB, float4* gradB,
-                           int* nbIdx, int* nbCount, int* bnbIdx, int* bnbCount,
+                           const float* bvol, float4* nbGeom, float* nbDist,
+                           float* deltaB, float4* gradB,
+                           int* nbCount, int* bnbIdx, int* bnbCount,
                            int* maxNeighbors) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     float3 pi = make_float3(pos[i].x, pos[i].y, pos[i].z);
     float3 c = cellCoords(pi, ox, oy, oz, invh, gw, gh, gd);
     int cx = (int)c.x, cy = (int)c.y, cz = (int)c.z;
-    int nf = 0, nbound = 0;
+    int nbound = 0;
+    float dsum = 0.f, gx = 0.f, gy = 0.f, gz = 0.f;
     const float h2 = h * h;
     for (int dz = -1; dz <= 1; ++dz) {
         int z = cz + dz;
@@ -274,69 +282,60 @@ __global__ void kNeighbors(const float4* pos, const float4* bpos, int n, int nb,
                 int cell = cellIndex(x, y, z, gw, gh);
                 int s = cellStart[cell], e = cellStart[cell + 1];
                 for (int k = s; k < e; ++k) {
-                    int j = sorted[k];
+                    const int j = sorted[k];
+                    // Each fluid-fluid pair is emitted once (j > i) and
+                    // mirrored into both lists. Boundary pairs are owned by
+                    // their fluid particle only.
+                    if (j < n && j <= i) continue;
                     float3 pj = (j < n)
                         ? make_float3(pos[j].x, pos[j].y, pos[j].z)
                         : make_float3(bpos[j - n].x, bpos[j - n].y, bpos[j - n].z);
                     float rx = pi.x - pj.x, ry = pi.y - pj.y, rz = pi.z - pj.z;
-                    if (rx * rx + ry * ry + rz * rz >= h2) continue;
+                    float rr2 = rx * rx + ry * ry + rz * rz;
+                    if (rr2 >= h2) continue;
                     if (j < n) {
-                        if (j == i) continue;
-                        const int slot = nf++;
-                        if (slot < MAXNB) nbIdx[slot * n + i] = j;
+                        const float rr = sqrtf(rr2);
+                        const float4 g = kernelGradW(make_float3(rx, ry, rz), h);
+                        const int si = atomicAdd(&nbCount[i], 1);
+                        if (si < MAXNB) {
+                            nbGeom[si * n + i] = make_float4(g.x, g.y, g.z, __int_as_float(j));
+                            nbDist[si * n + i] = rr;
+                        }
+                        const int sj = atomicAdd(&nbCount[j], 1);
+                        if (sj < MAXNB) {
+                            nbGeom[sj * n + j] = make_float4(-g.x, -g.y, -g.z, __int_as_float(i));
+                            nbDist[sj * n + j] = rr;
+                        }
                     } else {
                         const int slot = nbound++;
-                        if (slot < MAXBNB) bnbIdx[slot * n + i] = j - n;
+                        if (slot < MAXBNB) {
+                            const int b = j - n;
+                            const float rr = sqrtf(rr2);
+                            const float4 g = kernelGradW(make_float3(rx, ry, rz), h);
+                            const float vb = bvol[b];
+                            bnbIdx[slot * n + i] = b;
+                            dsum += vb * kernelW(rr, h);
+                            gx += vb * g.x; gy += vb * g.y; gz += vb * g.z;
+                        }
                     }
                 }
             }
         }
     }
-    atomicMax(maxNeighbors, nf);
-    nf = min(nf, MAXNB);
-    nbound = min(nbound, MAXBNB);
-    for (int k = 0; k < nf; ++k) {
-        const int j = nbIdx[k * n + i];
-        const float3 pj = make_float3(pos[j].x, pos[j].y, pos[j].z);
-        const float3 r = make_float3(pi.x - pj.x, pi.y - pj.y, pi.z - pj.z);
-        const float rr = sqrtf(r.x * r.x + r.y * r.y + r.z * r.z);
-        const float4 g = kernelGradW(r, h);
-        nbGeom[k * n + i] = make_float4(g.x, g.y, g.z, rr);
-    }
-    float dsum = 0.f, gx = 0.f, gy = 0.f, gz = 0.f;
-    for (int k = 0; k < nbound; ++k) {
-        const int b = bnbIdx[k * n + i];
-        const float3 pb = make_float3(bpos[b].x, bpos[b].y, bpos[b].z);
-        const float3 r = make_float3(pi.x - pb.x, pi.y - pb.y, pi.z - pb.z);
-        const float rr = sqrtf(r.x * r.x + r.y * r.y + r.z * r.z);
-        const float vb = bvol[b];
-        const float4 g = kernelGradW(r, h);
-        dsum += vb * kernelW(rr, h);
-        gx += vb * g.x; gy += vb * g.y; gz += vb * g.z;
-    }
     deltaB[i] = dsum;
     gradB[i] = make_float4(gx, gy, gz, 0.f);
-    nbCount[i] = nf;
-    bnbCount[i] = nbound;
+    bnbCount[i] = min(nbound, MAXBNB);
 }
 
-// Cache the gradient and distance for every fluid pair. All iterative solver
-// passes can then reuse one coalesced float4 load instead of reloading a random
-// position and repeating sqrt/division for the same pair dozens of times.
-__global__ void kFluidGeometry(const float4* pos, const int* nbIdx, const int* nbCount,
-                               int n, float h, float4* nbGeom) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
+// Clamp overflowed counts before any solver pass loops over them, and retain
+// the true maximum for diagnostics.
+__global__ void kClampCounts(int* nbCount, int* bnbCount, int n, int* maxNeighbors) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    const float3 pi = make_float3(pos[i].x, pos[i].y, pos[i].z);
     const int c = nbCount[i];
-    for (int k = 0; k < c; ++k) {
-        const int j = nbIdx[k * n + i];
-        const float3 pj = make_float3(pos[j].x, pos[j].y, pos[j].z);
-        const float3 r = make_float3(pi.x - pj.x, pi.y - pj.y, pi.z - pj.z);
-        const float rr = sqrtf(r.x * r.x + r.y * r.y + r.z * r.z);
-        const float4 g = kernelGradW(r, h);
-        nbGeom[k * n + i] = make_float4(g.x, g.y, g.z, rr);
-    }
+    atomicMax(maxNeighbors, c);
+    nbCount[i] = min(c, MAXNB);
+    bnbCount[i] = min(bnbCount[i], MAXBNB);
 }
 
 // Boundary density/gradient sums (Akinci 2012), recomputed from bpos.
@@ -371,15 +370,14 @@ __global__ void kScaleCopyF(float* dst, const float* src, int n, float s) {
 // ---------------------------------------------------------------------------
 // Predict
 // ---------------------------------------------------------------------------
-__global__ void kDensity(const float4* nbGeom, const int* nbIdx, const int* nbCount, int n,
+__global__ void kDensity(const float4* nbGeom, const float* nbDist, const int* nbCount, int n,
                          float vol, float h, const float* deltaB, float* rho, float* invRho2) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     float rhoN = vol * kernelW(0.0f, h);
     int c = nbCount[i];
     for (int k = 0; k < c; ++k) {
-        const float rr = __ldg(&nbGeom[k * n + i]).w;
-        rhoN += vol * kernelW(rr, h);
+        rhoN += vol * kernelW(__ldg(&nbDist[k * n + i]), h);
     }
     rhoN += deltaB[i];
     rho[i] = rhoN;
@@ -388,7 +386,7 @@ __global__ void kDensity(const float4* nbGeom, const int* nbIdx, const int* nbCo
 
 // DFSPH needs rho and its stiffness factor together. Computing both in one
 // neighbor traversal also refreshes invRho2 for the IISPH pressure path.
-__global__ void kDensityFactor(const float4* nbGeom, const int* nbIdx, const int* nbCount,
+__global__ void kDensityFactor(const float4* nbGeom, const float* nbDist, const int* nbCount,
                                const float4* gradB, const float* deltaB, int n, float vol,
                                float h, float* rho, float* invRho2, float4* gradPI,
                                float* alpha) {
@@ -401,7 +399,7 @@ __global__ void kDensityFactor(const float4* nbGeom, const int* nbIdx, const int
     const int c = nbCount[i];
     for (int k = 0; k < c; ++k) {
         const float4 g = __ldg(&nbGeom[k * n + i]);
-        rhoN += vol * kernelW(g.w, h);
+        rhoN += vol * kernelW(__ldg(&nbDist[k * n + i]), h);
         const float px = vol * g.x, py = vol * g.y, pz = vol * g.z;
         gx += px; gy += py; gz += pz;
         sum += px * px + py * py + pz * pz;
@@ -414,7 +412,7 @@ __global__ void kDensityFactor(const float4* nbGeom, const int* nbIdx, const int
     alpha[i] = (sum > 1e-6f) ? 1.0f / sum : 0.0f;
 }
 
-__global__ void kDii(const float4* nbGeom, const int* nbIdx, const int* nbCount,
+__global__ void kDii(const float4* nbGeom, const int* nbCount,
                      const float4* gradB, const float* rho, int n, float vol, float h,
                      float4* dii) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -429,16 +427,16 @@ __global__ void kDii(const float4* nbGeom, const int* nbIdx, const int* nbCount,
     dii[i] = make_float4(gx * inv, gy * inv, gz * inv, 0.f);
 }
 
-__global__ void kNormalsIdx(const float4* nbGeom, const int* nbIdx, const int* nbCount,
+__global__ void kNormalsIdx(const float4* nbGeom, const int* nbCount,
                             const float* rho, int n, float vol, float h, float4* normals) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     int c = nbCount[i];
     float nx = 0.f, ny = 0.f, nz = 0.f;
     for (int k = 0; k < c; ++k) {
-        int j = __ldg(&nbIdx[k * n + i]);
+        const float4 g = __ldg(&nbGeom[k * n + i]);
+        const int j = neighborIndex(g);
         if (rho[j] < 1e-6f) continue;
-        float4 g = __ldg(&nbGeom[k * n + i]);
         float s = vol / rho[j];
         nx += s * g.x; ny += s * g.y; nz += s * g.z;
     }
@@ -446,8 +444,8 @@ __global__ void kNormalsIdx(const float4* nbGeom, const int* nbIdx, const int* n
 }
 
 __global__ void kForcesFull(const float4* pos, const float4* vel, const float4* bpos,
-                            const int* nbIdx, const int* nbCount, const float4* nbGeom,
-                            const int* bnbIdx, const int* bnbCount,
+                            const int* nbCount, const float4* nbGeom,
+                            const float* nbDist, const int* bnbIdx, const int* bnbCount,
                             const float4* normals, const float* rho, const float* bvol, int n,
                             float vol, float h, float dt, float gravity, float viscosity,
                             float tension, float tensionB, float rho0, float4* vadv) {
@@ -459,10 +457,11 @@ __global__ void kForcesFull(const float4* pos, const float4* vel, const float4* 
     float ax = 0.f, ay = 0.f, az = 0.f;
     int c = nbCount[i];
     for (int k = 0; k < c; ++k) {
-        int j = __ldg(&nbIdx[k * n + i]);
+        const float4 geom = __ldg(&nbGeom[k * n + i]);
+        const int j = neighborIndex(geom);
         float3 pj = make_float3(pos[j].x, pos[j].y, pos[j].z);
         float rx = pi.x - pj.x, ry = pi.y - pj.y, rz = pi.z - pj.z;
-        float rr = __ldg(&nbGeom[k * n + i]).w;
+        float rr = __ldg(&nbDist[k * n + i]);
         if (viscosity > 0.0f && rho[j] >= 1e-6f) {
             float s = viscosity * (vol / rho[j]) * kernelW(rr, h);
             dvx -= s * (vi.x - vel[j].x);
@@ -500,7 +499,7 @@ __global__ void kForcesFull(const float4* pos, const float4* vel, const float4* 
                           vi.z + az * dt + dvz, 0.f);
 }
 
-__global__ void kRhoAdvAii(const float4* pos, const int* nbIdx, const int* nbCount,
+__global__ void kRhoAdvAii(const float4* pos, const int* nbCount,
                            const float4* nbGeom, const float4* dii, const float4* gradB,
                            const float4* vadv, const float* rho, const float* invRho2,
                            const float* pPrev, int n, float vol, float h, float dt,
@@ -511,8 +510,8 @@ __global__ void kRhoAdvAii(const float4* pos, const int* nbIdx, const int* nbCou
     float rhoA = rho[i];
     int c = nbCount[i];
     for (int k = 0; k < c; ++k) {
-        int j = __ldg(&nbIdx[k * n + i]);
         float4 g = __ldg(&nbGeom[k * n + i]);
+        int j = neighborIndex(g);
         rhoA += dt * vol * ((vi.x - vadv[j].x) * g.x +
                             (vi.y - vadv[j].y) * g.y +
                             (vi.z - vadv[j].z) * g.z);
@@ -523,7 +522,7 @@ __global__ void kRhoAdvAii(const float4* pos, const int* nbIdx, const int* nbCou
     ps[i] = make_float2(p[i], invRho2[i]);
 }
 
-__global__ void kAii(const float4* nbGeom, const int* nbIdx, const int* nbCount,
+__global__ void kAii(const float4* nbGeom, const int* nbCount,
                      const float4* dii, const float4* gradB, const float* rho,
                      int n, float vol, float h, float* aii) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -547,15 +546,15 @@ __global__ void kAii(const float4* nbGeom, const int* nbIdx, const int* nbCount,
 // IISPH pressure solve
 // ---------------------------------------------------------------------------
 __global__ void __launch_bounds__(BLOCK, 4) kPressureSIdx(
-        const float4* nbGeom, const int* nbIdx, const int* nbCount,
-        const float2* ps, int n, float4* S) {
+        const float4* __restrict__ nbGeom, const int* __restrict__ nbCount,
+        const float2* __restrict__ ps, int n, float4* __restrict__ S) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     float sx = 0.f, sy = 0.f, sz = 0.f;
     int c = nbCount[i];
     for (int k = 0; k < c; ++k) {
-        int j = __ldg(&nbIdx[k * n + i]);
         float4 g = __ldg(&nbGeom[k * n + i]);
+        int j = neighborIndex(g);
         const float2 q = __ldg(&ps[j]);       // (pressure, V/rho^2)
         float s = -q.y * q.x;
         sx += g.x * s; sy += g.y * s; sz += g.z * s;
@@ -565,11 +564,13 @@ __global__ void __launch_bounds__(BLOCK, 4) kPressureSIdx(
 }
 
 __global__ void __launch_bounds__(BLOCK, 4) kPressureP(
-        const float4* nbGeom, const int* nbIdx, const int* nbCount,
-        const float4* dii, const float4* S, const float4* gradB,
-        float2* ps, const float* rhoAdv, const float* aii,
+        const float4* __restrict__ nbGeom, const int* __restrict__ nbCount,
+        const float4* __restrict__ dii, const float4* __restrict__ S,
+        const float4* __restrict__ gradB, float2* __restrict__ ps,
+        const float* __restrict__ rhoAdv, const float* __restrict__ aii,
         int n, float vol, float h, float dt, float omega,
-        float* pOut, float* blkErr, float* blkAbs, float* blkMax) {
+        float* __restrict__ pOut, float* __restrict__ blkErr,
+        float* __restrict__ blkAbs, float* __restrict__ blkMax) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     float errSum = 0.f, absSum = 0.f, maxAbs = 0.f;
     if (i < n) {
@@ -582,8 +583,8 @@ __global__ void __launch_bounds__(BLOCK, 4) kPressureP(
         float sum = 0.f;
         int c = nbCount[i];
         for (int k = 0; k < c; ++k) {
-            int j = __ldg(&nbIdx[k * n + i]);
-            float4 g = __ldg(&nbGeom[k * n + i]);
+            const float4 g = __ldg(&nbGeom[k * n + i]);
+            const int j = neighborIndex(g);
             float4 sj = __ldg(&S[j]);
             float4 dj = __ldg(&dii[j]);
             float pjv = sj.w;
@@ -766,38 +767,17 @@ __global__ void kMeanRho(const float* rho, int n, float* blockVals) {
 // ---------------------------------------------------------------------------
 // DFSPH
 // ---------------------------------------------------------------------------
-__global__ void kDFSPHFactorFull(const float4* nbGeom, const float4* bpos,
-                                 const int* nbIdx, const int* nbCount,
-                                 const int* bnbIdx, const int* bnbCount,
-                                 const float* bvol, const float4* gradB, int n, float vol, float h,
-                                 float4* gradPI, float* alpha) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    const float4 gb = gradB[i];
-    float gx = gb.x, gy = gb.y, gz = gb.z;
-    float sum = 0.f;
-    const int c = nbCount[i];
-    for (int k = 0; k < c; ++k) {
-        const float4 g = __ldg(&nbGeom[k * n + i]);
-        const float px = vol * g.x, py = vol * g.y, pz = vol * g.z;
-        gx += px; gy += py; gz += pz;
-        sum += px * px + py * py + pz * pz;
-    }
-    sum += gx * gx + gy * gy + gz * gz;
-    gradPI[i] = make_float4(gx, gy, gz, 0.f);
-    alpha[i] = (sum > 1e-6f) ? 1.0f / sum : 0.0f;
-}
-
-__device__ __forceinline__ float rhoDotOf(int i, const float4* nbGeom, const int* nbIdx,
-                                          const int* nbCount, const float4* vadv,
-                                          const float4* gradB, float vol, int n) {
+__device__ __forceinline__ float rhoDotOf(int i, const float4* __restrict__ nbGeom,
+                                          const int* __restrict__ nbCount,
+                                          const float4* __restrict__ vadv,
+                                          const float4* __restrict__ gradB, float vol, int n) {
     const float4 vi4 = vadv[i];
     const float4 gb = gradB[i];
     float dx = vi4.x * gb.x, dy = vi4.y * gb.y, dz = vi4.z * gb.z;
     const int c = nbCount[i];
     for (int k = 0; k < c; ++k) {
-        const int j = __ldg(&nbIdx[k * n + i]);
         const float4 g = __ldg(&nbGeom[k * n + i]);
+        const int j = neighborIndex(g);
         const float4 vj = __ldg(&vadv[j]);
         dx += vol * (vi4.x - vj.x) * g.x;
         dy += vol * (vi4.y - vj.y) * g.y;
@@ -806,25 +786,26 @@ __device__ __forceinline__ float rhoDotOf(int i, const float4* nbGeom, const int
     return dx + dy + dz;
 }
 
-__global__ void kDFSPHInit(const float4* nbGeom, const int* nbIdx, const int* nbCount,
+__global__ void kDFSPHInit(const float4* nbGeom, const int* nbCount,
                            const int* bnbCount, const float4* vadv, const float4* gradB,
                            const float* rho, const float* alpha, const float* pPrev,
                            int n, float vol, float h, float dt, int warmStart,
                            float* rhoAdv, float* p) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    float rhoA = rho[i] + dt * rhoDotOf(i, nbGeom, nbIdx, nbCount, vadv, gradB, vol, n);
+    float rhoA = rho[i] + dt * rhoDotOf(i, nbGeom, nbCount, vadv, gradB, vol, n);
     rhoAdv[i] = rhoA;
     float invH2 = 1.0f / (dt * dt);
     if (warmStart) p[i] = (rhoA > 1.0f) ? fminf(pPrev[i], 0.00025f) * invH2 : 0.0f;
     else p[i] = fmaxf(rhoA - 1.0f, 0.0f) * alpha[i] * invH2;
 }
 
-__global__ void kDFSPHVelocityUpdate(const float4* nbGeom, const float4* bpos,
-                                     const int* nbIdx, const int* nbCount,
-                                     const int* bnbIdx, const int* bnbCount,
-                                     const float* bvol, const float4* gradB, const float* p,
-                                     int n, float vol, float h, float dt, float omega, float4* vadv) {
+__global__ void kDFSPHVelocityUpdate(const float4* __restrict__ nbGeom,
+                                     const int* __restrict__ nbCount,
+                                     const float4* __restrict__ gradB,
+                                     const float* __restrict__ p,
+                                     int n, float vol, float h, float dt, float omega,
+                                     float4* __restrict__ vadv) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     const float pi = p[i];
@@ -832,8 +813,8 @@ __global__ void kDFSPHVelocityUpdate(const float4* nbGeom, const float4* bpos,
     float ax = -pi * gb.x, ay = -pi * gb.y, az = -pi * gb.z;
     const int c = nbCount[i];
     for (int k = 0; k < c; ++k) {
-        const int j = __ldg(&nbIdx[k * n + i]);
         const float4 g = __ldg(&nbGeom[k * n + i]);
+        const int j = neighborIndex(g);
         const float s = vol * (pi + __ldg(&p[j]));
         ax -= s * g.x; ay -= s * g.y; az -= s * g.z;
     }
@@ -841,16 +822,20 @@ __global__ void kDFSPHVelocityUpdate(const float4* nbGeom, const float4* bpos,
     vadv[i] = make_float4(v.x + omega * dt * ax, v.y + omega * dt * ay, v.z + omega * dt * az, 0.f);
 }
 
-__global__ void kDFSPHRhoAdvUpdateFull(const float4* nbGeom, const int* nbIdx,
-                                       const int* nbCount, const float4* vadv,
-                                       const float4* gradB, const float* rho, const float* alpha,
-                                       int n, float vol, float h, float dt,
-                                       float* rhoAdv, float* p, float* blkErr, float* blkAbs,
-                                       float* blkMax) {
+__global__ void kDFSPHRhoAdvUpdateFull(const float4* __restrict__ nbGeom,
+                                       const int* __restrict__ nbCount,
+                                       const float4* __restrict__ vadv,
+                                       const float4* __restrict__ gradB,
+                                       const float* __restrict__ rho,
+                                       const float* __restrict__ alpha,
+                                       int n, float vol, float dt,
+                                       float* __restrict__ rhoAdv, float* __restrict__ p,
+                                       float* __restrict__ blkErr, float* __restrict__ blkAbs,
+                                       float* __restrict__ blkMax) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     float e = 0.f, ae = 0.f, me = 0.f;
     if (i < n) {
-        float rhoA = rho[i] + dt * rhoDotOf(i, nbGeom, nbIdx, nbCount, vadv, gradB, vol, n);
+        float rhoA = rho[i] + dt * rhoDotOf(i, nbGeom, nbCount, vadv, gradB, vol, n);
         rhoAdv[i] = rhoA;
         float invH2 = 1.0f / (dt * dt);
         p[i] = fmaxf(rhoA - 1.0f, 0.0f) * alpha[i] * invH2;
@@ -895,23 +880,7 @@ __global__ void kDFSPHIntegratePositions(const float4* vadv, const float4* pos, 
     velOut[i] = v;
 }
 
-__global__ void kDFSPHWallClampVadv(float4* vadv, const float4* pos, int n,
-                                    float wx0, float wx1, float wy1, float wz0, float wz1,
-                                    int wallTop, float half) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    float4 v = vadv[i];
-    float4 p = pos[i];
-    if (p.x <= wx0 + half && v.x < 0.f) v.x = 0.f;
-    if (p.x >= wx1 - half && v.x > 0.f) v.x = 0.f;
-    if (p.y <= half && v.y < 0.f) v.y = 0.f;
-    if (wallTop && p.y >= wy1 - half && v.y > 0.f) v.y = 0.f;
-    if (p.z <= wz0 + half && v.z < 0.f) v.z = 0.f;
-    if (p.z >= wz1 - half && v.z > 0.f) v.z = 0.f;
-    vadv[i] = v;
-}
-
-__global__ void kDFSPHKappaInit(const float4* nbGeom, const int* nbIdx, const int* nbCount,
+__global__ void kDFSPHKappaInit(const float4* nbGeom, const int* nbCount,
                                 const int* bnbCount, const float4* vadv, const float4* gradB,
                                 int n, float vol, float invH, int warmStart,
                                 const float* kappaPrev, float* kappaV, float* seed,
@@ -923,7 +892,7 @@ __global__ void kDFSPHKappaInit(const float4* nbGeom, const int* nbIdx, const in
             kappaV[i] = 0.f;
             seed[i] = 0.f;
         } else {
-            v = rhoDotOf(i, nbGeom, nbIdx, nbCount, vadv, gradB, vol, n);
+            v = rhoDotOf(i, nbGeom, nbCount, vadv, gradB, vol, n);
             kappaV[i] = v;
             seed[i] = warmStart ? fminf(kappaPrev[i], 0.00025f) * invH : 0.f;
         }
@@ -957,12 +926,12 @@ __global__ void kDFSPHKappaScale(const float* alpha, int n, float invH, int iter
     else kappaV[i] *= alpha[i] * invH;
 }
 
-__global__ void kDFSPHVelocityUpdateV(const float4* nbGeom, const float4* bpos,
-                                      const int* nbIdx, const int* nbCount,
-                                      const int* bnbIdx, const int* bnbCount,
-                                      const float* bvol, const float4* gradB,
-                                      const float* kappaV, int n, float vol,
-                                      float h, float dt, float omega, float4* vadv) {
+__global__ void kDFSPHVelocityUpdateV(const float4* __restrict__ nbGeom,
+                                      const int* __restrict__ nbCount,
+                                      const float4* __restrict__ gradB,
+                                      const float* __restrict__ kappaV,
+                                      int n, float vol, float dt, float omega,
+                                      float4* __restrict__ vadv) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     const float ki = kappaV[i];
@@ -970,8 +939,8 @@ __global__ void kDFSPHVelocityUpdateV(const float4* nbGeom, const float4* bpos,
     float ax = -ki * gb.x, ay = -ki * gb.y, az = -ki * gb.z;
     const int c = nbCount[i];
     for (int k = 0; k < c; ++k) {
-        const int j = __ldg(&nbIdx[k * n + i]);
         const float4 g = __ldg(&nbGeom[k * n + i]);
+        const int j = neighborIndex(g);
         const float s = vol * (ki + __ldg(&kappaV[j]));
         ax -= s * g.x; ay -= s * g.y; az -= s * g.z;
     }
@@ -979,7 +948,7 @@ __global__ void kDFSPHVelocityUpdateV(const float4* nbGeom, const float4* bpos,
     vadv[i] = make_float4(v.x + omega * dt * ax, v.y + omega * dt * ay, v.z + omega * dt * az, 0.f);
 }
 
-__global__ void kDFSPHRhoDotUpdate(const float4* nbGeom, const int* nbIdx, const int* nbCount,
+__global__ void kDFSPHRhoDotUpdate(const float4* nbGeom, const int* nbCount,
                                    const int* bnbCount, const float4* vadv, const float4* gradB,
                                    int n, float vol, float h, float* kappaV, float* blockVals) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -988,7 +957,7 @@ __global__ void kDFSPHRhoDotUpdate(const float4* nbGeom, const int* nbIdx, const
         if (nbCount[i] + bnbCount[i] < 20) {
             kappaV[i] = 0.f;
         } else {
-            float rhoDot = rhoDotOf(i, nbGeom, nbIdx, nbCount, vadv, gradB, vol, n);
+            float rhoDot = rhoDotOf(i, nbGeom, nbCount, vadv, gradB, vol, n);
             kappaV[i] = rhoDot;
             v = rhoDot;
         }
@@ -1005,12 +974,6 @@ __global__ void kDFSPHRhoDotUpdate(const float4* nbGeom, const int* nbIdx, const
     }
 }
 
-__global__ void kDFSPHStorePrev(const float* kappaV, const float* alpha, int n, float* prev) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    prev[i] = kappaV[i] * alpha[i];
-}
-
 __global__ void kDFSPHFinalize(const float4* vadv, float4* vel, int n, float vmax,
                                const float* kappaV, const float* alpha, int warmStart,
                                float* prev) {
@@ -1024,18 +987,6 @@ __global__ void kDFSPHFinalize(const float4* vadv, float4* vel, int n, float vma
     }
     vel[i] = v;
     if (warmStart) prev[i] = kappaV[i] * alpha[i];
-}
-
-__global__ void kCopyFloat4(float4* dst, const float4* src, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    dst[i] = src[i];
-}
-
-__global__ void kCopyFloat(float* dst, const float* src, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    dst[i] = src[i];
 }
 
 __global__ void kZeroInt(int* dst, int n) {

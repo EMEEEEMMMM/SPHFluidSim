@@ -8,7 +8,7 @@ Flickable {
     id: panel
     property var session
     signal sceneRequested(int scene)
-    signal resolutionRequested(int index)
+    signal particleCountRequested(int count)
 
     clip: true
     contentWidth: width
@@ -21,11 +21,21 @@ Flickable {
     readonly property var p: session ? session.params : ({})
     readonly property var st: session ? session.status : ({})
 
-    readonly property var resolutions: [
-        "Low · 0.040 m", "Medium · 0.030 m", "High · 0.025 m", "Ultra · 0.020 m",
-        "Cinema · 0.015 m", "Epic · 0.0125 m", "Extreme · 0.010 m"
-    ]
-    readonly property var spacings: [0.040, 0.030, 0.025, 0.020, 0.015, 0.0125, 0.010]
+    readonly property int particleMin: 512
+    readonly property int particleMax: 4000000
+    readonly property int particleTarget: p.particleCount !== undefined ? p.particleCount : 0
+    // Device memory one particle needs (0 on the CPU backend, which has none).
+    readonly property real bytesPerParticle: st.bytesPerParticle !== undefined ? st.bytesPerParticle : 0
+    readonly property real vramFree: st.vramFreeBytes !== undefined ? st.vramFreeBytes : 0
+    readonly property real neededBytes: bytesPerParticle * particleTarget
+    readonly property bool overBudget: bytesPerParticle > 0 && vramFree > 0
+                                       && neededBytes > vramFree * 0.9
+
+    function formatBytes(bytes) {
+        if (!(bytes > 0)) return "—"
+        if (bytes >= 1024 * 1024 * 1024) return (bytes / (1024 * 1024 * 1024)).toFixed(2) + " GB"
+        return Math.round(bytes / (1024 * 1024)) + " MB"
+    }
 
     readonly property var tracePoints: {
         const src = session ? session.densityTrace : [];
@@ -55,13 +65,6 @@ Flickable {
 
     readonly property real densityError: panel.st.densityError !== undefined
                                         ? panel.st.densityError : 0
-
-    function resolutionIndex() {
-        const s = p.spacing !== undefined ? p.spacing : 0.025;
-        for (let i = 0; i < spacings.length; ++i)
-            if (Math.abs(s - spacings[i]) < 1e-4) return i;
-        return 2;
-    }
 
     function groupDigits(value) {
         const raw = String(Math.round(value));
@@ -96,80 +99,108 @@ Flickable {
                 Layout.fillWidth: true
                 spacing: 8
                 Text {
-                    text: "Resolution"
+                    text: "Particles"
                     color: panel.c.fg2
                     font.pixelSize: 11
                 }
                 Item { Layout.fillWidth: true }
 
-                ComboBox {
-                    id: resCombo
-                    implicitWidth: 136
-                    model: panel.resolutions
-                    currentIndex: panel.resolutionIndex()
-                    onActivated: (index) => panel.resolutionRequested(index)
+                Rectangle {
+                    implicitWidth: 104
+                    implicitHeight: 24
+                    radius: panel.m.square ? 0 : panel.m.radiusSm
+                    color: panel.c.field
+                    border.width: countField.activeFocus ? 2 : 1
+                    border.color: countField.activeFocus ? panel.c.accent
+                                : (panel.overBudget ? panel.c.danger : panel.c.border)
 
-                    background: Rectangle {
-                        radius: panel.c && Theme.metrics ? Theme.metrics.radiusSm : 6
-                        color: panel.c.field
-                        border.width: 1
-                        border.color: panel.c.border
-                    }
-                    contentItem: Text {
-                        leftPadding: 8
-                        rightPadding: 18
-                        text: resCombo.displayText
-                        color: panel.c.fg
+                    TextField {
+                        id: countField
+                        anchors.fill: parent
+                        anchors.leftMargin: 6
+                        anchors.rightMargin: 6
+                        padding: 0
+                        color: panel.overBudget ? panel.c.danger : panel.c.fg
+                        selectionColor: panel.c.accent
+                        selectedTextColor: panel.c.accentFg
                         font.pixelSize: 11
+                        font.family: panel.m.numberFamily
+                        horizontalAlignment: Text.AlignRight
                         verticalAlignment: Text.AlignVCenter
-                        elide: Text.ElideRight
-                    }
-                    indicator: IconItem {
-                        x: resCombo.width - width - 8
-                        y: (resCombo.height - height) / 2
-                        width: 10
-                        height: 10
-                        kind: 8
-                        angle: 90
-                        color: panel.c.fg2
-                    }
-                    delegate: ItemDelegate {
-                        width: resCombo.width
-                        contentItem: Text {
-                            text: modelData
-                            color: highlighted ? "#FFFFFF" : panel.c.fg
-                            font.pixelSize: 11
-                            verticalAlignment: Text.AlignVCenter
+                        inputMethodHints: Qt.ImhDigitsOnly
+                        // Do NOT attach an IntValidator here: the display text
+                        // is grouped ("32 768"), which IntValidator rejects, so
+                        // Enter never produced editingFinished/accepted and the
+                        // field looked dead. commit() validates and clamps.
+                        Component.onCompleted: text = panel.groupDigits(panel.particleTarget)
+
+                        property double lastCommitMs: 0
+
+                        function commit() {
+                            const now = Date.now();
+                            // Enter fires both accepted and editingFinished.
+                            if (now - lastCommitMs < 300) return;
+                            lastCommitMs = now;
+                            const parsed = parseInt(text.replace(/\s/g, ""), 10);
+                            if (!isFinite(parsed)) {
+                                text = panel.groupDigits(panel.particleTarget);
+                                return;
+                            }
+                            const wanted = Math.max(panel.particleMin,
+                                                    Math.min(panel.particleMax, parsed));
+                            // Show the committed target again; if the user
+                            // accepts the confirmation, particleTarget changes
+                            // and the Connections handler writes the new count.
+                            text = panel.groupDigits(panel.particleTarget);
+                            if (wanted !== panel.particleTarget)
+                                panel.particleCountRequested(wanted);
                         }
-                        background: Rectangle {
-                            color: highlighted ? panel.c.accent : panel.c.card
+
+                        onAccepted: commit()
+                        onEditingFinished: commit()
+                        // Keep the field in sync when the count changes elsewhere
+                        // (parameter import, backend switch, scene reset). Do not
+                        // skip while focused: after a rebuild the field must show
+                        // the count that was actually built.
+                        Connections {
+                            target: panel
+                            function onParticleTargetChanged() {
+                                countField.text = panel.groupDigits(panel.particleTarget);
+                            }
                         }
-                    }
-                    popup: Popup {
-                        y: resCombo.height + 4
-                        width: resCombo.width
-                        implicitHeight: contentItem.implicitHeight + 2
-                        padding: 1
-                        background: Rectangle {
-                            radius: Theme.metrics.radiusSm
-                            color: panel.c.card
-                            border.width: 1
-                            border.color: panel.c.border
-                        }
-                        contentItem: ListView {
-                            clip: true
-                            implicitHeight: contentHeight
-                            model: resCombo.popup.visible ? resCombo.delegateModel : null
-                            currentIndex: resCombo.highlightedIndex
-                        }
+                        background: Item {}
                     }
                 }
+            }
+
+            // Spacing is derived from the count; showing it keeps the old
+            // resolution presets' information without the vague labels.
+            Text {
+                Layout.fillWidth: true
+                text: "spacing " + Number(panel.st.spacing !== undefined ? panel.st.spacing : 0).toFixed(4)
+                      + " m" + (panel.bytesPerParticle > 0
+                                ? "  ·  " + panel.formatBytes(panel.neededBytes)
+                                  + " / " + panel.formatBytes(panel.vramFree) + " free"
+                                : "")
+                color: panel.overBudget ? panel.c.danger : panel.c.fg3
+                font.pixelSize: 10
+                font.family: panel.m.numberFamily
+                wrapMode: Text.WordWrap
+            }
+
+            Text {
+                Layout.fillWidth: true
+                visible: panel.overBudget
+                text: "More particles than the GPU can hold — lower the count or the solver will refuse to build the scene."
+                color: panel.c.danger
+                font.pixelSize: 10
+                wrapMode: Text.WordWrap
             }
 
             RowLayout {
                 Layout.fillWidth: true
                 Text {
-                    text: "Particles"
+                    text: "Active"
                     color: panel.c.fg2
                     font.pixelSize: 11
                 }

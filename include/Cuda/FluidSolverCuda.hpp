@@ -63,6 +63,8 @@ public:
     const Params& GetParams() const override;
     float KernelRadius() const override;
     float Spacing() const override;
+    GpuMemoryInfo GpuMemory() const override;
+    void CheckParticleBudget(int particleCount) const override;
 
     void EnableConvergenceTrace() override;
     const std::vector<float>& ConvergenceTrace() const override;

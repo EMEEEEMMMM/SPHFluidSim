@@ -36,7 +36,7 @@
 //     -r <WxH>         output resolution       (default 1280x720)
 //     --output <dir>   output directory        (default ./out)
 //     --mode <m>       particles | surface     (default surface)
-//     --particles <n>  approx. fluid particle count (default 8000)
+//     --particles <n>  exact fluid particle count (default 8000)
 //     --dt <float>     nominal timestep        (default: solver CFL)
 //     --threads <n>    OpenMP threads          (default: all)
 //     --no-video       keep only BMP frames
@@ -381,9 +381,10 @@ int main(int argc, char** argv) {
                    "  -r <WxH>         resolution (default 1280x720)\n"
                    "  --output <dir>   output dir (default ./out)\n"
                    "  --mode <m>       particles | surface (default surface)\n"
-                   "  --particles <n>  approx. fluid particles (default 8000)\n"
+                   "  --particles <n>  exact fluid particle count (default 8000)\n"
                    "  --scene <s>      dam | inflow (default dam; dam tank is open-top)\n"
                    "  --solver <s>     IISPH | DFSPH (default IISPH)\n"
+                   "  --backend <b>    auto | cpu | cuda (default auto)\n"
                    "  --drop <N>[f|s]  spawn at video frame N or video time N seconds (dam only)\n"
                    "  --dt <s>         nominal timestep (CFL may shorten it)\n"
                    "  --threads <n>    OpenMP threads\n"

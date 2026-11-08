@@ -27,6 +27,7 @@
 #include <QScreen>
 #include <QStyle>
 #include <QThread>
+#include <QSpinBox>
 #include <QTimer>
 #include <QVBoxLayout>
 #include <QWindow>
@@ -54,24 +55,12 @@
 namespace ui {
 namespace {
 
-struct ResolutionPreset {
-    const char* label;
-    float spacing;
-};
-
-const ResolutionPreset kResolutions[] = {
-    {"Low · 0.040 m", 0.040f},   {"Medium · 0.030 m", 0.030f},
-    {"High · 0.025 m", 0.025f},  {"Ultra · 0.020 m", 0.020f},
-    {"Cinema · 0.015 m", 0.015f},{"Epic · 0.0125 m", 0.0125f},
-    {"Extreme · 0.010 m", 0.010f},
-};
-constexpr int kResolutionCount = static_cast<int>(sizeof(kResolutions) / sizeof(kResolutions[0]));
-
-int IndexForSpacing(float spacing) {
-    for (int i = 0; i < kResolutionCount; ++i) {
-        if (std::fabs(spacing - kResolutions[i].spacing) < 1e-4f) return i;
-    }
-    return 2;
+QString FormatBytes(qlonglong bytes) {
+    if (bytes <= 0) return QStringLiteral("—");
+    if (bytes >= 1024ll * 1024 * 1024)
+        return QString::number(bytes / (1024.0 * 1024.0 * 1024.0), 'f', 2) +
+               QStringLiteral(" GB");
+    return QString::number(bytes / (1024.0 * 1024.0), 'f', 0) + QStringLiteral(" MB");
 }
 
 // "33412" -> "33 412"
@@ -401,19 +390,25 @@ void MainWindow::buildLeftPanel() {
     auto* resLayout = new QHBoxLayout(resRow);
     resLayout->setContentsMargins(0, 0, 0, 0);
     resLayout->setSpacing(8);
-    auto* resLabel = new QLabel(QStringLiteral("Resolution"), resRow);
+    auto* resLabel = new QLabel(QStringLiteral("Particles"), resRow);
     resLabel->setProperty("role", "caption");
-    m_resolution = new QComboBox(resRow);
-    for (const auto& preset : kResolutions) {
-        m_resolution->addItem(QString::fromUtf8(preset.label));
-    }
-    m_resolution->setCurrentIndex(2);
+    m_particles = new QSpinBox(resRow);
+    m_particles->setRange(512, 4000000);
+    m_particles->setSingleStep(1024);
+    m_particles->setGroupSeparatorShown(true);
+    // Without keyboard tracking the scene is rebuilt once, when the number is
+    // committed (Enter / focus out / arrow), not on every typed digit.
+    m_particles->setKeyboardTracking(false);
+    m_particles->setValue(32768);
+    m_particles->setToolTip(QStringLiteral("Exact number of fluid particles; the spacing follows from it"));
     resLayout->addWidget(resLabel);
     resLayout->addStretch(1);
-    resLayout->addWidget(m_resolution);
+    resLayout->addWidget(m_particles);
     scene->addWidget(resRow);
 
-    m_particleCount = scene->addValueRow(QStringLiteral("Particles"), QStringLiteral("—"));
+    m_spacingHint = scene->addValueRow(QStringLiteral("Spacing"), QStringLiteral("—"));
+
+    m_particleCount = scene->addValueRow(QStringLiteral("Active"), QStringLiteral("—"));
 
     m_dropButton = new QPushButton(QStringLiteral("Spawn water drop"), scene);
     m_dropButton->setIcon(GlyphIcon(IconKind::Droplet, Theme::instance().current().fg, 13));
@@ -675,9 +670,8 @@ void MainWindow::wire() {
     });
 
     connect(m_sceneSeg, &SegmentedControl::activated, this, &MainWindow::changeScene);
-    connect(m_resolution, QOverload<int>::of(&QComboBox::activated), this,
-            &MainWindow::changeResolution);
-    connect(m_dropButton, &QPushButton::clicked, this, [this] { m_session->spawnDrop(); });
+    connect(m_particles, QOverload<int>::of(&QSpinBox::valueChanged), this,
+            &MainWindow::changeParticleCount);    connect(m_dropButton, &QPushButton::clicked, this, [this] { m_session->spawnDrop(); });
 
     connect(m_speed, &SliderRow::valueChanged, this,
             [this](double v) { setParam(QStringLiteral("speed"), static_cast<int>(std::lround(v))); });
@@ -760,9 +754,9 @@ void MainWindow::syncParams() {
     }
 
     {
-        const QSignalBlocker block(m_resolution);
-        const int index = IndexForSpacing(p.value(QStringLiteral("spacing")).toFloat());
-        if (m_resolution->currentIndex() != index) m_resolution->setCurrentIndex(index);
+        const QSignalBlocker block(m_particles);
+        const int count = p.value(QStringLiteral("particleCount")).toInt();
+        if (m_particles->value() != count) m_particles->setValue(count);
     }
 
     m_dropButton->setVisible(scene == 0);
@@ -809,6 +803,20 @@ void MainWindow::syncStatus() {
 
     m_clock->setText(QStringLiteral("t %1 s").arg(simTime, 0, 'f', 2));
     m_particleCount->setText(GroupDigits(fluid));
+    if (m_spacingHint) {
+        const auto mem = m_session->status();
+        const qlonglong bytesPerParticle =
+            mem.value(QStringLiteral("bytesPerParticle")).toLongLong();
+        const qlonglong freeBytes = mem.value(QStringLiteral("vramFreeBytes")).toLongLong();
+        QString hint = QStringLiteral("%1 m").arg(spacing, 0, 'f', 4);
+        if (bytesPerParticle > 0 && freeBytes > 0) {
+            hint += QStringLiteral(" · %1 / %2 free")
+                        .arg(FormatBytes(bytesPerParticle *
+                                         m_session->params().value(QStringLiteral("particleCount")).toLongLong()),
+                             FormatBytes(freeBytes));
+        }
+        m_spacingHint->setText(hint);
+    }
 
     m_metrics->setValue(0, QString::number(simTime, 'f', 2) + QStringLiteral(" s"));
     m_metrics->setValue(1, QString::number(std::abs(density) * 100.0, 'f', 3) + QStringLiteral(" %"));
@@ -825,11 +833,9 @@ void MainWindow::syncStatus() {
         m_actualRate->setText(QString::number(1000.0 / ms, 'f', 0) + QStringLiteral(" steps/s"));
     }
 
-    m_statusRight->setText(QStringLiteral("%1 fluid · %2 boundary · %3")
+    m_statusRight->setText(QStringLiteral("%1 fluid · %2 boundary · r=%3 m")
                                .arg(GroupDigits(fluid), GroupDigits(boundary),
-                                    IndexForSpacing(static_cast<float>(spacing)) >= 0
-                                        ? QString::fromUtf8(kResolutions[IndexForSpacing(static_cast<float>(spacing))].label)
-                                        : QStringLiteral("custom")));
+                                    QString::number(spacing, 'f', 4)));
 
     if (m_statusMessage.isEmpty()) {
         m_statusLeft->clear();
@@ -913,20 +919,20 @@ void MainWindow::changeScene(int scene) {
     setParam(QStringLiteral("scene"), scene);
 }
 
-void MainWindow::changeResolution(int index) {
-    const int current = IndexForSpacing(
-        m_session->params().value(QStringLiteral("spacing")).toFloat());
-    if (index == current) return;
+void MainWindow::changeParticleCount(int count) {
+    const int current = m_session->params().value(QStringLiteral("particleCount")).toInt();
+    if (count == current) return;
     const auto answer = QMessageBox::question(
-        this, QStringLiteral("Change resolution"),
-        QStringLiteral("Changing the resolution rebuilds the scene from scratch. Continue?"),
+        this, QStringLiteral("Rebuild scene"),
+        QStringLiteral("Building %1 particles rebuilds the scene from scratch. Continue?")
+            .arg(GroupDigits(count)),
         QMessageBox::Yes | QMessageBox::No, QMessageBox::Yes);
     if (answer != QMessageBox::Yes) {
-        const QSignalBlocker block(m_resolution);
-        m_resolution->setCurrentIndex(current);
+        const QSignalBlocker block(m_particles);
+        m_particles->setValue(current);
         return;
     }
-    setParam(QStringLiteral("spacing"), kResolutions[index].spacing);
+    setParam(QStringLiteral("particleCount"), count);
 }
 
 void MainWindow::changeSolver(int solver) {
