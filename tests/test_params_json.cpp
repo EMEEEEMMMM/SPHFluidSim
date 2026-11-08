@@ -78,6 +78,17 @@ int main(int argc, char** argv) {
     if (!Check(legacyParams.value(QStringLiteral("viewMode")).toInt() == 0,
                "legacy viewMode was ignored")) return 1;
 
+    // There is no application-level particle cap: large requested counts must
+    // survive import and be left to the backend's memory preflight.
+    const QByteArray largeRequest = R"({
+        "app":"IISPH","schemaVersion":1,
+        "simulation":{"scene":"dam","solver":"IISPH","particleCount":10000000}
+    })";
+    if (!Check(restored.importParamsJson(QString::fromUtf8(largeRequest)),
+               "10M-particle JSON did not import")) return 1;
+    if (!Check(restored.params().value(QStringLiteral("particleCount")).toInt() == 10000000,
+               "particleCount was capped below 10000000")) return 1;
+
     std::printf("params_json: PASS\n");
     return 0;
 }

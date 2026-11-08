@@ -106,6 +106,12 @@ public:
     //   gridScale, reconInterval
     Q_INVOKABLE void setParam(const QString& key, const QVariant& value);
 
+    // Empty when the current backend can build `count` particles. On CUDA this
+    // uses the cached device budget (no context switch); the CPU backend has no
+    // upper limit. The main window and render dialog use this for live preflight
+    // warnings before a scene rebuild or offline render is requested.
+    Q_INVOKABLE QString particleBudgetError(int count) const;
+
     // ---- experiment files --------------------------------------------------
     Q_INVOKABLE QString exportParamsJson() const;
     Q_INVOKABLE bool importParamsJson(const QString& json);

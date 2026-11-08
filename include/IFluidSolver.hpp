@@ -1,6 +1,8 @@
 #pragma once
 #include "FluidParams.hpp"
 #include "Math/Vector3.hpp"
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 // Backend-agnostic SPH solver interface.
@@ -18,6 +20,14 @@
 //  - The accessors return host-side vectors that are valid after Step() and
 //    after scene construction. A GPU backend keeps a host mirror and refreshes
 //    it lazily.
+// A scene request that exceeds the backend's device budget. This is a user
+// input error, not a broken solver: the current scene remains valid and keeps
+// running while the UI reports the refusal.
+class ParticleBudgetError : public std::runtime_error {
+public:
+    explicit ParticleBudgetError(const std::string& message) : std::runtime_error(message) {}
+};
+
 // Device-memory budget of a backend. Everything is zero for the CPU solver.
 struct GpuMemoryInfo {
     long long freeBytes = 0;         // free device memory when last measured

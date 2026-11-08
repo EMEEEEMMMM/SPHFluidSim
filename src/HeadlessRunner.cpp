@@ -322,7 +322,7 @@ int RunHeadless(const HeadlessOptions& opt) {
         const double s = static_cast<double>(*opt.spacing);
         particles = static_cast<int>(std::llround(waterVol / (s * s * s)));
     }
-    particles = std::clamp(particles, 512, 4000000);
+    particles = std::max(particles, 512);
     float spacing = powf(waterVol / (float)particles, 1.0f / 3.0f);
     params.spacing = spacing;
     if (opt.dt > 0.0f) params.dt = opt.dt;

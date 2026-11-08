@@ -22,14 +22,19 @@ Flickable {
     readonly property var st: session ? session.status : ({})
 
     readonly property int particleMin: 512
-    readonly property int particleMax: 4000000
+    // Practical limit of the int-backed solver API, not an application cap.
+    readonly property int particleMax: 2147483647
     readonly property int particleTarget: p.particleCount !== undefined ? p.particleCount : 0
+    property int pendingParticleCount: 0
+    property string particleBudgetMessage: ""
     // Device memory one particle needs (0 on the CPU backend, which has none).
     readonly property real bytesPerParticle: st.bytesPerParticle !== undefined ? st.bytesPerParticle : 0
     readonly property real vramFree: st.vramFreeBytes !== undefined ? st.vramFreeBytes : 0
-    readonly property real neededBytes: bytesPerParticle * particleTarget
-    readonly property bool overBudget: bytesPerParticle > 0 && vramFree > 0
-                                       && neededBytes > vramFree * 0.9
+    readonly property int budgetCount: particleBudgetMessage !== "" ? pendingParticleCount : particleTarget
+    readonly property real neededBytes: bytesPerParticle * budgetCount
+    readonly property bool overBudget: particleBudgetMessage !== "" ||
+                                       (bytesPerParticle > 0 && vramFree > 0
+                                        && neededBytes > vramFree * 0.9)
 
     function formatBytes(bytes) {
         if (!(bytes > 0)) return "—"
@@ -148,6 +153,16 @@ Flickable {
                             }
                             const wanted = Math.max(panel.particleMin,
                                                     Math.min(panel.particleMax, parsed));
+                            const budgetError = panel.session
+                                ? panel.session.particleBudgetError(wanted) : "";
+                            if (budgetError !== "") {
+                                panel.pendingParticleCount = wanted;
+                                panel.particleBudgetMessage = budgetError;
+                                text = panel.groupDigits(wanted);
+                                return;
+                            }
+                            panel.pendingParticleCount = 0;
+                            panel.particleBudgetMessage = "";
                             // Show the committed target again; if the user
                             // accepts the confirmation, particleTarget changes
                             // and the Connections handler writes the new count.
@@ -156,6 +171,10 @@ Flickable {
                                 panel.particleCountRequested(wanted);
                         }
 
+                        onTextEdited: {
+                            panel.pendingParticleCount = 0;
+                            panel.particleBudgetMessage = "";
+                        }
                         onAccepted: commit()
                         onEditingFinished: commit()
                         // Keep the field in sync when the count changes elsewhere
@@ -165,6 +184,8 @@ Flickable {
                         Connections {
                             target: panel
                             function onParticleTargetChanged() {
+                                panel.pendingParticleCount = 0;
+                                panel.particleBudgetMessage = "";
                                 countField.text = panel.groupDigits(panel.particleTarget);
                             }
                         }
@@ -191,7 +212,9 @@ Flickable {
             Text {
                 Layout.fillWidth: true
                 visible: panel.overBudget
-                text: "More particles than the GPU can hold — lower the count or the solver will refuse to build the scene."
+                text: panel.particleBudgetMessage !== ""
+                      ? panel.particleBudgetMessage
+                      : "More particles than the GPU can hold — lower the count or the solver will refuse to build the scene."
                 color: panel.c.danger
                 font.pixelSize: 10
                 wrapMode: Text.WordWrap

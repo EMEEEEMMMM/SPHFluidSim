@@ -24,6 +24,7 @@
 #include <QVariantList>
 
 #include <cmath>
+#include <limits>
 
 #include "Render/RenderJob.hpp"
 #include "Session/SimulationSession.hpp"
@@ -142,7 +143,7 @@ void RenderOptionsDialog::buildUi() {
     QGridLayout* fluidGrid = nullptr;
     makeGroup(QStringLiteral("FLUID PARAMETERS"), &fluidGrid);
     m_particleCount = new QSpinBox(this);
-    m_particleCount->setRange(128, 2000000);
+    m_particleCount->setRange(128, std::numeric_limits<int>::max());
     m_particleCount->setSingleStep(1024);
     m_particleCount->setKeyboardTracking(false);
     m_dt = new QDoubleSpinBox(this);
@@ -326,7 +327,7 @@ void RenderOptionsDialog::loadValues() {
     m_particleCount->setValue(
         std::clamp(qRound(currentVolume / std::pow(currentSpacing, 3.0)) +
                        (currentInflow ? 8 : 0),
-                   128, 2000000));
+                   128, std::numeric_limits<int>::max()));
     m_dt->setValue(p.value(QStringLiteral("dt"), 0.004).toDouble());
     m_cfl->setChecked(p.value(QStringLiteral("cfl"), true).toBool());
     m_omega->setValue(p.value(QStringLiteral("omega"), 0.5).toDouble());
@@ -423,6 +424,18 @@ void RenderOptionsDialog::scheduleValidation() {
 
 void RenderOptionsDialog::updateValidation() {
     if (!m_job || !m_startButton) return;
+    const QString budgetError = m_session && m_particleCount
+        ? m_session->particleBudgetError(m_particleCount->value()) : QString();
+    if (!budgetError.isEmpty()) {
+        m_startButton->setEnabled(false);
+        if (m_status) {
+            m_status->setText(QStringLiteral("Not ready — ") + budgetError);
+            m_status->setStyleSheet(
+                QStringLiteral("color: %1;").arg(Theme::instance().current().danger.name()));
+        }
+        return;
+    }
+
     const QVariantMap result = m_job->validateOptions(buildConfig());
     const bool valid = result.value(QStringLiteral("valid")).toBool();
     const QString message = result.value(QStringLiteral("message")).toString();
@@ -469,6 +482,13 @@ void RenderOptionsDialog::chooseOutputDirectory() {
 
 void RenderOptionsDialog::startRender() {
     if (!m_job) return;
+    const QString budgetError = m_session && m_particleCount
+        ? m_session->particleBudgetError(m_particleCount->value()) : QString();
+    if (!budgetError.isEmpty()) {
+        QMessageBox::warning(this, QStringLiteral("Render"), budgetError);
+        updateValidation();
+        return;
+    }
     const QVariantMap config = buildConfig();
     const QVariantMap result = m_job->validateOptions(config);
     if (!result.value(QStringLiteral("valid")).toBool()) {

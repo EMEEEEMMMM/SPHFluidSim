@@ -103,6 +103,7 @@ private:
     Card* m_playbackCard = nullptr;
     QSpinBox* m_particles = nullptr;
     QLabel* m_spacingHint = nullptr;
+    QLabel* m_particleWarning = nullptr;
     QLabel* m_particleCount = nullptr;
     QPushButton* m_dropButton = nullptr;
     SliderRow* m_speed = nullptr;

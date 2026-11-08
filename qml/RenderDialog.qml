@@ -98,6 +98,12 @@ Popup {
 
     function validateNow() {
         if (!session || !job) return;
+        const particles = Math.max(128, Math.round(particleField.value));
+        const budgetError = session.particleBudgetError(particles);
+        if (budgetError !== "") {
+            validation = ({ valid: false, message: budgetError });
+            return;
+        }
         validation = job.validateOptions(buildConfig());
     }
 
@@ -234,7 +240,7 @@ Popup {
                             label: qsTr("Number of particles")
                             value: 32768
                             from: 128
-                            to: 2000000
+                            to: 2147483647
                             integer: true
                             onEdited: dialog.scheduleValidation()
                         }

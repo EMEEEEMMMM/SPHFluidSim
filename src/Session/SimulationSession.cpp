@@ -44,10 +44,12 @@ float WaterVolumeForScene(int scene) {
 }
 
 constexpr int kMinParticles = 512;
-constexpr int kMaxParticles = 4000000;
 
+// There is deliberately no application-level upper cap. Large scenes are
+// rejected by the active backend's budget check (CUDA) or by the machine's
+// available memory (CPU), not by an arbitrary UI number.
 int ClampParticleCount(int count) {
-    return std::clamp(count, kMinParticles, kMaxParticles);
+    return std::max(count, kMinParticles);
 }
 
 float SpacingForCount(int scene, int count) {
@@ -278,6 +280,38 @@ QVariantMap SimulationSession::status() const {
 QVariantList SimulationSession::densityTrace() const {
     std::lock_guard<std::mutex> lk(m_impl->uiMutex);
     return m_impl->trace;
+}
+
+QString SimulationSession::particleBudgetError(int count) const {
+    const QVariantMap st = status();
+    const qlonglong bytesPerParticle =
+        st.value(QStringLiteral("bytesPerParticle")).toLongLong();
+    const qlonglong freeBytes = st.value(QStringLiteral("vramFreeBytes")).toLongLong();
+    if (count <= 0 || bytesPerParticle <= 0 || freeBytes <= 0) return {};
+
+    const int currentCount = params().value(QStringLiteral("particleCount")).toInt();
+    if (count <= currentCount) return {};
+
+    // The current fluid buffers are reusable while rebuilding, so the free
+    // figure alone would reject a straightforward resolution increase.
+    const long double available = static_cast<long double>(freeBytes) +
+                                  static_cast<long double>(currentCount) * bytesPerParticle;
+    const long double margin = 1.12L;
+    const long double scratch = 80.0L * 1024.0L * 1024.0L;
+    const long double reserve = 96.0L * 1024.0L * 1024.0L;
+    const long double need = static_cast<long double>(count) * bytesPerParticle * margin + scratch;
+    if (need <= available) return {};
+
+    const long double usable = std::max(0.0L, available - reserve);
+    const long double fits = std::floor(usable / (bytesPerParticle * margin));
+    const auto mib = [](long double bytes) {
+        return QString::number(static_cast<qlonglong>(bytes / (1024.0L * 1024.0L)));
+    };
+    return QStringLiteral(
+               "Not enough GPU memory for about %1 particles: needs about %2 MiB, "
+               "only %3 MiB usable. Lower the count to about %4.")
+        .arg(count)
+        .arg(mib(need), mib(available), QString::number(static_cast<qlonglong>(fits)));
 }
 
 void SimulationSession::setTriangleCount(int count) {
@@ -893,6 +927,18 @@ void SimulationSession::workerLoop() {
             for (auto& fn : pending) {
                 try {
                     fn(solver);
+                } catch (const ParticleBudgetError& ex) {
+                    // Refusing an oversized rebuild does not invalidate the
+                    // running scene: keep the solver usable and only surface
+                    // the reason to the user.
+                    const QString text =
+                        QStringLiteral("Scene not rebuilt: %1").arg(QString::fromUtf8(ex.what()));
+                    Q_EMIT message(text);
+                    {
+                        std::lock_guard<std::mutex> lk(d.uiMutex);
+                        d.status.insert(QStringLiteral("solverError"), text);
+                    }
+                    Q_EMIT statusChanged();
                 } catch (const std::exception& ex) {
                     reportFailure(ex);
                 }

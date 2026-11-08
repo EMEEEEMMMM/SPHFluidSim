@@ -429,7 +429,7 @@ struct FluidSolverCuda::Impl {
                       static_cast<double>(available) / 1048576.0,
                       static_cast<double>(freeB) / 1048576.0,
                       static_cast<double>(totalB) / 1048576.0, fits);
-        throw std::runtime_error(msg);
+        throw ParticleBudgetError(msg);
     }
 
     void BuildBoundary(bool openTop) {

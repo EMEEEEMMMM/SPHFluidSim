@@ -34,6 +34,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 #ifdef Q_OS_WIN
 #ifndef NOMINMAX
@@ -393,7 +394,7 @@ void MainWindow::buildLeftPanel() {
     auto* resLabel = new QLabel(QStringLiteral("Particles"), resRow);
     resLabel->setProperty("role", "caption");
     m_particles = new QSpinBox(resRow);
-    m_particles->setRange(512, 4000000);
+    m_particles->setRange(512, std::numeric_limits<int>::max());
     m_particles->setSingleStep(1024);
     m_particles->setGroupSeparatorShown(true);
     // Without keyboard tracking the scene is rebuilt once, when the number is
@@ -407,6 +408,14 @@ void MainWindow::buildLeftPanel() {
     scene->addWidget(resRow);
 
     m_spacingHint = scene->addValueRow(QStringLiteral("Spacing"), QStringLiteral("—"));
+
+    m_particleWarning = new QLabel(scene);
+    m_particleWarning->setWordWrap(true);
+    m_particleWarning->setVisible(false);
+    m_particleWarning->setStyleSheet(
+        QStringLiteral("color: %1; font-size: 10px;")
+            .arg(Theme::instance().current().danger.name()));
+    scene->addWidget(m_particleWarning);
 
     m_particleCount = scene->addValueRow(QStringLiteral("Active"), QStringLiteral("—"));
 
@@ -757,6 +766,10 @@ void MainWindow::syncParams() {
         const QSignalBlocker block(m_particles);
         const int count = p.value(QStringLiteral("particleCount")).toInt();
         if (m_particles->value() != count) m_particles->setValue(count);
+        if (m_particleWarning && m_particles->value() == count) {
+            m_particleWarning->clear();
+            m_particleWarning->setVisible(false);
+        }
     }
 
     m_dropButton->setVisible(scene == 0);
@@ -922,6 +935,14 @@ void MainWindow::changeScene(int scene) {
 void MainWindow::changeParticleCount(int count) {
     const int current = m_session->params().value(QStringLiteral("particleCount")).toInt();
     if (count == current) return;
+
+    const QString budgetError = m_session->particleBudgetError(count);
+    if (m_particleWarning) {
+        m_particleWarning->setText(budgetError);
+        m_particleWarning->setVisible(!budgetError.isEmpty());
+    }
+    if (!budgetError.isEmpty()) return;
+
     const auto answer = QMessageBox::question(
         this, QStringLiteral("Rebuild scene"),
         QStringLiteral("Building %1 particles rebuilds the scene from scratch. Continue?")
@@ -1033,6 +1054,10 @@ void MainWindow::applyTheme() {
     }
     if (m_dropButton) {
         m_dropButton->setIcon(GlyphIcon(IconKind::Droplet, t.fg, 13));
+    }
+    if (m_particleWarning) {
+        m_particleWarning->setStyleSheet(
+            QStringLiteral("color: %1; font-size: 10px;").arg(t.danger.name()));
     }
     refreshTraceLegend();
 
