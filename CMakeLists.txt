@@ -93,6 +93,12 @@ endif()
 if(OpenCL_FOUND)
     message(STATUS "OpenCL found: ${OpenCL_LIBRARIES}")
 else()
+    # FindOpenCL leaves the singular cache entry as `<var>-NOTFOUND` and copies
+    # it into the plural list; passing that to target_include_directories makes
+    # the *generate* step fail. Clear both so OpenCL really is optional.
+    set(OpenCL_INCLUDE_DIR "")
+    set(OpenCL_INCLUDE_DIRS "")
+    set(OpenCL_LIBRARIES "")
     message(WARNING "OpenCL not found — GPU surface reconstruction disabled (CPU path only)")
 endif()
 

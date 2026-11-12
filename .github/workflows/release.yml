@@ -162,6 +162,8 @@ jobs:
           # libgomp is an *optional* dependency of the GCC package: without it
           # -fopenmp compiles but cannot link (libgomp.dll.a is missing), so it
           # must be requested explicitly.
+          # opencl-headers provides CL/cl.h; the ICD loader package ships only
+          # the DLL and the import library, so find_package(OpenCL) needs both.
           install: >-
             mingw-w64-ucrt-x86_64-gcc
             mingw-w64-ucrt-x86_64-libgomp
@@ -172,6 +174,7 @@ jobs:
             mingw-w64-ucrt-x86_64-qt6-declarative
             mingw-w64-ucrt-x86_64-qt6-tools
             mingw-w64-ucrt-x86_64-assimp
+            mingw-w64-ucrt-x86_64-opencl-headers
 
       # Optional: the app falls back to the CPU backend when no ICD loader is
       # present, and deploy/windows.ps1 already tolerates a missing OpenCL.dll.
