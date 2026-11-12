@@ -79,6 +79,32 @@ if(NOT TARGET OpenMP::OpenMP_CXX)
 endif()
 find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets Quick QuickControls2 OpenGL OpenGLWidgets)
 
+# Development convenience: Qt records its install prefix at build time. MSYS2
+# builds it for C:/msys64, so with the toolkit in D:/msys64 (or any other
+# location) the QML modules are not found when the executable runs from the
+# build tree, and the window fails with
+#   module "QtQuick.Controls" plugin "qtquickcontrols2plugin" not found
+# A qt.conf next to the binary points Qt at the real QML directory. The
+# packaged build writes its own qt.conf, so this only affects the build tree.
+if(WIN32)
+    get_filename_component(_sph_qt_prefix "${Qt6_DIR}/../../.." ABSOLUTE)
+    foreach(_sph_candidate "${_sph_qt_prefix}/qml" "${_sph_qt_prefix}/share/qt6/qml")
+        if(IS_DIRECTORY "${_sph_candidate}")
+            set(_sph_qml_dir "${_sph_candidate}")
+            break()
+        endif()
+    endforeach()
+    if(_sph_qml_dir)
+        file(WRITE "${CMAKE_BINARY_DIR}/qt.conf"
+             "[Paths]\nQmlImports=${_sph_qml_dir}\nQml2Imports=${_sph_qml_dir}\n")
+        message(STATUS "Qt QML imports: ${_sph_qml_dir} (build/qt.conf)")
+    else()
+        message(WARNING
+            "Qt QML import directory not found under ${_sph_qt_prefix}; "
+            "running build/SPHFluidSim.exe will fail unless QML2_IMPORT_PATH is set.")
+    endif()
+endif()
+
 find_package(OpenCL)
 if(NOT OpenCL_FOUND)
     set(_cuda_root "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.1")

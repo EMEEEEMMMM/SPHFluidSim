@@ -1,6 +1,6 @@
 # SPHFluidSim — real-time implicit incompressible SPH
 
-A from-scratch, real-time reproduction of **Implicit Incompressible SPH** (Ihmsen et al., IEEE TVCG 2013) and a **Divergence-Free SPH** solver (Bender & Koschier 2017), in C++17 + OpenGL 3.3 + Qt 6 + OpenMP, running on Windows (MinGW + CMake). The desktop UI is available as both **Qt Widgets** and **Qt Quick/QML**, with four switchable skins.
+A from-scratch, real-time reproduction of **Implicit Incompressible SPH** (Ihmsen et al., IEEE TVCG 2013) and a **Divergence-Free SPH** solver (Bender & Koschier 2017), in C++17 + OpenGL 3.3 + Qt 6 + OpenMP, running on Windows and Linux. The desktop UI is available as both **Qt Widgets** and **Qt Quick/QML**, with four switchable skins.
 
 Repository: **https://github.com/EMEEEEMMMM/SPHFluidSim**
 
@@ -14,18 +14,15 @@ Repository: **https://github.com/EMEEEEMMMM/SPHFluidSim**
 
 ## Features
 
-- **IISPH solver** (paper Alg. 1): implicit density constraint via relaxed-Jacobi pressure solve (`omega = 0.5`, negative pressure clamped to 0, warm start `p^0 = 0.5 p(t-dt)`), CFL step limiter (`dt <= 0.4 d/vmax`, paper Sec.3.1), single-layer boundary particles with Akinci-2012 volumes, XSPH viscosity (Schechter & Bridson 2012, as in SPlisHSPlasH) and surface tension (Akinci et al. 2013: color-field normals + cohesion + curvature + boundary adhesion)
-- **Water surface reconstruction** (Akinci et al. 2012): color-field surface particles, distance-to-weighted-centroid scalar field `phi = |x - xbar| - r`, Marching Cubes lookup tables with shared-edge intersection reuse (watertight, crack-free), opaque fresnel water shader
-- **Parallelism** (Ihmsen et al. 2011 style): SoA spatial hash built in 3 passes — atomic count -> prefix sum -> atomic scatter; no locks, cache-friendly neighbor slices; reconstruction runs on a background thread (never stalls the render loop)
-- **Qt desktop frontends**: native Qt Widgets and Qt Quick/QML share the same simulation session, renderer and theme tokens; frameless window, pause / single step / reset, a particle-count field, solver and surface parameters, particles-only / surface-only / both view modes, FPS + tank overlay, four switchable skins
-- **Empty model scene**: the app starts with no tank and no fluid. Import multiple OBJ/STL/PLY/FBX/DAE/3DS/OFF/glTF models, plus STEP/STP CAD parts (tessellated by the built-in B-rep importer, see [STEP import](#step-cad-import)), select one in the Objects card, edit position / Euler rotation / uniform scale, or drag the world-axis translate arrows and rotation rings directly in the viewport. Selection uses an AABB + lazy BVH triangle test and a yellow stencil outline; scale stays numeric-only.
-- **Per-viewport background**: `Option → Background color...` changes only the 3D clear colour and letterbox bars. It is stored in `QSettings`, survives theme switches/restarts, and is written into headless render configs.
-- **Manual CUDA release pipeline**: a `workflow_dispatch` GitHub Actions workflow builds CUDA-enabled Windows and Linux archives, verifies the configure gate, smoke-tests `--version`, and opens a draft Release for review.
-- **Live density diagnostics**: mean density in real kg/m³ with a labelled `rho0` reference; the axis follows the data (a stable DFSPH run still fills the chart), and when rho0 lies far off that range it is reported as off-scale rather than flattening the trace. The trace is banded by the solver's density error (green ≤ 0.10 %, amber 0.10-1 %, red ≥ 1 %, i.e. an order of magnitude around the ~0.01 % a converged run holds), and hovering a sample shows sim time, step, density and Δρ
-- **DFSPH solver** (Bender & Koschier 2017, `--solver DFSPH`): constant-density + divergence-free solvers with warm start, sharing the same boundary / XSPH / surface-tension passes as IISPH
-- **Deterministic pressure solve**: the IISPH iteration reads the previous pressure and writes the next one (`m_P` / `m_Pold`, strict relaxed Jacobi), so results no longer depend on thread scheduling
-- **Headless mode**: offline simulation -> offscreen render -> ffmpeg streaming encode (frames piped straight to the encoder, no BMPs on disk; ~500 MB mp4 instead of ~90 GB of BMPs for a 14400-frame 1080p run)
-- **Particle export** (headless only): `--export-particles` dumps one binary PLY per frame for Houdini / Blender, with a disk-space pre-check before the simulation starts
+- **IISPH and DFSPH solvers** — Implicit Incompressible SPH (Ihmsen et al., TVCG 2013) and Divergence-Free SPH (Bender & Koschier 2017), selectable in the UI or with `--solver`. Both support XSPH viscosity, surface tension and wall adhesion, and the CPU solver is deterministic: the same scene reproduces the same result.
+- **Water surface** — Akinci-2012 color-field reconstruction producing a watertight Marching Cubes mesh with an opaque Fresnel shader. Reconstruction runs in the background, so the viewport stays responsive while paused.
+- **CPU and GPU backends** — OpenMP on the CPU, an optional CUDA backend via NVRTC; measured cases cover 8k / 32.8k / 125k particles, see [PERFORMANCE.md](PERFORMANCE.md).
+- **Qt desktop frontends** — native Qt Widgets and Qt Quick/QML share one simulation session and renderer: frameless window, pause / single step / reset, particle and solver parameters, view modes, FPS overlay, four skins.
+- **Empty model scene** — starts with no tank and no fluid. Import several OBJ/STL/PLY/FBX/DAE/3DS/OFF/glTF models plus STEP/STP CAD parts, then place them with the panel or the viewport arrows and rings; a click selects a model and outlines it.
+- **Per-viewport background** — `Option → Background color...` changes only the 3D clear colour and letterbox bars; it survives theme switches and restarts and is written into headless render configs.
+- **Live density diagnostics** — mean density in real kg/m³ against a labelled `rho0` line, banded green / amber / red by solver error; hover a sample for sim time, step, density and Δρ.
+- **Headless mode** — offline simulation rendered straight into ffmpeg, with no BMP frames on disk: a 14 400-frame 1080p run writes one ~500 MB mp4 instead of ~90 GB of BMPs.
+- **Particle export** — `--export-particles` writes one binary PLY per frame for Houdini / Blender, with a disk-space pre-check before the run starts.
 
 ---
 
@@ -45,203 +42,8 @@ Repository: **https://github.com/EMEEEEMMMM/SPHFluidSim**
 | CUDA Toolkit headers `cuda.h` + `nvrtc.h` (optional) | CUDA backend | headers only; no `nvcc`, no import library |
 | ffmpeg (optional) | headless mp4 output | without it the runner keeps BMP frames |
 
-### Windows (MSYS2 UCRT64, tested)
-
-```bash
-pacman -S --needed mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-cmake \
-    mingw-w64-ucrt-x86_64-ninja mingw-w64-ucrt-x86_64-assimp \
-    mingw-w64-ucrt-x86_64-qt6-base mingw-w64-ucrt-x86_64-qt6-declarative
-```
-
-```powershell
-# configure (Release + CUDA autodetected when the headers are installed)
-cmake -S . -B build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release `
-      -DCMAKE_PREFIX_PATH="C:/msys64/ucrt64"
-
-# build everything: app, tests, GPU benchmark
-cmake --build build --parallel
-
-# run the GUI
-.\build\SPHFluidSim.exe
-```
-
-`CMAKE_PREFIX_PATH` can be omitted when Qt 6 already sits in a standard prefix
-(the project also probes `D:/msys64/ucrt64`, `C:/msys64/ucrt64` and a few Qt
-install directories). The build is single-configuration, so
-`-DCMAKE_BUILD_TYPE=Release` is fixed at configure time; use `Debug` when you
-need symbols.
-
-Build options:
-
-| option | default | effect |
-|---|---|---|
-| `-DSPH_ENABLE_CUDA=ON/OFF` | `ON` | compile the CUDA backend when `cuda.h`/`nvrtc.h` are found |
-| `-DCMAKE_BUILD_TYPE=Release/Debug` | — | optimisation level |
-| `-DCMAKE_PREFIX_PATH=<qt6-prefix>` | autodetect | Qt 6 installation |
-
-Run the test suite (CPU reference, CUDA parity, model import, quaternion/transform/picking, schema and camera/drop config):
-
-```powershell
-ctest --test-dir build --output-on-failure
-```
-
-`windeployqt` alone is **not** sufficient for a MinGW build: it handles Qt but
-not the MinGW runtime, Assimp, OpenCL, NVRTC, or the `qt.conf` needed to make
-the copied Qt tree relocatable. Build a complete portable package with:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\deploy\windows.ps1
-```
-
-The script creates `dist/SPHFluidSim/` and `dist/SPHFluidSim-v1.11.0-win64.zip`.
-Copy the **entire folder or zip** to the target machine; copying only
-`SPHFluidSim.exe` will fail with missing-DLL or missing-QML-plugin errors. The
-package includes Qt and its plugins, Qt Quick/QML modules, the MinGW runtime,
-Assimp, the OpenCL ICD loader, NVRTC, `shaders/`, and `qt.conf`.
-
-The target machine still needs the NVIDIA display driver for CUDA
-(`nvcuda.dll`). Without it the app starts on the CPU backend. Offline video
-output additionally requires `ffmpeg` on `PATH`; ffmpeg is not bundled.
-
-If you already have a working Qt deployment directory and only need Qt's own
-files refreshed, `windeployqt --release --compiler-runtime <exe>` can still be
-used manually.
-
-### Linux
-
-```bash
-sudo apt install build-essential cmake ninja-build \
-    qt6-base-dev qt6-declarative-dev libassimp-dev libgl1-mesa-dev ocl-icd-opencl-dev
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build --parallel
-./build/SPHFluidSim
-```
-
-`SPH_ENABLE_CUDA=ON` (the default) also works there: the backend `dlopen`s
-`libcuda.so.1` and `libnvrtc.so`, so only the CUDA headers are needed at build
-time. Pass `-DSPH_ENABLE_CUDA=OFF` on machines without them.
-
-Build the portable Linux archive (linuxdeploy and `linuxdeploy-plugin-qt` must
-be on `PATH`, or pass `--linuxdeploy`):
-
-```bash
-bash deploy/linux.sh --build-dir build --qt-root /path/to/Qt/6.8.3/gcc_64
-```
-
-It produces `dist/SPHFluidSim-v1.11.0-linux-x86_64.tar.gz` with the AppDir-style
-tree, Qt libraries/plugins/QML modules, Assimp, the OpenCL ICD loader, the NVRTC
-runtime, shaders and README. `libcuda.so.1` is intentionally not bundled: it is
-provided by the NVIDIA driver. Run the extracted `AppRun`.
-
-The Windows executable is a native PE binary and **cannot** be copied to a Linux GPU server. Rebuild it on the server (the commands above); the CUDA kernels are compiled from the embedded source at runtime by NVRTC, so the server needs a driver plus `libnvrtc` (CUDA toolkit/runtime), not `nvcc` at build time.
-
-### CUDA backend
-
-The optional CUDA backend is compiled when `cuda.h` and `nvrtc.h` are found. It
-loads `nvcuda` and NVRTC at runtime, so no CUDA import library or `nvcc` is
-required at link time (MinGW keeps working). NVRTC installations from CUDA 11
-through 13 are discovered from `CUDA_PATH`/`CUDA_HOME` and the standard install
-directories; the same source also builds on Linux with `libcuda.so.1` and
-`libnvrtc.so`.
-
-```powershell
-# correctness: CPU vs GPU, IISPH + DFSPH
-.\build\test_cuda_parity.exe
-
-# MS/step for 8k / 32.8k, solver-only and render-synchronised
-.\build\benchmark_gpu.exe 30
-
-# add ~125k-particle cases and print max neighbor count
-.\build\benchmark_gpu.exe 10 --large
-```
-
-On Linux:
-
-```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DSPH_ENABLE_CUDA=ON
-cmake --build build --parallel
-./build/test_cuda_parity
-./build/benchmark_gpu 30 --large
-```
-
-Implementation notes:
-
-- particle state and neighbor data stay on the device; accessors synchronise
-  only the requested field, so a pure simulation loop has no per-step D2H copy;
-- the spatial hash uses device-side count/scan/scatter; each fluid pair is
-  emitted once and mirrored into both lists, halving discovery/gradient work;
-- per-pair gradient/distance is cached once per neighborhood rebuild and reused
-  by density, IISPH Jacobi iterations and both DFSPH solvers; the neighbor index
-  is packed into the gradient record, removing a separate 4-byte stream from
-  every pressure iteration;
-- DFSPH reuses its end-of-step neighborhood, density and stiffness at the next
-  step start (positions are unchanged until the next integration), eliminating
-  one full rebuild and one density pass per step;
-- DFSPH boundary pressure terms use the precomputed `gradB`, and paired passes
-  (density + stiffness, integrate + wall clamp, finalize + warm start) are fused;
-- tiny reduction/bounds readbacks use pinned host staging; redundant reductions
-  that cannot affect the mandatory minimum iteration count are skipped;
-- `SPH_CUDA_DEVICE=N` selects a GPU, `SPH_CUDA_PROFILE=1` prints build/predict/
-  solve timings, `SPH_CUDA_KERNEL_PROFILE=1` prints per-kernel device times
-  (`SPH_CUDA_KERNEL_PROFILE_SKIP=N` starts after N steps), and
-  `SPH_CUDA_DUMP_PTX=path` writes the generated PTX.
-
-The mirrored neighbor insertion uses atomic slot allocation, so CUDA results can
-differ in the last few floating-point bits between runs; the CPU reference
-remains bit-reproducible. Parity tests are tolerance-based for this reason.
-
-Measured CPU/CUDA numbers for 8k / 32.8k / 125k particles and the memory-per-particle sizing are in **[PERFORMANCE.md](PERFORMANCE.md)**. That report contains only measurements taken on the Quadro P600 test machine; no data for other GPUs is included because they were not available for testing.
-
-### GPU memory limits
-
-One fluid particle keeps about **1.6 KiB** of device memory (state, pressure / DFSPH scratch, plus 64 fluid and 48 boundary neighbor slots). The neighbor capacity dominates: 64 × 20 B + 48 × 4 B ≈ 1.45 KiB of the total.
-
-The backend measures the device budget *before* building a scene and reports the number of particles that fit on the actual card:
-
-| GPU | usable device memory | particles that fit |
-|---|---|---|
-| Quadro P600 (2 GB) | ~1.6 GB | ~870 000 |
-
-For other cards, use the pre-flight message: 1 000 000 particles need about 1 846 MiB, 10 000 000 need about 18.6 GB, and 100 000 000 need about 186 GB. The last case does not fit a single GPU; multi-GPU is not implemented.
-
-If the requested count does not fit, nothing is allocated and nothing breaks:
-
-- GUI: the particle field turns red with `needs X MB / Y MB free`, and the
-  rebuild is refused with a message in the status bar; the running scene keeps
-  stepping.
-- Headless / CLI: the runner prints the reason and exits with code 1, e.g.
-
-```
-[headless] cannot build the scene: not enough GPU memory for about 1000000 particles:
-needs about 1846 MiB, only 1619 MiB usable (1619 MiB free of 2048 MiB).
-Lower the particle count to about 867000.
-```
-
-Windows (WDDM) would otherwise silently page device memory into system RAM, which "works" but runs an order of magnitude slower, so the pre-flight check is deliberate. The CPU backend has no such limit (it is bounded by system RAM).
-
-The paper's Table 1 benchmark is **WCSPH**, not DFSPH, and explicitly excludes
-prefix-sum time. It is therefore not a like-for-like target for this project's
-IISPH/DFSPH numbers. Use the same scene and particle count when comparing GPUs.
-
-### Desktop frontends
-
-The default UI is **Qt Quick/QML**. Both frontends share the same session, renderer and four themes:
-
-```powershell
-.\build\SPHFluidSim.exe                      # QML frontend, Cupertino Dark, Empty scene
-.\build\SPHFluidSim.exe --ui widgets         # Qt Widgets frontend
-.\build\SPHFluidSim.exe --ui qml --theme 1   # Cupertino Light
-.\build\SPHFluidSim.exe --ui qml --theme 2   # Linear Dark
-.\build\SPHFluidSim.exe --ui qml --theme 3   # Swiss Light
-.\build\SPHFluidSim.exe --screenshot shot.png --delay 1500   # UI smoke test
-```
-
-| theme | name | character |
-|---|---|---|
-| `0` | Cupertino Dark | charcoal material layers, 12 px radii, Apple system blue `#0A84FF` |
-| `1` | Cupertino Light | `#F5F5F7` page, white cards, soft shadows, black selected segments, `#007AFF` |
-| `2` | Linear Dark | near-black high-density layout, 8 px radii, indigo `#6E79D6`, mono numerals |
-| `3` | Swiss Light | pure-white grid, square corners, orange-red `#E8501E`, black selected states |
+Build, packaging and deployment guides: **[Windows](docs/Windows.md)** ·
+**[Linux](docs/Linux.md)**.
 
 ### GUI controls
 
@@ -290,32 +92,6 @@ unit:
 }
 ```
 
-`rotation` is a `[w, x, y, z]` quaternion and `scale` is a uniform number.
-Schema v1 files still load (models default to empty, camera/background to the
-defaults above); every new export is v2. A missing model file is reported
-before it can be rendered. Empty is intentionally screenshot-only: headless
-render accepts only `dam` and `inflow` and rejects `empty` with a clear error.
-
-## Headless mode (offline video)
-Make sure that ffmpeg is installed on your computer.
-
-Frames are streamed directly into ffmpeg over a pipe (rawvideo), so **no BMP
-files are written** and the only disk usage is the final mp4. BMP frames are
-only written with `--no-video` (debug / manual encode) or `--keep-frames`.
-
-`--seconds` controls **video duration**, while `--time-scale` controls how much
-simulation time elapses per video second. The default `--time-scale 1` gives
-real-time playback: the runner executes as many solver steps as needed before
-each rendered frame instead of treating one solver step as one video frame.
-Use `0.1` for 10x slow motion or `2` for 2x fast motion. Changing `--fps` then
-changes only the output sampling rate, not the underlying physical trajectory.
-`--drop 3s` uses the same video timeline; at the default time scale it appears
-3 seconds into both the video and the simulation.
-
-```powershell
-.\build\SPHFluidSim.exe --headless --seconds 10 --output drop_demo
-# -> drop_demo/output.mp4 only (no frames/); default scene = dam break (open-top)
-```
 
 ### Scenes (`--scene`)
 
@@ -325,23 +101,6 @@ changes only the output sampling rate, not the underlying physical trajectory.
 | `inflow` | open-top 1.0 m cubic container with a continuous central jet falling 0.5 m from above (injects until `--particles` is reached, then stops - fixed volume) |
 | `empty` | GUI only: no tank, no fluid, models only. Rejected by headless rendering; use a screenshot instead |
 
-**Render dialog Camera / Events.** The Camera section is available for Dam and
-Inflow: presets Front / Back / Left / Right / Top / Iso / Current, editable yaw,
-pitch, distance, target XYZ and FOV, and **Use current view** to copy the live
-camera. It writes `render.camera` (`target` as `[x, y, z]`). Dam additionally
-supports one drop event with enable, time (seconds, frame count shown beside
-it), radius and XYZ; this is also written to `events`. The dialog estimates the
-drop particle count from the current spacing and adds it to the GPU budget
-warning. Inflow hides Events. No preview or orthographic projection yet.
-
-All scenes render their container/tank as a wireframe outline.
-
-**Fixed water volume**: each scene defines a physical water volume (dam 0.512 m^3, inflow 0.6 m^3; the optional drop adds a fixed 0.034 m^3 sphere); `--particles N` derives the spacing from
-`spacing = (volume / N)^(1/3)`, so 8000 or 16000 particles show the *same*
-water volume - only the resolution changes. N is a target: the lattice is built
-with `ceil(size / spacing)` per axis, so the actual count can be slightly higher
-(e.g. 1000000 → 1000000, 500000 → 512000); the printed `particles=` line always
-reports the count that was really created.
 
 ### Options
 
@@ -393,48 +152,13 @@ SPHFluidSim.exe --headless --seconds 20 --fps 120 -r 1920x1080 --particles 10000
 
 ---
 
-## Releasing (manual GitHub Actions)
-
-`VERSION` at the repository root is the single source of truth (currently
-`1.11.0`). CMake reads it, generates `version.h`, and `SPHFluidSim --version`
-prints the same string.
-
-1. Commit `.github/workflows/release.yml` and `VERSION` to the default branch.
-2. In **Settings → Actions → General → Workflow permissions**, allow
-   **Read and write** (the workflow also declares `permissions: contents: write`).
-3. Open **Actions → Release → Run workflow**. `version` may be left empty; if
-   supplied it must equal `VERSION`. `notes` may be empty. `force` only replaces
-   an existing **draft**; a published release is never overwritten.
-4. The workflow builds both packages with a hard `CUDA backend: enabled`
-   configure gate, smoke-tests `--version`, generates `SHA256SUMS`, and opens a
-   **draft** Release. Edit the notes and inspect the assets, then publish it
-   manually.
-
-The git tag, the release title and the asset names all carry the full version
-from `VERSION` (`v1.11.0`):
-
-- `SPHFluidSim-v1.11.0-win64.zip`
-- `SPHFluidSim-v1.11.0-linux-x86_64.tar.gz`
-- `SHA256SUMS`
-- `README.md`
-
-GitHub-hosted runners have no GPU, so CI compiles the CUDA backend but does not
-run CUDA parity or any kernel; `ctest` is also not run in CI. Local development
-still runs the targeted tests. End users still need an NVIDIA display driver
-(`nvcuda.dll` / `libcuda.so.1`); the packages include NVRTC but not the driver.
-Mac packaging is not part of this release line.
-
----
-
 ## References
 
-Five papers this reproduction is built on. `[n]` is the citation index used in the IISPH paper.
-
-1. **M. Ihmsen, J. Cornelis, B. Solenthaler, C. Horvath, and M. Teschner,** "Implicit incompressible SPH," *IEEE Transactions on Visualization and Computer Graphics*, vol. 20, no. 3, pp. 426-435, 2014. (main paper, also listed as TVCG 2013 early access). DOI: 10.1109/TVCG.2013.105
-2. **J. J. Monaghan,** "Smoothed particle hydrodynamics," *Reports on Progress in Physics*, vol. 68, no. 8, pp. 1703-1759, 2005. [23] DOI: 10.1088/0034-4885/68/8/R01
-3. **M. Becker and M. Teschner,** "Weakly compressible SPH for free surface flows," in *Proc. ACM SIGGRAPH/Eurographics Symposium on Computer Animation (SCA)*, San Diego, CA, 2007, pp. 209-217. [5] DOI: 10.5555/1272690.1272719 (ACM legacy DOI; confirmed via DBLP)
-4. **G. Akinci, M. Ihmsen, N. Akinci, and M. Teschner,** "Parallel surface reconstruction for particle-based fluids," *Computer Graphics Forum*, vol. 31, no. 6, pp. 1797-1809, 2012. [32] DOI: 10.1111/j.1467-8659.2012.02096.x (Note: the citation printed in the IISPH paper — "vol. 32, no. 1, pp. 99-112" — is garbled; 99-112 belongs to the Ihmsen 2011 paper below. CrossRef confirms the record above.)
-5. **M. Ihmsen, N. Akinci, M. Becker, and M. Teschner,** "A parallel SPH implementation on multi-core CPUs," *Computer Graphics Forum*, vol. 30, no. 1, pp. 99-112, 2011. [30] DOI: 10.1111/j.1467-8659.2010.01832.x
+1. **M. Ihmsen, J. Cornelis, B. Solenthaler, C. Horvath, and M. Teschner,** "Implicit incompressible SPH," *IEEE Transactions on Visualization and Computer Graphics*, vol. 20, no. 3, pp. 426-435, 2014. DOI: 10.1109/TVCG.2013.105
+2. **J. J. Monaghan,** "Smoothed particle hydrodynamics," *Reports on Progress in Physics*, vol. 68, no. 8, pp. 1703-1759, 2005. DOI: 10.1088/0034-4885/68/8/R01
+3. **M. Becker and M. Teschner,** "Weakly compressible SPH for free surface flows," in *Proc. ACM SIGGRAPH/Eurographics Symposium on Computer Animation (SCA)*, San Diego, CA, 2007, pp. 209-217. DOI: 10.5555/1272690.1272719
+4. **G. Akinci, M. Ihmsen, N. Akinci, and M. Teschner,** "Parallel surface reconstruction for particle-based fluids," *Computer Graphics Forum*, vol. 31, no. 6, pp. 1797-1809, 2012. DOI: 10.1111/j.1467-8659.2012.02096.x
+5. **M. Ihmsen, N. Akinci, M. Becker, and M. Teschner,** "A parallel SPH implementation on multi-core CPUs," *Computer Graphics Forum*, vol. 30, no. 1, pp. 99-112, 2011. DOI: 10.1111/j.1467-8659.2010.01832.x
 
 ---
 
@@ -442,36 +166,3 @@ Five papers this reproduction is built on. `[n]` is the citation index used in t
 The notes I took when I was working on this project are all on [my blog](https://emeeeemmmm.github.io/).
 
 Deepseek v4 Flash was used during this project.
-
-## STEP (CAD) import
-
-`File > Import 3D Model` and the Objects card accept `.step` / `.stp` in addition
-to the Assimp formats. STEP is not a triangle mesh, so it is not routed through
-Assimp: `src/StepImporter.cpp` parses the ISO 10303-21 exchange structure and
-tessellates the boundary representation itself.
-
-* Supported surfaces: faceted B-rep, plane, cylinder, cone, sphere and torus.
-  Boundary curves: line, circle, ellipse, polyline, composite and (rational)
-  B-spline curves, trimmed curves and `SURFACE_CURVE` / `SEAM_CURVE` wrappers.
-* Faces on B-spline or swept surfaces are skipped individually and reported in
-  the import message; the rest of the part still loads.
-* Length units are honoured (`SI_UNIT(.MILLI.,.METRE.)`, inch/foot conversion
-  units) and converted to metres, so a 35 mm bracket imports 0.035 m wide. The
-  import message reports the size in millimetres and the viewport frames the
-  new model, which keeps true-scale CAD parts readable.
-* CAD files are Z-up; the importer rotates them into the Y-up world
-  (`(x, y, z) -> (x, z, -y)`), so parts stand upright in the tank.
-* Shell orientation is normalised outwards, and the mesh is flat-shaded with
-  per-face normals so machined edges stay crisp.
-* The exact CAD boundary curves are uploaded as a line list and drawn as dark
-  feature edges, so hole rims and machined corners read the way they do in
-  SolidWorks. Every authored face is kept as-is, including the small coplanar
-  disk patches some exporters place over a bore: they are part of the design and
-  are what makes the circle pattern read as circles rather than as voids.
-* Planar faces are validated after triangulation (covered area vs trimmed
-  region); a face that cannot be triangulated exactly is skipped and reported
-  instead of being drawn as a stray wedge.
-
-Curved faces are trimmed in the surface's own (u, v) parameter plane: boundary
-loops are projected there, holes are bridged and ear-clipped, and the interior
-is densified on a grid whose spacing follows the local radius of curvature.
