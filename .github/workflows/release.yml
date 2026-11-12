@@ -151,7 +151,9 @@ jobs:
           update: true
           path-type: minimal
           # qt6-base provides windeployqt; qt6-declarative provides Qt Quick /
-          # QuickControls2 / QML; ocl-icd provides OpenCL.dll.
+          # QuickControls2 / QML. The OpenCL ICD loader is installed in its own
+          # step below because it is optional and its package name has changed
+          # before (ocl-icd -> opencl-icd).
           install: >-
             mingw-w64-ucrt-x86_64-gcc
             mingw-w64-ucrt-x86_64-cmake
@@ -161,7 +163,16 @@ jobs:
             mingw-w64-ucrt-x86_64-qt6-declarative
             mingw-w64-ucrt-x86_64-qt6-tools
             mingw-w64-ucrt-x86_64-assimp
-            mingw-w64-ucrt-x86_64-ocl-icd
+
+      # Optional: the app falls back to the CPU backend when no ICD loader is
+      # present, and deploy/windows.ps1 already tolerates a missing OpenCL.dll.
+      # Keeping it out of the `install:` list means a rename upstream can never
+      # abort the whole release again.
+      - name: Install OpenCL ICD loader (optional)
+        shell: msys2 {0}
+        run: |
+          pacman -S --noconfirm --needed --overwrite '*' mingw-w64-ucrt-x86_64-opencl-icd \
+            || echo "::warning::mingw-w64-ucrt-x86_64-opencl-icd unavailable; the archive will ship without OpenCL.dll"
 
       # Jimver/cuda-toolkit installs the full toolkit: cuda.h, nvrtc.h and the
       # NVRTC runtime DLLs, and writes CUDA_PATH into GITHUB_ENV. The action's
@@ -284,14 +295,29 @@ jobs:
 
       # aqtinstall via install-qt-action exports CMAKE_PREFIX_PATH / Qt6_DIR /
       # QT_ROOT_DIR into the environment for the later cmake + packaging steps.
+      #
+      # Do NOT list `qtdeclarative` here: for Qt 6 it is a base archive that aqt
+      # installs as part of the desktop target, and asking for it as a module
+      # makes aqt abort with "packages ['qtdeclarative'] were not found".
+      # `qtshadertools` really is an add-on module (Qt Quick Effects needs it).
       - name: Install Qt 6.8
         uses: jurplel/install-qt-action@v4
         with:
           version: '6.8.3'
           host: linux
           target: desktop
-          modules: qtdeclarative qtshadertools
+          modules: qtshadertools
           cache: true
+
+      # Fail here, with a clear message, if the desktop base ever stops shipping
+      # Qt Quick; otherwise the error only shows up much later inside CMake.
+      - name: Verify Qt Quick is present
+        run: |
+          set -euo pipefail
+          test -d "$QT_ROOT_DIR/lib/cmake/Qt6Quick" || {
+            echo "::error::Qt6Quick not found in $QT_ROOT_DIR - the Qt desktop base package did not include qtdeclarative"
+            exit 1
+          }
 
       # Full network install -> /usr/local/cuda/{include,lib64} with cuda.h,
       # nvrtc.h and libnvrtc.so* (the latter is bundled by deploy/linux.sh).
