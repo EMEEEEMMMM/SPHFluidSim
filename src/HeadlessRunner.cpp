@@ -17,6 +17,7 @@
 #else
 #include <sys/stat.h>
 #include <sys/statvfs.h>
+#include <unistd.h>   // rmdir
 #endif
 
 #include "HeadlessRunner.hpp"
@@ -45,12 +46,16 @@
 #include <omp.h>
 
 // The ffmpeg pipe uses the C runtime's popen; only the spelling differs.
+// rmdir is declared in <unistd.h> on POSIX and as _rmdir in <direct.h> on
+// Windows; both take the path only (the Windows CRT adds the directory flag).
 #if defined(_WIN32)
 #define SPH_POPEN  _popen
 #define SPH_PCLOSE _pclose
+#define SPH_RMDIR  _rmdir
 #else
 #define SPH_POPEN  popen
 #define SPH_PCLOSE pclose
+#define SPH_RMDIR  rmdir
 #endif
 
 namespace {
@@ -674,7 +679,7 @@ int RunHeadless(const HeadlessOptions& opt) {
                     snprintf(name, sizeof(name), "%s/frame_%04d.bmp", framesDir.c_str(), k);
                     ::remove(name);
                 }
-                _rmdir(framesDir.c_str());   // succeeds only when empty
+                SPH_RMDIR(framesDir.c_str());   // succeeds only when empty
             }
         } else {
             printf("[headless] ffmpeg not found - frames saved in %s/frames/, install ffmpeg to assemble a video\n", dir.c_str());

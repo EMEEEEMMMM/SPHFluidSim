@@ -159,8 +159,12 @@ jobs:
           # QuickControls2 / QML. The OpenCL ICD loader is installed in its own
           # step below because it is optional and its package name has changed
           # before (ocl-icd -> opencl-icd).
+          # libgomp is an *optional* dependency of the GCC package: without it
+          # -fopenmp compiles but cannot link (libgomp.dll.a is missing), so it
+          # must be requested explicitly.
           install: >-
             mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-libgomp
             mingw-w64-ucrt-x86_64-cmake
             mingw-w64-ucrt-x86_64-ninja
             mingw-w64-ucrt-x86_64-pkgconf

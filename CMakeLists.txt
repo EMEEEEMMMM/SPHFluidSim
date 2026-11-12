@@ -73,7 +73,8 @@ if(NOT TARGET OpenMP::OpenMP_CXX)
     else()
         message(FATAL_ERROR
             "OpenMP is not usable: the compiler rejects -fopenmp. "
-            "Install the GCC OpenMP runtime (libgomp, shipped with gcc-libs) and reconfigure.")
+            "On MSYS2 install mingw-w64-ucrt-x86_64-libgomp (it is an optional GCC "
+            "dependency, so it is not pulled in automatically); on Linux install libgomp.")
     endif()
 endif()
 find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets Quick QuickControls2 OpenGL OpenGLWidgets)
