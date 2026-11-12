@@ -1,5 +1,6 @@
-// windows.h pulls in min/max macros that would break std::min/std::max below,
-// and we only need GetDiskFreeSpaceExA.
+// Windows-only helpers live behind _WIN32: the headless renderer must build on
+// Linux too (the release pipeline compiles it there).
+#if defined(_WIN32)
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
@@ -11,6 +12,12 @@
 // Matrix4::Persp/Ortho parameters used by the GL layer.
 #undef near
 #undef far
+#include <direct.h>   // _mkdir
+#include <io.h>       // _popen / _pclose (MinGW)
+#else
+#include <sys/stat.h>
+#include <sys/statvfs.h>
+#endif
 
 #include "HeadlessRunner.hpp"
 #include "FluidSolver.hpp"
@@ -31,13 +38,20 @@
 #include <string>
 #include <thread>
 #include <vector>
-#include <io.h>   // _popen / _pclose (MinGW)
 #include <algorithm>
 #include <stdexcept>
 #include <sys/stat.h>
 #include <sys/types.h>
-#include <direct.h>
 #include <omp.h>
+
+// The ffmpeg pipe uses the C runtime's popen; only the spelling differs.
+#if defined(_WIN32)
+#define SPH_POPEN  _popen
+#define SPH_PCLOSE _pclose
+#else
+#define SPH_POPEN  popen
+#define SPH_PCLOSE pclose
+#endif
 
 namespace {
 
@@ -126,7 +140,11 @@ struct RenderControl {
 
 
 bool MakeDirs(const std::string& dir) {
+#if defined(_WIN32)
     if (_mkdir(dir.c_str()) == 0) return true;
+#else
+    if (mkdir(dir.c_str(), 0777) == 0) return true;
+#endif
     return errno == EEXIST;   // already exists is fine; anything else is not
 }
 
@@ -196,6 +214,7 @@ unsigned long long EstimateParticleDumpBytes(int particles, int frames) {
 }
 
 bool FreeDiskBytes(const std::string& path, unsigned long long& freeBytes) {
+#if defined(_WIN32)
     char full[_MAX_PATH];
     if (!_fullpath(full, path.c_str(), _MAX_PATH)) return false;
     if (full[1] != ':') return false;               // not a drive-absolute path
@@ -204,6 +223,13 @@ bool FreeDiskBytes(const std::string& path, unsigned long long& freeBytes) {
     if (!GetDiskFreeSpaceExA(root, &avail, nullptr, nullptr)) return false;
     freeBytes = avail.QuadPart;
     return true;
+#else
+    struct statvfs info;
+    if (statvfs(path.c_str(), &info) != 0) return false;
+    freeBytes = static_cast<unsigned long long>(info.f_bavail) *
+                static_cast<unsigned long long>(info.f_frsize);
+    return true;
+#endif
 }
 
 bool WriteParticlePLY(const std::string& path, const std::vector<Math::Vector3>& pos,
@@ -415,7 +441,7 @@ int RunHeadless(const HeadlessOptions& opt) {
                           " -framerate " + std::to_string(opt.fps) +
                           " -i pipe:0 -c:v libx264 -preset veryfast -pix_fmt yuv420p -crf 18 \"" +
                           dir + "/output.mp4\"";
-        pipe = _popen(cmd.c_str(), "wb");
+        pipe = SPH_POPEN(cmd.c_str(), "wb");
         if (!pipe) {
             printf("[headless] WARNING: could not start ffmpeg pipe, falling back to BMP frames\n");
             if (!MakeDirs(framesDir)) {
@@ -590,7 +616,7 @@ int RunHeadless(const HeadlessOptions& opt) {
 
     if (cancelled) {
         if (pipe) {
-            _pclose(pipe);
+            SPH_PCLOSE(pipe);
             pipe = nullptr;
         }
         control.ReportProgress(lastFrame, opt.frames,
@@ -615,7 +641,7 @@ int RunHeadless(const HeadlessOptions& opt) {
     // code is the real success signal (previously ignored -> "No space left on
     // device" was reported as success).
     if (pipe) {
-        const int rc = _pclose(pipe);
+        const int rc = SPH_PCLOSE(pipe);
         if (rc == 0) {
             printf("[headless] video written to %s/output.mp4\n", dir.c_str());
         } else {

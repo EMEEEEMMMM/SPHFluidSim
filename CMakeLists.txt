@@ -40,7 +40,42 @@ if(NOT DEFINED CMAKE_PREFIX_PATH AND NOT DEFINED Qt6_DIR)
 endif()
 
 find_package(OpenGL REQUIRED)
-find_package(OpenMP REQUIRED)
+
+# OpenMP ---------------------------------------------------------------------
+# FindOpenMP's probe is version sensitive: with a brand-new GCC it can report
+# "missing: OpenMP_C_FLAGS OpenMP_C_LIB_NAMES" even though -fopenmp compiles
+# and links fine (this broke the MSYS2 GCC 16 release build). Try the module
+# first, then fall back to testing the flags directly.
+find_package(OpenMP QUIET)
+if(NOT TARGET OpenMP::OpenMP_CXX)
+    include(CheckCXXSourceCompiles)
+    set(_sph_saved_required_flags "${CMAKE_REQUIRED_FLAGS}")
+    set(CMAKE_REQUIRED_FLAGS "${CMAKE_REQUIRED_FLAGS} -fopenmp")
+    check_cxx_source_compiles(
+        "#include <omp.h>\nint main(){ return omp_get_max_threads() > 0 ? 0 : 1; }"
+        SPH_OPENMP_FLAG_WORKS)
+    set(CMAKE_REQUIRED_FLAGS "${_sph_saved_required_flags}")
+
+    if(SPH_OPENMP_FLAG_WORKS)
+        message(STATUS "OpenMP: FindOpenMP could not detect it; using -fopenmp directly")
+        if(NOT TARGET OpenMP::OpenMP_CXX)
+            add_library(OpenMP::OpenMP_CXX INTERFACE IMPORTED)
+            set_target_properties(OpenMP::OpenMP_CXX PROPERTIES
+                INTERFACE_COMPILE_OPTIONS "-fopenmp"
+                INTERFACE_LINK_OPTIONS "-fopenmp")
+        endif()
+        if(NOT TARGET OpenMP::OpenMP_C)
+            add_library(OpenMP::OpenMP_C INTERFACE IMPORTED)
+            set_target_properties(OpenMP::OpenMP_C PROPERTIES
+                INTERFACE_COMPILE_OPTIONS "-fopenmp"
+                INTERFACE_LINK_OPTIONS "-fopenmp")
+        endif()
+    else()
+        message(FATAL_ERROR
+            "OpenMP is not usable: the compiler rejects -fopenmp. "
+            "Install the GCC OpenMP runtime (libgomp, shipped with gcc-libs) and reconfigure.")
+    endif()
+endif()
 find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets Quick QuickControls2 OpenGL OpenGLWidgets)
 
 find_package(OpenCL)
