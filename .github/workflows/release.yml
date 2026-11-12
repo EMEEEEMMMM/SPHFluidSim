@@ -2,14 +2,19 @@
 #
 # Jobs: prepare -> { windows, linux } -> release
 #   prepare : validate VERSION, derive tag/asset names, refuse collisions
-#   windows : MSYS2 UCRT64 (Qt6/assimp/ocl-icd) + CUDA toolkit, build + package
-#   linux   : Ubuntu 24.04 + Qt 6.8 (aqt) + apt assimp/ocl-icd + CUDA, build + package
+#   windows : MSYS2 UCRT64 (Qt6/assimp/opencl-icd) + CUDA redist, build + package
+#   linux   : Ubuntu 24.04 + Qt 6.8 (aqt) + apt assimp/opencl + CUDA redist, build + package
 #   release : checksum both archives, open a DRAFT GitHub Release
 #
 # GitHub-hosted runners have NO GPU. This pipeline only COMPILES the CUDA
 # backend (it needs cuda.h / nvrtc.h; the driver/NVRTC libraries are loaded at
 # runtime via NVRTC) and runs a `--version` smoke test. It deliberately does
 # NOT run ctest and does NOT run CUDA parity tests or any CUDA kernel.
+#
+# CUDA comes from NVIDIA's per-component redistributable archives
+# (developer.download.nvidia.com/compute/cuda/redist), not from the multi-GB
+# toolkit installer: only two headers are needed to compile, and the NVRTC
+# runtime is what gets bundled.
 #
 # Shells: `windows-latest` defaults to pwsh, so every cmake/build/smoke step
 # explicitly uses `shell: msys2 {0}` (MSYS2 UCRT64 bash) while the packaging
@@ -174,37 +179,66 @@ jobs:
           pacman -S --noconfirm --needed --overwrite '*' mingw-w64-ucrt-x86_64-opencl-icd \
             || echo "::warning::mingw-w64-ucrt-x86_64-opencl-icd unavailable; the archive will ship without OpenCL.dll"
 
-      # Jimver/cuda-toolkit installs the full toolkit: cuda.h, nvrtc.h and the
-      # NVRTC runtime DLLs, and writes CUDA_PATH into GITHUB_ENV. The action's
-      # own GitHub cache is enabled so the large download is reused.
-      - name: Install CUDA toolkit (headers + NVRTC runtime)
-        id: cuda
-        uses: Jimver/cuda-toolkit@v0.2.15
-        with:
-          cuda: '12.1.0'
-          method: network
-          use-github-cache: true
+      # The backend only needs the *headers* at build time (the driver and NVRTC
+      # are opened with LoadLibrary at runtime), and the archive needs the NVRTC
+      # DLLs. Installing the 4 GB toolkit for that is slow and its silent
+      # installer can hang on a hosted runner, so pull NVIDIA's two small
+      # redistributable archives instead (~190 MB, plain HTTPS).
+      #
+      # The archives are .zip, and plain `tar.exe` on a runner may resolve to
+      # Git for Windows' GNU tar, which cannot read zip. Expand-Archive is a
+      # PowerShell cmdlet, so PATH cannot shadow it.
+      - name: Install CUDA headers + NVRTC (redistributable archives)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = 'C:\cuda'
+          New-Item -ItemType Directory -Force -Path $root | Out-Null
+          $base = 'https://developer.download.nvidia.com/compute/cuda/redist'
+          $tmp  = Join-Path $env:RUNNER_TEMP 'cuda-redist'
+
+          curl.exe -fsSL --retry 3 -o "${tmp}-cudart.zip" `
+            "$base/cuda_cudart/windows-x86_64/cuda_cudart-windows-x86_64-12.6.77-archive.zip"
+          curl.exe -fsSL --retry 3 -o "${tmp}-nvrtc.zip" `
+            "$base/cuda_nvrtc/windows-x86_64/cuda_nvrtc-windows-x86_64-12.6.85-archive.zip"
+          if ($LASTEXITCODE -ne 0) { throw "CUDA archive download failed ($LASTEXITCODE)" }
+
+          foreach ($name in 'cudart', 'nvrtc') {
+            $zipPath = "${tmp}-${name}.zip"
+            $stage   = Join-Path $env:RUNNER_TEMP "cuda-stage-${name}"
+            if (Test-Path $stage) { Remove-Item -LiteralPath $stage -Recurse -Force }
+            Expand-Archive -Path $zipPath -DestinationPath $stage -Force
+            $inner = Get-ChildItem -LiteralPath $stage -Directory | Select-Object -First 1
+            if (-not $inner) { throw "Unexpected layout in $zipPath" }
+            Copy-Item -Path (Join-Path $inner.FullName '*') -Destination $root -Recurse -Force
+            Remove-Item -LiteralPath $stage -Recurse -Force
+          }
+
+          foreach ($f in 'include\cuda.h', 'include\nvrtc.h', 'bin\nvrtc64_120_0.dll') {
+            if (-not (Test-Path (Join-Path $root $f))) { throw "CUDA archive is missing $f" }
+          }
+
+          "CUDA_PATH=C:/cuda" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding ascii
+          "CUDA_HOME=C:/cuda" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding ascii
 
       # windows-latest defaults to pwsh; cmake/build MUST run inside the MSYS2
       # UCRT64 shell so gcc, ninja, Qt6 and assimp resolve correctly.
       - name: Configure (MSYS2 bash) and enforce the CUDA gate
         shell: msys2 {0}
-        env:
-          CUDA_PATH_WIN: ${{ steps.cuda.outputs.CUDA_PATH }}
-          CUDA_PATH_ENV: ${{ env.CUDA_PATH }}
         run: |
           set -euo pipefail
 
           # Keep native Windows CUDA paths intact when MSYS2 launches cmake.exe.
           export MSYS2_ENV_CONV_EXCL='CUDA_PATH;CUDA_HOME'
-          CUDA_ROOT="${CUDA_PATH_WIN:-${CUDA_PATH_ENV:-}}"
-          [ -n "$CUDA_ROOT" ] || CUDA_ROOT='C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.1'
+          CUDA_ROOT="${CUDA_PATH:-/c/cuda}"
+          [ -n "$CUDA_ROOT" ] || CUDA_ROOT=/c/cuda
           CUDA_ROOT="${CUDA_ROOT//\\//}"          # backslashes -> forward slashes
           export CUDA_PATH="$CUDA_ROOT"
           export CUDA_HOME="$CUDA_ROOT"
+          CUDA_CHECK="$(cygpath -u "$CUDA_ROOT" 2>/dev/null || printf '%s' "$CUDA_ROOT")"
 
-          test -f "$CUDA_ROOT/include/cuda.h"  || { echo "::error::cuda.h not found in $CUDA_ROOT/include"; exit 1; }
-          test -f "$CUDA_ROOT/include/nvrtc.h" || { echo "::error::nvrtc.h not found in $CUDA_ROOT/include"; exit 1; }
+          test -f "$CUDA_CHECK/include/cuda.h"  || { echo "::error::cuda.h not found in $CUDA_ROOT/include"; exit 1; }
+          test -f "$CUDA_CHECK/include/nvrtc.h" || { echo "::error::nvrtc.h not found in $CUDA_ROOT/include"; exit 1; }
 
           # Derive the Qt prefix from windeployqt instead of hard-coding C:/msys64.
           QT_BIN="$(cd "$(dirname "$(command -v windeployqt)")" && pwd)"
@@ -243,16 +277,14 @@ jobs:
       - name: Package with deploy/windows.ps1 (pwsh)
         shell: pwsh
         env:
-          CUDA_PATH_WIN: ${{ steps.cuda.outputs.CUDA_PATH }}
           MSYS2_LOCATION: ${{ steps.msys2.outputs.msys2-location }}
         run: |
           $ErrorActionPreference = 'Stop'
           $msysRoot = $env:MSYS2_LOCATION
           if (-not $msysRoot -or -not (Test-Path -LiteralPath $msysRoot)) { $msysRoot = 'C:\msys64' }
           $qtBin = Join-Path $msysRoot 'ucrt64\bin'
-          $cudaRoot = $env:CUDA_PATH_WIN
-          if (-not $cudaRoot) { $cudaRoot = $env:CUDA_PATH }
-          if (-not $cudaRoot) { $cudaRoot = "${env:ProgramFiles}\NVIDIA GPU Computing Toolkit\CUDA\v12.1" }
+          $cudaRoot = $env:CUDA_PATH
+          if (-not $cudaRoot) { $cudaRoot = 'C:\cuda' }
           ./deploy/windows.ps1 `
             -BuildDir 'build' `
             -Output  "dist/$env:WIN_ASSET" `
@@ -319,15 +351,27 @@ jobs:
             exit 1
           }
 
-      # Full network install -> /usr/local/cuda/{include,lib64} with cuda.h,
-      # nvrtc.h and libnvrtc.so* (the latter is bundled by deploy/linux.sh).
-      - name: Install CUDA toolkit (headers + libnvrtc)
-        id: cuda
-        uses: Jimver/cuda-toolkit@v0.2.15
-        with:
-          cuda: '12.6.3'
-          method: network
-          use-github-cache: true
+      # Same idea as the Windows job: only cuda.h / nvrtc.h are needed to
+      # compile, and libnvrtc.so* is bundled by deploy/linux.sh. NVIDIA's
+      # redistributable archives are ~35 MB in total and never need a silent
+      # multi-gigabyte installer (or a toolkit version that the action may not
+      # know about).
+      - name: Install CUDA headers + NVRTC (redistributable archives)
+        run: |
+          set -euo pipefail
+          base=https://developer.download.nvidia.com/compute/cuda/redist
+          curl -fL --retry 3 -o /tmp/cudart.tar.xz \
+            "$base/cuda_cudart/linux-x86_64/cuda_cudart-linux-x86_64-12.6.77-archive.tar.xz"
+          curl -fL --retry 3 -o /tmp/nvrtc.tar.xz \
+            "$base/cuda_nvrtc/linux-x86_64/cuda_nvrtc-linux-x86_64-12.6.85-archive.tar.xz"
+
+          sudo mkdir -p /usr/local/cuda
+          sudo tar -xJf /tmp/cudart.tar.xz -C /usr/local/cuda --strip-components=1
+          sudo tar -xJf /tmp/nvrtc.tar.xz  -C /usr/local/cuda --strip-components=1
+
+          test -f /usr/local/cuda/include/cuda.h  || { echo "::error::cuda.h missing"; exit 1; }
+          test -f /usr/local/cuda/include/nvrtc.h || { echo "::error::nvrtc.h missing"; exit 1; }
+          ls -l /usr/local/cuda/lib/libnvrtc.so*
 
       - name: Configure and enforce the CUDA gate
         shell: bash

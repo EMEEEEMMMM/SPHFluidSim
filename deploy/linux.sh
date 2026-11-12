@@ -182,7 +182,10 @@ copy_glob "$LIBDIR" "/usr/lib/x86_64-linux-gnu/libOpenCL.so*" "/usr/lib64/libOpe
 
 if [ -d "$CUDA_ROOT" ]; then
   echo "Collecting NVRTC runtime from $CUDA_ROOT ..."
-  copy_glob "$LIBDIR" "$CUDA_ROOT/lib64/libnvrtc.so*" "$CUDA_ROOT/lib64/libnvrtc-builtins.so*" \
+  # A full toolkit installs into lib64/, the redistributable archives use lib/.
+  copy_glob "$LIBDIR" \
+    "$CUDA_ROOT/lib64/libnvrtc.so*" "$CUDA_ROOT/lib64/libnvrtc-builtins.so*" \
+    "$CUDA_ROOT/lib/libnvrtc.so*" "$CUDA_ROOT/lib/libnvrtc-builtins.so*" \
     || { echo "warning: NVRTC libraries not found; CUDA backend will fall back to CPU" >&2; }
 fi
 
