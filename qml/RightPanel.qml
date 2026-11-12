@@ -6,6 +6,9 @@ import IISPH.Theme
 Flickable {
     id: panel
     property var session
+    // Main.qml binds isEmpty, cameraSource, fieldOfView and cameraMode here.
+    property bool isEmpty: false
+    property var cameraSource        // Main.qml viewportProbe
 
     signal solverRequested(int solver)
     signal backendRequested(int backend)
@@ -28,16 +31,32 @@ Flickable {
     property bool sceneHud: true
     property real fieldOfView: 45
     property int cameraMode: 0
+    // Live camera readback for the compact "current settings" line. Refreshed
+    // by a timer because the viewport has no per-frame QML signal.
+    property var liveCamera: ({})
+
+    Component.onCompleted: panel.refreshCameraSummary()
 
     ColumnLayout {
         id: column
         width: panel.width
         spacing: panel.m.cardGap
 
+        // Empty scene: model list lives alongside the camera/overlay cards.
+        ObjectsPanel {
+            Layout.fillWidth: true
+            Layout.preferredHeight: implicitHeight
+            session: panel.session
+            // The card stays available in fluid scenes so the disabled Import
+            // state is visible; scene switches clear its contents.
+            importEnabled: panel.isEmpty
+        }
+
         Card {
             title: "Solver"
             badge: (panel.p.solver !== undefined && panel.p.solver === 1) ? "DFSPH" : "IISPH"
             Layout.fillWidth: true
+            visible: !panel.isEmpty
 
             Segmented {
                 Layout.fillWidth: true
@@ -133,6 +152,7 @@ Flickable {
             title: "Forces"
             badge: "Sec. 5"
             Layout.fillWidth: true
+            visible: !panel.isEmpty
 
             SliderRow {
                 Layout.fillWidth: true
@@ -161,6 +181,7 @@ Flickable {
             title: "Surface"
             badge: "Akinci 2012"
             Layout.fillWidth: true
+            visible: !panel.isEmpty
 
             SliderRow {
                 Layout.fillWidth: true
@@ -197,6 +218,27 @@ Flickable {
                 onActivated: (index) => panel.cameraModeRequested(index)
             }
 
+            // Presets reuse the shared editor in "presets-only" mode: no
+            // numeric fields and no duplicate Reset button here.
+            CameraSection {
+                id: cameraPresets
+                Layout.fillWidth: true
+                session: panel.session
+                cameraSource: panel.cameraSource
+                live: true
+                showFields: false
+                showActions: false
+            }
+
+            Text {
+                Layout.fillWidth: true
+                text: panel.cameraSummary()
+                color: panel.c.fg3
+                font.pixelSize: 10
+                font.family: panel.m.numberFamily
+                elide: Text.ElideRight
+            }
+
             SliderRow {
                 id: fovRow
                 Layout.fillWidth: true
@@ -204,6 +246,22 @@ Flickable {
                 from: 20; to: 75; decimals: 0; suffix: "°"
                 value: panel.fieldOfView
                 onEdited: (v) => panel.fovEdited(v)
+            }
+
+            SliderRow {
+                id: speedRow
+                Layout.fillWidth: true
+                // Orbit / pan / fly sensitivity; the viewport exposes it as a
+                // plain property so the slider stays optional for old builds.
+                readonly property bool supported:
+                    panel.cameraSource && panel.cameraSource.cameraSpeed !== undefined
+                visible: supported
+                label: "Camera speed"
+                from: 0.2; to: 3.0; decimals: 1; suffix: "x"
+                value: supported ? panel.cameraSource.cameraSpeed : 1.0
+                onEdited: (v) => {
+                    if (speedRow.supported) panel.cameraSource.cameraSpeed = v;
+                }
             }
 
             Rectangle {
@@ -251,6 +309,31 @@ Flickable {
 
     function setFieldOfView(value) {
         fovRow.value = value;
+    }
+
+    function refreshCameraSummary() {
+        if (panel.cameraSource && panel.cameraSource.currentCamera !== undefined) {
+            const cfg = panel.cameraSource.currentCamera();
+            panel.liveCamera = cfg !== undefined && cfg !== null ? cfg : ({});
+        }
+    }
+
+    function cameraSummary() {
+        const o = panel.liveCamera ? panel.liveCamera : ({});
+        const fov = Math.round(panel.fieldOfView);
+        if (o.yaw !== undefined && o.pitch !== undefined && o.distance !== undefined)
+            return "yaw " + Number(o.yaw).toFixed(0) + "°"
+                   + "  ·  pitch " + Number(o.pitch).toFixed(0) + "°"
+                   + "  ·  " + Number(o.distance).toFixed(2) + " m"
+                   + "  ·  fov " + fov + "°";
+        return "fov " + fov + "°";
+    }
+
+    Timer {
+        interval: 300
+        repeat: true
+        running: panel.visible
+        onTriggered: panel.refreshCameraSummary()
     }
 
     signal fovEdited(real value)

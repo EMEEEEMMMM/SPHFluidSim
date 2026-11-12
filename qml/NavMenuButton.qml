@@ -24,7 +24,7 @@ Button {
 
     background: Rectangle {
         radius: root.m.square ? 0 : root.m.radiusSm
-        color: root.hovered || menu.visible ? root.c.chip : "transparent"
+        color: root.enabled && (root.hovered || menu.visible) ? root.c.chip : "transparent"
 
         Behavior on color {
             ColorAnimation { duration: 110; easing.type: Easing.OutCubic }
@@ -34,7 +34,9 @@ Button {
     contentItem: Text {
         id: label
         text: root.text
-        color: root.hovered || menu.visible ? root.c.fg : root.c.fg2
+        color: !root.enabled
+               ? root.c.fg3
+               : (root.hovered || menu.visible ? root.c.fg : root.c.fg2)
         font.pixelSize: 11
         font.weight: Font.Medium
         horizontalAlignment: Text.AlignHCenter

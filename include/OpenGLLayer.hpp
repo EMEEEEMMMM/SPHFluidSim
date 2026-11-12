@@ -4,13 +4,17 @@
 #include <cstdint>
 #include <iostream>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 #include "FrameBuffer.hpp"
 #include "Shader.h"
 #include "Camera.hpp"
+#include "Math/Matrix4.hpp"
 #include "Math/Vector3.hpp"
 #include "Model.hpp"
-#include <vector>
+#include "Render/CameraRig.hpp"
 
 enum class ProjectionMode { Perspective, Orthographic };
 
@@ -33,7 +37,7 @@ public:
             m_CurrentMode = ProjectionMode::Perspective;
             std::cout << "Switch to Perspective projection" << std::endl;
         }
-        
+
     }
 
     Camera& GetCamera() { return m_Camera; }
@@ -51,9 +55,29 @@ public:
     // indices = triangles. Drawn with the Phong surface shader when visible.
     void UpdateSurfaceMesh(const std::vector<float>& verts, const std::vector<unsigned>& indices);
 
-    // Imported visual asset. This path owns separate GL buffers from the
-    // asynchronously rebuilt water surface. A null pointer clears the model.
+    // v2 multi-model path. Every ModelInstance gets its own VAO/VBO/EBO,
+    // cached by its (immutable) ModelData so several instances of the same
+    // imported file share one GPU upload. `selectedId` drives the yellow
+    // stencil outline and the transform gizmo. Passing a null/empty snapshot
+    // clears all models. Must be called from the render thread (it may create
+    // or delete GL buffers).
+    void UpdateModels(const ModelSnapshotPtr& models, int selectedId);
+
+    // Compatibility wrapper: draws one unselected model with an identity
+    // transform. Kept so existing callers of the pre-v2 single-model API keep
+    // working.
     void UpdateModel(const ModelDataPtr& model);
+
+    // 0..1 linear RGB used for the 3D clear colour (also the headless default).
+    void SetViewportBackground(const float rgb[3]) {
+        m_Bg[0] = rgb[0];
+        m_Bg[1] = rgb[1];
+        m_Bg[2] = rgb[2];
+    }
+
+    // scene encoding: 0 = dam, 1 = inflow, 2 = empty. Empty skips tank /
+    // particles / surface (models + gizmo + outline are still drawn).
+    void SetSceneIndex(int scene) { m_SceneIndex = scene; }
 
     void SetSurfaceVisible(bool v) { m_ShowSurface = v; }
     void SetParticlesVisible(bool v) { m_ShowParticles = v; }
@@ -61,7 +85,31 @@ public:
     int  SurfaceTriangleCount() const { return m_MeshIndexCount / 3; }
 
 private:
+    // One GPU buffer set per distinct ModelData.
+    struct GpuModel {
+        GLuint vao = 0;
+        GLuint vbo = 0;
+        GLuint ebo = 0;
+        GLsizei indexCount = 0;
+        // Optional CAD boundary line list (STEP): drawn as dark feature edges.
+        GLuint edgeVao = 0;
+        GLuint edgeVbo = 0;
+        GLsizei edgeVertexCount = 0;
+        uint64_t dataVersion = 0;   // fingerprint of vertices/indices sizes
+    };
+
     void InitGeometry();
+    void InitInlinePrograms();
+    void ReleaseGpuModels();
+    void EnsureGpuModel(const ModelData* data);
+    const ModelInstance* SelectedInstance() const;
+    void DrawSelectedOutline(const ModelInstance& inst,
+                             const Math::Matrix4& view,
+                             const Math::Matrix4& projection);
+    void DrawGizmo(const ModelInstance& inst,
+                   const Math::Matrix4& view,
+                   const Math::Matrix4& projection);
+
     GLuint m_VAO = 0;
     GLuint m_VBO = 0;
     GLuint m_EBO = 0;
@@ -79,12 +127,23 @@ private:
     bool m_ShowSurface = false;
     bool m_ShowParticles = true;   // false in pure-surface mode
 
-    // Imported model (neutral Phong material, independent of the water mesh).
-    GLuint m_ModelVAO = 0;
-    GLuint m_ModelVBO = 0;
-    GLuint m_ModelEBO = 0;
-    GLsizei m_ModelIndexCount = 0;
+    // Imported models: neutral Phong material (uImportedModel=1), one GPU
+    // buffer set per ModelData, shared across instances.
     Shader* m_ModelShader = nullptr;
+    std::unordered_map<const ModelData*, GpuModel> m_GpuModels;
+    ModelSnapshotPtr m_Models;
+    int m_SelectedId = -1;
+    int m_SceneIndex = 0;
+    float m_Bg[3] = {0.12f, 0.15f, 0.22f};   // #1F2638
+
+    // Inline GLSL programs (compiled in OpenGLLayer.cpp, no .glsl file edits):
+    // a normal-inflated solid program for the stencil outline, and a simple
+    // coloured line program for the transform gizmo.
+    GLuint m_OutlineProgram = 0;
+    GLuint m_EdgeProgram = 0;
+    GLuint m_GizmoProgram = 0;
+    GLuint m_GizmoVAO = 0;
+    GLuint m_GizmoVBO = 0;
 
     ProjectionMode m_CurrentMode = ProjectionMode::Perspective;
     Camera m_Camera = Camera(2.8f, 1.4f, 2.2f, 0.0f, 1.0f, 0.0f, -136.7f, -18.0f);

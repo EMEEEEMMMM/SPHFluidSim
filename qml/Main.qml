@@ -28,6 +28,30 @@ Window {
     // mode S is "move backwards" and must not trigger a single step.
     property int cameraMode: 0
 
+    // v2: sceneIndex 2 (empty) has no fluid, no solver, no offline render.
+    // Guard the lookup so the window still loads if the session predates the
+    // v2 API (a missing property would otherwise warn on every binding pass).
+    readonly property bool isEmpty:
+        root.sim && root.sim.isEmpty !== undefined ? root.sim.isEmpty : false
+
+    // Auto-frame after an import: a STEP part is authored in millimetres and
+    // lands in a 2 m tank, so without this it reads as a speck at the origin.
+    property int objectCount: 0
+
+    Connections {
+        target: root.sim
+        function onObjectsChanged() {
+            const count = root.sim && root.sim.objects ? root.sim.objects.length : 0;
+            if (count > root.objectCount)
+                Qt.callLater(function() { viewportProbe.frameModels(); });
+            root.objectCount = count;
+        }
+    }
+
+    Component.onCompleted: {
+        if (root.sim && root.sim.objects) root.objectCount = root.sim.objects.length;
+    }
+
     FrameAnimation {
         running: true
         onTriggered: {
@@ -51,8 +75,10 @@ Window {
         NavBar {
             Layout.fillWidth: true
             session: root.sim
+            isEmpty: root.isEmpty
             onScreenshotRequested: root.saveScreenshot()
             onRenderRequested: root.openRenderDialog()
+            onSceneChangeRequested: (index) => root.requestSceneIndex(index)
         }
 
         Item {
@@ -68,6 +94,7 @@ Window {
                     Layout.preferredWidth: 272
                     Layout.fillHeight: true
                     session: root.sim
+                    isEmpty: root.isEmpty
                     onSceneRequested: (scene) => root.requestScene(scene)
                     onParticleCountRequested: (count) => root.requestParticleCount(count)
                 }
@@ -104,6 +131,8 @@ Window {
                     Layout.preferredWidth: 300
                     Layout.fillHeight: true
                     session: root.sim
+                    isEmpty: root.isEmpty
+                    cameraSource: viewportProbe
                     fieldOfView: viewportProbe.fieldOfView
                     cameraMode: root.cameraMode
                     onSolverRequested: (solver) => root.requestSolver(solver)
@@ -259,6 +288,7 @@ Window {
         onLoaded: {
             item.session = root.sim;
             item.job = renderJob;
+            item.cameraSource = viewportProbe;
             item.started.connect(root.showRenderProgress);
             item.closed.connect(function () { renderDialogLoader.active = false; });
             item.open();
@@ -375,7 +405,7 @@ Window {
     Shortcut { sequence: "Ctrl+S"; onActivated: root.saveScreenshot() }
     Shortcut { sequence: "Ctrl+Shift+O"; onActivated: root.sim.importParameters() }
     Shortcut { sequence: "Ctrl+Shift+S"; onActivated: root.sim.exportParameters() }
-    Shortcut { sequence: "Ctrl+Shift+R"; onActivated: root.openRenderDialog() }
+    Shortcut { sequence: "Ctrl+Shift+R"; enabled: !root.isEmpty; onActivated: root.openRenderDialog() }
     Shortcut { sequence: "F11"; onActivated: root.toggleFullscreen() }
 
     function hudText() {
@@ -386,9 +416,15 @@ Window {
             if (st.msPerStep > 0.01) parts.push(Number(st.msPerStep).toFixed(1) + " ms/step");
         }
         if (rightPanel.sceneHud) {
-            parts.push(st.scene === 1 ? "open tank 1.0³ (inflow)" : "tank 2.0 × 1.2 × 1.0 m");
-            parts.push("N=" + (st.fluidCount !== undefined ? st.fluidCount : 0));
-            parts.push("r=" + Number(st.spacing !== undefined ? st.spacing : 0.025).toFixed(3) + " m");
+            if (root.isEmpty) {
+                const list = root.sim.objects !== undefined ? root.sim.objects : [];
+                parts.push("Empty scene");
+                parts.push(list.length + (list.length === 1 ? " model" : " models"));
+            } else {
+                parts.push(st.scene === 1 ? "open tank 1.0³ (inflow)" : "tank 2.0 × 1.2 × 1.0 m");
+                parts.push("N=" + (st.fluidCount !== undefined ? st.fluidCount : 0));
+                parts.push("r=" + Number(st.spacing !== undefined ? st.spacing : 0.025).toFixed(3) + " m");
+            }
         }
         return parts.join("   ·   ");
     }
@@ -401,6 +437,16 @@ Window {
         if (root.sim.params.scene === scene) return;
         confirmPopup.text = "Switching the scene resets the simulation. Continue?";
         confirmPopup.onAccept = function () { root.sim.setParam("scene", scene); };
+        confirmPopup.open();
+    }
+
+    // v2 Option menu: sceneIndex 0 = dam, 1 = inflow, 2 = empty. Reuse the
+    // existing confirmPopup before calling the new session.setScene() API.
+    function requestSceneIndex(index) {
+        if (root.sim.sceneIndex !== undefined && root.sim.sceneIndex === index) return;
+        if (root.sim.setScene === undefined) return;
+        confirmPopup.text = "Switching the scene resets the simulation and clears imported models. Continue?";
+        confirmPopup.onAccept = function () { root.sim.setScene(index); };
         confirmPopup.open();
     }
 
@@ -425,6 +471,12 @@ Window {
     }
 
     function openRenderDialog() {
+        // Empty is screenshot-only: headless render is not supported there.
+        if (root.isEmpty) {
+            root.message = "Rendering is unavailable in the Empty scene";
+            messageTimer.restart();
+            return;
+        }
         if (renderJob.running) {
             root.message = "A render is already running";
             messageTimer.restart();

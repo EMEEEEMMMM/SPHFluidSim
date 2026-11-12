@@ -46,6 +46,8 @@ public:
     // for any particle count (spacing is derived externally).
     void InitDrop(float tankSize, float poolHeight, float dropRadius, float dropGap,
                   float cx, float cz, int maxParticles) override;
+    // Empty scene (v2): clear all particles/boundaries, enter a no-fluid state.
+    void InitEmpty() override;
     void Reset() override;
     void Step() override;
 
@@ -115,6 +117,7 @@ private:
     bool m_UseFullInit = false;   // Reset() needs to know which Init variant to rerun
     bool m_UseDamOpen = false;    // dam-break with open top (InitDamOpen)
     bool m_DropSpawned = false;   // SpawnDrop() already fired (one-shot)
+    bool m_Empty = false;         // v2 empty scene: no particles, no boundary
     float m_h = 0.1f;      // kernel support radius = 2 * spacing
     float m_mass = 1.0f;   // particle mass = rho0 * spacing^3
 

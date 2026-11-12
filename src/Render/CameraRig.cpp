@@ -10,7 +10,7 @@ namespace render {
 namespace {
 
 constexpr float kOrbitDegPerPixel = 0.32f;
-constexpr float kMinDistance = 0.55f;
+constexpr float kMinDistance = 0.05f;
 constexpr float kMaxDistance = 26.0f;
 constexpr float kMaxPitch = 89.0f;
 constexpr float kFlySpeed = 2.2f;

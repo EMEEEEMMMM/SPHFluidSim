@@ -6,20 +6,35 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 
 #include "Camera.hpp"
 #include "FrameBuffer.hpp"
 #include "Math/Constants.hpp"
+#include "Math/Ray.hpp"
 #include "Math/Vector3.hpp"
 #include "OpenGLLayer.hpp"
 
 namespace render {
 namespace {
 
-Math::Vector3 FrontVector(float yawDeg, float pitchDeg) {
-    const float ry = Math::radians(yawDeg);
-    const float rp = Math::radians(pitchDeg);
-    return Math::Vector3(std::cos(ry) * std::cos(rp), std::sin(rp), std::sin(ry) * std::cos(rp));
+Math::Vector3 EyeFromState(const CameraState& cam) {
+    const Math::Vector3 front = FrontVector(cam.yawDeg, cam.pitchDeg);
+    const Math::Vector3 target(cam.targetX, cam.targetY, cam.targetZ);
+    return target - front * cam.distance;
+}
+
+// Project a world point to NDC through a view-projection matrix. Returns
+// false when the point is on/behind the eye plane.
+bool ProjectToNdc(const Math::Matrix4& vp, const Math::Vector3& p,
+                  float& ndcX, float& ndcY) {
+    const float cx = vp.m[0][0] * p.x + vp.m[1][0] * p.y + vp.m[2][0] * p.z + vp.m[3][0];
+    const float cy = vp.m[0][1] * p.x + vp.m[1][1] * p.y + vp.m[2][1] * p.z + vp.m[3][1];
+    const float cw = vp.m[0][3] * p.x + vp.m[1][3] * p.y + vp.m[2][3] * p.z + vp.m[3][3];
+    if (cw <= 1.0e-6f) return false;   // on or behind the eye plane
+    ndcX = cx / cw;
+    ndcY = cy / cw;
+    return true;
 }
 
 }  // namespace
@@ -43,12 +58,18 @@ struct GlView::Impl {
     bool modelDirty = false;
     ModelDataPtr model;
 
+    // v2 queued state. Applied inside Render() on the render thread.
+    ModelSnapshotPtr models;
+    int selectedId = -1;
+    bool modelsDirty = false;
+    int sceneIndex = 0;
+    // #1F2638, matches OpenGLLayer's default 3D clear colour.
+    float m_bg[3] = {0.12f, 0.15f, 0.22f};
+
     void PushCamera() {
         if (!layer) return;
         Camera& camera = layer->GetCamera();
-        const Math::Vector3 front = FrontVector(cam.yawDeg, cam.pitchDeg);
-        const Math::Vector3 target(cam.targetX, cam.targetY, cam.targetZ);
-        camera.Position = target - front * cam.distance;
+        camera.Position = EyeFromState(cam);
         camera.Yaw = cam.yawDeg;
         camera.Pitch = cam.pitchDeg;
         camera.Zoom = cam.fovDeg;
@@ -124,6 +145,12 @@ void GlView::Render() {
         d.layer->UpdateModel(d.model);
         d.modelDirty = false;
     }
+    if (d.modelsDirty) {
+        d.layer->UpdateModels(d.models, d.selectedId);
+        d.modelsDirty = false;
+    }
+    d.layer->SetViewportBackground(d.m_bg);
+    d.layer->SetSceneIndex(d.sceneIndex);
     d.PushCamera();
     d.layer->Render();
 }
@@ -131,6 +158,13 @@ void GlView::Render() {
 void GlView::BlitTo(uint32_t dstFbo, int dstWidth, int dstHeight,
                     float letterR, float letterG, float letterB) {
     if (!m_impl->ready || dstWidth <= 0 || dstHeight <= 0) return;
+
+    // Negative components mean the caller relied on the defaults: use the
+    // stored background so the bars and the 3D clear are always the same
+    // colour. Explicit 0..1 colours are still honoured.
+    if (letterR < 0.0f) letterR = m_impl->m_bg[0];
+    if (letterG < 0.0f) letterG = m_impl->m_bg[1];
+    if (letterB < 0.0f) letterB = m_impl->m_bg[2];
 
     const int sw = m_impl->width;
     const int sh = m_impl->height;
@@ -211,6 +245,21 @@ void GlView::UpdateModel(const ModelDataPtr& model) {
     m_impl->modelDirty = true;
 }
 
+void GlView::UpdateModels(const ModelSnapshotPtr& models, int selectedId) {
+    m_impl->models = models;
+    m_impl->selectedId = selectedId;
+    m_impl->modelsDirty = true;
+}
+
+void GlView::SetSceneIndex(int scene) { m_impl->sceneIndex = scene; }
+
+void GlView::SetBackground(const float rgb[3]) {
+    if (!rgb) return;
+    m_impl->m_bg[0] = rgb[0];
+    m_impl->m_bg[1] = rgb[1];
+    m_impl->m_bg[2] = rgb[2];
+}
+
 void GlView::SetSurfaceVisible(bool visible) {
     if (m_impl->layer) m_impl->layer->SetSurfaceVisible(visible);
 }
@@ -257,5 +306,90 @@ void GlView::ResetCamera() {
 }
 
 CameraState& GlView::cameraState() { return m_impl->cam; }
+
+// ---------------------------------------------------------------------------
+// CPU-side picking (no GL calls): safe on the GUI thread.
+// ---------------------------------------------------------------------------
+Math::Matrix4 GlView::ViewMatrix() const {
+    // LookAt(eye, eye + front, worldUp) is exactly what Camera::GetViewMatrix()
+    // produces after PushCamera(): Camera::Up == Right.cross(Front) with
+    // Right == normalize(Front.cross(worldUp)), so both give the same basis.
+    const Math::Vector3 eye = EyeFromState(m_impl->cam);
+    const Math::Vector3 front = FrontVector(m_impl->cam.yawDeg, m_impl->cam.pitchDeg);
+    return Math::Matrix4::LookAt(eye, eye + front, Math::Vector3(0.0f, 1.0f, 0.0f));
+}
+
+Math::Matrix4 GlView::ProjectionMatrix() const {
+    const float aspect = (m_impl->width > 0 && m_impl->height > 0)
+        ? static_cast<float>(m_impl->width) / static_cast<float>(m_impl->height)
+        : 1.0f;
+    // Kept in sync with OpenGLLayer so picking rays match what is drawn.
+    return Math::Matrix4::Persp(Math::radians(m_impl->cam.fovDeg), aspect, 0.01f, 100.0f);
+}
+
+Math::Vector3 GlView::CameraEye() const { return EyeFromState(m_impl->cam); }
+
+int GlView::PickModel(double nx, double ny, const ModelSnapshotPtr& models) const {
+    if (!models || models->empty()) return -1;
+    const float ndcX = static_cast<float>(2.0 * nx - 1.0);
+    const float ndcY = static_cast<float>(1.0 - 2.0 * ny);   // item y is top-down
+    const Math::Ray ray =
+        Math::MakeScreenRay(ndcX, ndcY, ViewMatrix(), ProjectionMatrix(), CameraEye());
+
+    int bestId = -1;
+    float bestT = std::numeric_limits<float>::max();
+    for (const auto& inst : *models) {
+        if (!inst || !inst->visible || !inst->data) continue;
+        float t = 0.0f;
+        if (inst->intersectWorld(ray, t) && t > 0.0f && t < bestT) {
+            bestT = t;
+            bestId = inst->id;
+        }
+    }
+    return bestId;
+}
+
+int GlView::PickGizmo(double nx, double ny, const ModelInstance* selected) const {
+    if (!selected) return 0;
+    const float ndcX = static_cast<float>(2.0 * nx - 1.0);
+    const float ndcY = static_cast<float>(1.0 - 2.0 * ny);
+    const Math::Matrix4 vp = ProjectionMatrix() * ViewMatrix();
+    const Math::Vector3 eye = CameraEye();
+    const std::vector<render::GizmoLine> segs =
+        render::MakeGizmo(selected->position, eye);
+    const float aspect = (m_impl->width > 0 && m_impl->height > 0)
+        ? static_cast<float>(m_impl->width) / static_cast<float>(m_impl->height)
+        : 1.0f;
+    constexpr float kThreshold = 0.045f;   // ~2% of the viewport height
+    // Work in aspect-corrected NDC so the hit radius is roughly isotropic on
+    // screen (x NDC spans `aspect` times more pixels than y NDC).
+    const float px = ndcX * aspect;
+    const float py = ndcY;
+    int bestHandle = 0;
+    float bestDist = kThreshold;
+    for (const render::GizmoLine& s : segs) {
+        if (s.handle < 1 || s.handle > 6) continue;
+        float ax, ay, bx, by;
+        if (!ProjectToNdc(vp, s.a, ax, ay) || !ProjectToNdc(vp, s.b, bx, by)) continue;
+        ax *= aspect;
+        bx *= aspect;
+        const float dx = bx - ax;
+        const float dy = by - ay;
+        const float len2 = dx * dx + dy * dy;
+        float u = 0.0f;
+        if (len2 > 1.0e-12f) {
+            u = ((px - ax) * dx + (py - ay) * dy) / len2;
+            u = std::max(0.0f, std::min(1.0f, u));
+        }
+        const float ddx = px - (ax + u * dx);
+        const float ddy = py - (ay + u * dy);
+        const float dist = std::sqrt(ddx * ddx + ddy * ddy);
+        if (dist < bestDist) {
+            bestDist = dist;
+            bestHandle = s.handle;
+        }
+    }
+    return bestHandle;
+}
 
 }  // namespace render

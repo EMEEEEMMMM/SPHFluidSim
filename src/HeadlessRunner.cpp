@@ -284,6 +284,7 @@ int RunHeadless(const HeadlessOptions& opt) {
     }
 
     OpenGLLayer layer(opt.width, opt.height);
+    layer.SetViewportBackground(opt.background);
     std::string backendError;
     auto solverPtr = CreateSolver(ParseBackend(opt.backend), &backendError);
     if (!solverPtr) {
@@ -347,16 +348,38 @@ int RunHeadless(const HeadlessOptions& opt) {
     }
     spacing = solver.Spacing();
 
-    // Camera: a closer three-quarter view centred on the tank.
+    // Camera: a closer three-quarter view centred on the tank (original
+    // behaviour). When a v2 config supplies render.camera, derive the eye from
+    // the orbit yaw/pitch/distance around the target instead — the same
+    // convention as render::GlView::PushCamera / Render/CameraRig.hpp.
     {
         auto& cam = layer.GetCamera();
-        cam.Position = { 2.9f, 2.3f, 2.9f };
-        const float tx = 1.0f, tz = 0.5f;
-        const float ty = isInflow ? 0.5f : 0.55f;
-        Math::Vector3 f = { tx - 2.9f, ty - 2.3f, tz - 2.9f };
-        cam.Front = f * (1.0f / f.length());
-        cam.Up = { 0.0f, 1.0f, 0.0f };
-        cam.Zoom = 42.0f;
+        if (opt.camera.explicitCamera) {
+            constexpr double kDegToRad = 3.14159265358979323846 / 180.0;
+            const double ry = opt.camera.yaw * kDegToRad;
+            const double rp = opt.camera.pitch * kDegToRad;
+            // Front = eye -> target direction; eye = target - Front * distance.
+            const Math::Vector3 front(
+                static_cast<float>(std::cos(ry) * std::cos(rp)),
+                static_cast<float>(std::sin(rp)),
+                static_cast<float>(std::sin(ry) * std::cos(rp)));
+            const Math::Vector3 target(
+                static_cast<float>(opt.camera.targetX),
+                static_cast<float>(opt.camera.targetY),
+                static_cast<float>(opt.camera.targetZ));
+            cam.Position = target - front * static_cast<float>(opt.camera.distance);
+            cam.Front = front.normalize();
+            cam.Up = { 0.0f, 1.0f, 0.0f };
+            cam.Zoom = static_cast<float>(opt.camera.fov);
+        } else {
+            cam.Position = { 2.9f, 2.3f, 2.9f };
+            const float tx = 1.0f, tz = 0.5f;
+            const float ty = isInflow ? 0.5f : 0.55f;
+            Math::Vector3 f = { tx - 2.9f, ty - 2.3f, tz - 2.9f };
+            cam.Front = f * (1.0f / f.length());
+            cam.Up = { 0.0f, 1.0f, 0.0f };
+            cam.Zoom = 42.0f;
+        }
     }
 
     // Surface or particle view.
@@ -424,7 +447,10 @@ int RunHeadless(const HeadlessOptions& opt) {
             static_cast<double>(solver.SimTime()) < dropSimTime) return;
         // Check after every solver step, not just at rendered-frame boundaries.
         // The event therefore occurs after the same physical step at every fps.
-        solver.SpawnDrop(0.2f, 1.0f, 1.6f, 0.5f);
+        solver.SpawnDrop(static_cast<float>(opt.drop.radius),
+                         static_cast<float>(opt.drop.x),
+                         static_cast<float>(opt.drop.y),
+                         static_cast<float>(opt.drop.z));
         printf("[headless] drop spawned at video t=%.3fs, sim t=%.3fs (N=%d)\n",
                opt.dropVideoSeconds, solver.SimTime(), solver.FluidCount());
     };

@@ -10,6 +10,7 @@
 #include <QStandardPaths>
 #include <QStorageInfo>
 #include <QStringList>
+#include <QVariant>
 
 #include <algorithm>
 #include <cmath>
@@ -129,13 +130,18 @@ QVariantMap RenderJob::validateOptions(const QVariantMap& root) const {
     if (!root.value(QStringLiteral("app")).toString().isEmpty() &&
         root.value(QStringLiteral("app")).toString() != QLatin1String("IISPH"))
         return ValidationResult(false, tr("The configuration is not an IISPH render job."));
-    if (root.contains(QStringLiteral("schemaVersion")) &&
-        root.value(QStringLiteral("schemaVersion")).toInt() != 1)
-        return ValidationResult(false, tr("Unsupported configuration schema version."));
+    if (root.contains(QStringLiteral("schemaVersion"))) {
+        const int schemaVersion = root.value(QStringLiteral("schemaVersion")).toInt();
+        if (schemaVersion != 1 && schemaVersion != 2)
+            return ValidationResult(false, tr("Unsupported configuration schema version."));
+    }
 
     const QVariantMap simulation = root.value(QStringLiteral("simulation")).toMap();
     const QVariantMap render = root.value(QStringLiteral("render")).toMap();
     const QString scene = simulation.value(QStringLiteral("scene"), QStringLiteral("dam")).toString();
+    if (scene == QLatin1String("empty"))
+        return ValidationResult(false,
+            tr("Empty 场景只支持截图，不支持 headless 渲染"));
     if (scene != QLatin1String("dam") && scene != QLatin1String("inflow"))
         return ValidationResult(false, tr("Scene must be 'dam' or 'inflow'."));
     const QString solver = simulation.value(QStringLiteral("solver"), QStringLiteral("IISPH")).toString();
@@ -210,6 +216,65 @@ QVariantMap RenderJob::validateOptions(const QVariantMap& root) const {
     if (render.contains(QStringLiteral("threads")) && render.value(QStringLiteral("threads")).toInt() < 0)
         return ValidationResult(false, tr("Thread count cannot be negative."));
 
+    // schema v2: validate render.camera numeric ranges when present. Missing
+    // keys keep the headless defaults and are not validated here.
+    const QVariantMap camera = render.value(QStringLiteral("camera")).toMap();
+    if (!camera.isEmpty()) {
+        const auto requireFinite = [&](const QString& key) -> bool {
+            if (!camera.contains(key)) return true;
+            double v = 0.0;
+            return FiniteNumber(camera, key, v);
+        };
+        const auto requireRange = [&](const QString& key, double lo, double hi) -> bool {
+            if (!camera.contains(key)) return true;
+            double v = 0.0;
+            return FiniteNumber(camera, key, v) && v >= lo && v <= hi;
+        };
+        if (!requireRange(QStringLiteral("fov"), 10.0, 120.0))
+            return ValidationResult(false, tr("Camera FOV must be in the range 10..120."));
+        if (!requireRange(QStringLiteral("distance"), 0.01, 1000.0))
+            return ValidationResult(false, tr("Camera distance must be in the range 0.01..1000."));
+        if (!requireRange(QStringLiteral("pitch"), -89.0, 89.0))
+            return ValidationResult(false, tr("Camera pitch must be in the range -89..89."));
+        if (!requireFinite(QStringLiteral("yaw")))
+            return ValidationResult(false, tr("Camera yaw must be a finite number."));
+        if (!requireFinite(QStringLiteral("targetX")) ||
+            !requireFinite(QStringLiteral("targetY")) ||
+            !requireFinite(QStringLiteral("targetZ")))
+            return ValidationResult(false, tr("Camera target components must be finite numbers."));
+        // Alternative [x, y, z] array form for the target.
+        const QVariant targetValue = camera.value(QStringLiteral("target"));
+        if (targetValue.isValid() && !targetValue.isNull()) {
+            const QVariantList targetList = targetValue.toList();
+            if (targetList.size() != 3)
+                return ValidationResult(false, tr("Camera target must be a [x, y, z] array."));
+            for (const QVariant& component : targetList) {
+                bool ok = false;
+                const double t = component.toDouble(&ok);
+                if (!ok || !std::isfinite(t))
+                    return ValidationResult(false, tr("Camera target components must be finite numbers."));
+            }
+        }
+    }
+
+    // schema v2: events[0] drop needs a positive radius and finite xyz.
+    const QVariantList events = root.value(QStringLiteral("events")).toList();
+    if (!events.isEmpty()) {
+        const QVariantMap event = events.at(0).toMap();
+        if (event.value(QStringLiteral("type")).toString() == QLatin1String("drop")) {
+            double v = 0.0;
+            if (event.contains(QStringLiteral("radius")) &&
+                (!FiniteNumber(event, QStringLiteral("radius"), v) || v <= 0.0))
+                return ValidationResult(false, tr("Drop radius must be positive."));
+            for (const char* key : {"x", "y", "z"}) {
+                const QString name = QLatin1String(key);
+                if (event.contains(name) && !FiniteNumber(event, name, v))
+                    return ValidationResult(false,
+                        tr("Drop '%1' must be a finite number.").arg(name));
+            }
+        }
+    }
+
     const QString output = LocalPath(render.value(QStringLiteral("output")));
     if (output.trimmed().isEmpty())
         return ValidationResult(false, tr("Choose an output directory before rendering."));
@@ -282,7 +347,8 @@ bool RenderJob::start(const QVariantMap& root) {
 
     QVariantMap actual = root;
     actual.insert(QStringLiteral("app"), QStringLiteral("IISPH"));
-    actual.insert(QStringLiteral("schemaVersion"), 1);
+    // Exports always use the latest schema, even when a v1 job is re-run.
+    actual.insert(QStringLiteral("schemaVersion"), 2);
     QVariantMap render = actual.value(QStringLiteral("render")).toMap();
     const QString output = QFileInfo(LocalPath(render.value(QStringLiteral("output")))).absoluteFilePath();
     render.insert(QStringLiteral("output"), output);

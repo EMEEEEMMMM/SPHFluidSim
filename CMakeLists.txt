@@ -1,5 +1,14 @@
 cmake_minimum_required(VERSION 3.16)
-project(SPHFluidSim)
+
+# Root VERSION is the single source of truth for both the build and releases.
+file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" SPH_VERSION_STRING LIMIT_COUNT 1)
+string(STRIP "${SPH_VERSION_STRING}" SPH_VERSION_STRING)
+if(NOT SPH_VERSION_STRING MATCHES "^[0-9]+\\.[0-9]+\\.[0-9]+$")
+  message(FATAL_ERROR "VERSION must contain MAJOR.MINOR.PATCH (got '${SPH_VERSION_STRING}')")
+endif()
+project(SPHFluidSim VERSION ${SPH_VERSION_STRING} LANGUAGES C CXX)
+
+configure_file(cmake/Version.h.in "${CMAKE_CURRENT_BINARY_DIR}/generated/version.h" @ONLY)
 
 # Single-config generators (MinGW Makefiles, Ninja, Unix Makefiles) leave
 # CMAKE_BUILD_TYPE empty unless the caller passes it. That silently drops -O3
@@ -130,8 +139,10 @@ endif()
 
 add_library(sph_session STATIC
     include/Model.hpp
+    include/StepImporter.hpp
     include/Session/SimulationSession.hpp
     src/Model.cpp
+    src/StepImporter.cpp
     src/Session/SimulationSession.cpp
 )
 target_link_libraries(sph_session PUBLIC
@@ -175,6 +186,9 @@ add_executable(${PROJECT_NAME}
     include/Render/RenderJob.hpp
     src/Render/RenderJob.cpp
     qml/qml.qrc
+)
+target_include_directories(${PROJECT_NAME} PRIVATE
+    "${CMAKE_CURRENT_BINARY_DIR}/generated"
 )
 target_link_libraries(${PROJECT_NAME} PRIVATE
     sph_session
@@ -253,9 +267,26 @@ if(SPH_CUDA_INCLUDE_DIR AND SPH_NVRTC_INCLUDE_DIR)
     target_compile_options(benchmark_gpu PRIVATE -fopenmp)
 endif()
 
-add_executable(test_model_import tests/test_model_import.cpp src/Model.cpp)
+add_executable(test_model_import tests/test_model_import.cpp src/Model.cpp src/StepImporter.cpp)
 target_include_directories(test_model_import PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_definitions(test_model_import PRIVATE
+    TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data")
 target_link_libraries(test_model_import PRIVATE Qt6::Core ${ASSIMP_TARGET})
+
+add_executable(test_quaternion tests/test_quaternion.cpp)
+target_include_directories(test_quaternion PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
+add_executable(test_model_transform tests/test_model_transform.cpp)
+target_include_directories(test_model_transform PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
+add_executable(test_camera_config
+    tests/test_camera_config.cpp
+    src/Render/RenderJob.cpp
+    include/Render/RenderJob.hpp)
+target_include_directories(test_camera_config PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(test_camera_config PRIVATE Qt6::Core)
 
 add_executable(test_params_json tests/test_params_json.cpp)
 target_link_libraries(test_params_json PRIVATE sph_session Qt6::Core Qt6::Widgets)
@@ -274,4 +305,7 @@ add_test(NAME hydrostatic COMMAND verify_hydrostatic 200)
 add_test(NAME surface     COMMAND surface_reconstruct)
 add_test(NAME dfsph       COMMAND test_solver 120 0.003 0 0.1 DFSPH)
 add_test(NAME model_import COMMAND test_model_import)
+add_test(NAME quaternion COMMAND test_quaternion)
+add_test(NAME model_transform COMMAND test_model_transform)
+add_test(NAME camera_config COMMAND test_camera_config)
 add_test(NAME params_json COMMAND test_params_json)

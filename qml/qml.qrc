@@ -22,6 +22,9 @@
         <file>Segmented.qml</file>
         <file>Toggle.qml</file>
         <file>SliderRow.qml</file>
+        <file>NumberField.qml</file>
+        <file>ObjectsPanel.qml</file>
+        <file>CameraSection.qml</file>
         <file>MetricGrid.qml</file>
         <file>Spark.qml</file>
         <file>IconBtn.qml</file>

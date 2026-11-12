@@ -33,6 +33,8 @@ public:
                     float cx, float cz, int maxParticles) override;
     void InitDrop(float tankSize, float poolHeight, float dropRadius, float dropGap,
                   float cx, float cz, int maxParticles) override;
+    // Empty scene (v2): no fluid, no boundary. Step() still advances SimTime().
+    void InitEmpty() override;
     void SpawnDrop(float radius, float cx, float cy, float cz) override;
     bool HasDrop() const override;
     void Reset() override;

@@ -18,6 +18,7 @@
 #include <string>
 #include <vector>
 
+#include "Math/Matrix4.hpp"
 #include "Math/Vector3.hpp"
 #include "Model.hpp"
 #include "Render/CameraRig.hpp"
@@ -49,11 +50,14 @@ public:
     void Render();
 
     // Scales the internal target into `dstFbo` (0 = window back buffer),
-    // letterboxing to preserve aspect. `letterbox` is the fill colour of the
-    // bars, in 0..1 sRGB.
+    // letterboxing to preserve aspect. `letterR/G/B` are the fill colour of
+    // the bars, in 0..1 sRGB. The signature and the three default parameters
+    // are kept for existing callers; a negative component (the default) means
+    // "use the colour stored by SetBackground()", which keeps the letterbox
+    // bars the same colour as the 3D clear.
     void BlitTo(uint32_t dstFbo, int dstWidth, int dstHeight,
-                float letterR = 0.043f, float letterG = 0.047f,
-                float letterB = 0.055f);
+                float letterR = -1.0f, float letterG = -1.0f,
+                float letterB = -1.0f);
 
     // Reads the internal target back as tightly packed RGBA8, top-down.
     bool ReadPixels(std::vector<uint8_t>& rgba, int& outWidth, int& outHeight);
@@ -65,6 +69,18 @@ public:
                        const std::vector<unsigned>& indices);
     // Queues an imported visual model for upload during Render(). Null clears it.
     void UpdateModel(const ModelDataPtr& model);
+
+    // ---- v2 multi-model feed --------------------------------------------
+    // Queued and applied inside Render() on the render thread (they may create
+    // or delete GL buffers). `selectedId` drives the outline + transform gizmo.
+    void UpdateModels(const ModelSnapshotPtr& models, int selectedId);
+    // scene encoding: 0 = dam, 1 = inflow, 2 = empty.
+    void SetSceneIndex(int scene);
+
+    // Background colour (0..1 sRGB) used for BOTH the 3D clear colour
+    // (forwarded to OpenGLLayer::SetViewportBackground) and the letterbox bars.
+    void SetBackground(const float rgb[3]);
+
     void SetSurfaceVisible(bool visible);
     void SetParticlesVisible(bool visible);
     void SetTank(float x, float y, float z, float cx, float cz, bool openTop);
@@ -79,6 +95,20 @@ public:
     void Fly(float forward, float right, float up, float deltaSeconds);
     void ResetCamera();
     CameraState& cameraState();
+
+    // ---- CPU-side picking helpers ---------------------------------------
+    // nx, ny are normalised [0,1] coordinates inside the item (top-left
+    // origin). They use only the camera state (no GL calls), so they are safe
+    // on the GUI thread even on a GlView that was never Initialize()d.
+    // Set cameraState() (and Resize() for the aspect) before calling.
+    int PickModel(double nx, double ny, const ModelSnapshotPtr& models) const;
+    // Handle encoding: 1..3 translate XYZ, 4..6 rotate XYZ, 0 = none.
+    int PickGizmo(double nx, double ny, const ModelInstance* selected) const;
+
+    // CPU-side camera matrices / eye, computed from cameraState() alone.
+    Math::Matrix4 ViewMatrix() const;
+    Math::Matrix4 ProjectionMatrix() const;
+    Math::Vector3 CameraEye() const;
 
 private:
     struct Impl;

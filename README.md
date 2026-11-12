@@ -18,6 +18,9 @@ Repository: **https://github.com/EMEEEEMMMM/SPHFluidSim**
 - **Water surface reconstruction** (Akinci et al. 2012): color-field surface particles, distance-to-weighted-centroid scalar field `phi = |x - xbar| - r`, Marching Cubes lookup tables with shared-edge intersection reuse (watertight, crack-free), opaque fresnel water shader
 - **Parallelism** (Ihmsen et al. 2011 style): SoA spatial hash built in 3 passes — atomic count -> prefix sum -> atomic scatter; no locks, cache-friendly neighbor slices; reconstruction runs on a background thread (never stalls the render loop)
 - **Qt desktop frontends**: native Qt Widgets and Qt Quick/QML share the same simulation session, renderer and theme tokens; frameless window, pause / single step / reset, a particle-count field, solver and surface parameters, particles-only / surface-only / both view modes, FPS + tank overlay, four switchable skins
+- **Empty model scene**: the app starts with no tank and no fluid. Import multiple OBJ/STL/PLY/FBX/DAE/3DS/OFF/glTF models, plus STEP/STP CAD parts (tessellated by the built-in B-rep importer, see [STEP import](#step-cad-import)), select one in the Objects card, edit position / Euler rotation / uniform scale, or drag the world-axis translate arrows and rotation rings directly in the viewport. Selection uses an AABB + lazy BVH triangle test and a yellow stencil outline; scale stays numeric-only.
+- **Per-viewport background**: `Option → Background color...` changes only the 3D clear colour and letterbox bars. It is stored in `QSettings`, survives theme switches/restarts, and is written into headless render configs.
+- **Manual CUDA release pipeline**: a `workflow_dispatch` GitHub Actions workflow builds CUDA-enabled Windows and Linux archives, verifies the configure gate, smoke-tests `--version`, and opens a draft Release for review.
 - **Live density diagnostics**: mean density in real kg/m³ with a labelled `rho0` reference; the axis follows the data (a stable DFSPH run still fills the chart), and when rho0 lies far off that range it is reported as off-scale rather than flattening the trace. The trace is banded by the solver's density error (green ≤ 0.10 %, amber 0.10-1 %, red ≥ 1 %, i.e. an order of magnitude around the ~0.01 % a converged run holds), and hovering a sample shows sim time, step, density and Δρ
 - **DFSPH solver** (Bender & Koschier 2017, `--solver DFSPH`): constant-density + divergence-free solvers with warm start, sharing the same boundary / XSPH / surface-tension passes as IISPH
 - **Deterministic pressure solve**: the IISPH iteration reads the previous pressure and writes the next one (`m_P` / `m_Pold`, strict relaxed Jacobi), so results no longer depend on thread scheduling
@@ -35,7 +38,8 @@ Repository: **https://github.com/EMEEEEMMMM/SPHFluidSim**
 | CMake 3.16+ | build | any generator; the commands below use MinGW Makefiles |
 | MinGW-w64 g++ (MSYS2 UCRT64) or GCC/Clang on Linux | build | OpenMP is required (`find_package(OpenMP REQUIRED)`) |
 | Qt 6.5+ **Core, Gui, Widgets, Quick, QuickControls2, OpenGL, OpenGLWidgets** | GUI | tested with Qt 6.12.0 / UCRT64 |
-| Assimp | OBJ/FBX/STL import | `find_package(assimp CONFIG)` first, `pkg-config assimp` as fallback |
+| Assimp | OBJ/FBX/STL/glTF import | `find_package(assimp CONFIG)` first, `pkg-config assimp` as fallback |
+| — (built in) | STEP/STP import | no extra dependency: ISO 10303-21 parser + B-rep tessellator in `src/StepImporter.cpp` |
 | OpenGL 3.3 | renderer | GLAD is vendored in `thirdparty/` |
 | OpenCL (optional) | GPU surface reconstruction | CPU reconstruction is used when missing |
 | CUDA Toolkit headers `cuda.h` + `nvrtc.h` (optional) | CUDA backend | headers only; no `nvcc`, no import library |
@@ -75,18 +79,33 @@ Build options:
 | `-DCMAKE_BUILD_TYPE=Release/Debug` | — | optimisation level |
 | `-DCMAKE_PREFIX_PATH=<qt6-prefix>` | autodetect | Qt 6 installation |
 
-Run the test suite (CPU reference, CUDA parity, model import, parameter JSON):
+Run the test suite (CPU reference, CUDA parity, model import, quaternion/transform/picking, schema and camera/drop config):
 
 ```powershell
 ctest --test-dir build --output-on-failure
 ```
 
-If you move the executable outside the Qt environment, deploy its runtime next
-to the binary:
+`windeployqt` alone is **not** sufficient for a MinGW build: it handles Qt but
+not the MinGW runtime, Assimp, OpenCL, NVRTC, or the `qt.conf` needed to make
+the copied Qt tree relocatable. Build a complete portable package with:
 
 ```powershell
-windeployqt .\build\SPHFluidSim.exe
+powershell -ExecutionPolicy Bypass -File .\deploy\windows.ps1
 ```
+
+The script creates `dist/SPHFluidSim/` and `dist/SPHFluidSim-v1.11.0-win64.zip`.
+Copy the **entire folder or zip** to the target machine; copying only
+`SPHFluidSim.exe` will fail with missing-DLL or missing-QML-plugin errors. The
+package includes Qt and its plugins, Qt Quick/QML modules, the MinGW runtime,
+Assimp, the OpenCL ICD loader, NVRTC, `shaders/`, and `qt.conf`.
+
+The target machine still needs the NVIDIA display driver for CUDA
+(`nvcuda.dll`). Without it the app starts on the CPU backend. Offline video
+output additionally requires `ffmpeg` on `PATH`; ffmpeg is not bundled.
+
+If you already have a working Qt deployment directory and only need Qt's own
+files refreshed, `windeployqt --release --compiler-runtime <exe>` can still be
+used manually.
 
 ### Linux
 
@@ -101,6 +120,18 @@ cmake --build build --parallel
 `SPH_ENABLE_CUDA=ON` (the default) also works there: the backend `dlopen`s
 `libcuda.so.1` and `libnvrtc.so`, so only the CUDA headers are needed at build
 time. Pass `-DSPH_ENABLE_CUDA=OFF` on machines without them.
+
+Build the portable Linux archive (linuxdeploy and `linuxdeploy-plugin-qt` must
+be on `PATH`, or pass `--linuxdeploy`):
+
+```bash
+bash deploy/linux.sh --build-dir build --qt-root /path/to/Qt/6.8.3/gcc_64
+```
+
+It produces `dist/SPHFluidSim-v1.11.0-linux-x86_64.tar.gz` with the AppDir-style
+tree, Qt libraries/plugins/QML modules, Assimp, the OpenCL ICD loader, the NVRTC
+runtime, shaders and README. `libcuda.so.1` is intentionally not bundled: it is
+provided by the NVIDIA driver. Run the extracted `AppRun`.
 
 The Windows executable is a native PE binary and **cannot** be copied to a Linux GPU server. Rebuild it on the server (the commands above); the CUDA kernels are compiled from the embedded source at runtime by NVRTC, so the server needs a driver plus `libnvrtc` (CUDA toolkit/runtime), not `nvcc` at build time.
 
@@ -197,7 +228,7 @@ IISPH/DFSPH numbers. Use the same scene and particle count when comparing GPUs.
 The default UI is **Qt Quick/QML**. Both frontends share the same session, renderer and four themes:
 
 ```powershell
-.\build\SPHFluidSim.exe                      # QML frontend, Cupertino Dark
+.\build\SPHFluidSim.exe                      # QML frontend, Cupertino Dark, Empty scene
 .\build\SPHFluidSim.exe --ui widgets         # Qt Widgets frontend
 .\build\SPHFluidSim.exe --ui qml --theme 1   # Cupertino Light
 .\build\SPHFluidSim.exe --ui qml --theme 2   # Linear Dark
@@ -215,17 +246,55 @@ The default UI is **Qt Quick/QML**. Both frontends share the same session, rende
 ### GUI controls
 
 - **Transport** — pause / resume (`Space`), single step (`S`), reset (`R`)
-- **Scene** — dam break (open-top) / inflow jet; switching rebuilds the solver and asks for confirmation
-- **Spawn water drop** (dam scene) — one-shot spherical blob above the tank rim
+- **Scene** — `Option → Scene`: Empty / Dam break / Inflow, with the active item checked. Switching asks for confirmation, clears all models, resets the simulation and restores that scene's fixed camera. The app starts in Empty.
+- **Objects** (Empty only) — multi-select import, model list with visibility/delete, position XYZ, rotation XYZ (degrees), uniform scale 0.001–1000 and Reset. Multiple imports may overlap at the origin; move them apart with the panel or gizmo.
+- **Selection / gizmo** (Empty only) — left-click selects a model (yellow stencil outline); clicking empty space or `Esc` deselects. Drag the coloured world X/Y/Z arrows to translate, or the X/Y/Z rings to rotate. Dragging the model body or empty space still orbits; middle/right-drag pans. No snapping and no scale gizmo.
+- **Spawn water drop** (dam scene) — one-shot spherical blob above the tank rim, with editable radius and X/Y/Z defaults in the Scene card
 - **Particles** — type any fluid-particle count of 512 or more; there is no application-level upper cap. Spacing follows from the scene's fixed water volume, and the box under the field shows the resulting spacing plus the estimated device memory. On CUDA, the count is checked against the active GPU budget as soon as it is entered; an overloaded request is marked in red and is not applied. The same preflight is used by the render dialog. The `Active` row always reports the particle count the solver really built (a non-cubic number rounds up to the lattice, e.g. 500 000 → 512 000)
 - **Solver / forces / surface** — IISPH or DFSPH, XSPH viscosity, surface tension, wall adhesion, threshold, grid scale, rebuild interval
 - **View** — particles / surface / both; surface mode also reconstructs while paused
-- **Camera** — two modes only: **Orbit** (left-drag orbits the target) and **Fly** (left-drag looks around from the current eye, `WASD` moves, `Q/E` moves down/up). Middle/right-drag pans, the wheel changes the **field of view** and stops exactly at 20° / 75° (the same ends as the Field-of-view control), double-click or **Reset view** restores the camera. `S` is a single step in Orbit mode and "move backwards" in Fly mode.
+- **Camera** — two modes only: **Orbit** (left-drag orbits the target) and **Fly** (left-drag looks around from the current eye, `WASD` moves, `Q/E` moves down/up). The Camera card and Render dialog share Front / Back / Left / Right / Top / Iso / Current presets. Middle/right-drag pans, the wheel changes the **field of view** and stops exactly at 20° / 75° (the same ends as the Field-of-view control), double-click or **Reset view** restores the camera. The orbit distance can go down to 5 cm, so a 30 mm CAD part can be inspected up close. The **Camera speed** slider (0.2x-3x) scales orbit, pan and fly sensitivity; importing a model frames it automatically, so a part authored in millimetres is not a speck in the 2 m tank. `S` is a single step in Orbit mode and "move backwards" in Fly mode.
 - **Density chart** — plots the real mean density in `kg/m³` with a `ρ₀` reference line; hover any point to read its simulation time, step number, density and signed density error
-- **Navigation bar** — `File` (restart, save snapshot, exit), `Appearance` (four skins with preview swatches and current selection), `Help` (shortcuts, about)
+- **Navigation bar** — `File` (import model in Empty, restart, save snapshot, exit), `Option` (scene submenu, viewport background colour, multi-model import), `Appearance` (four skins with preview swatches and current selection), `Help` (shortcuts, about). **Render** and `Ctrl+Shift+R` are disabled in Empty; screenshots remain available.
 - **Window** — minimize / maximize / close at the top right; screenshot (`Ctrl+S`), fullscreen (`F11`), and `Ctrl+T` still cycles appearances
 
 ---
+
+## Scene files (schema v2)
+
+`File → Export Parameter (Json)` now writes schema v2. Paths are resolved
+relative to the config file's directory, so a scene folder can be moved as a
+unit:
+
+```json
+{
+  "app": "IISPH",
+  "schemaVersion": 2,
+  "simulation": {
+    "scene": "empty",
+    "models": [
+      {
+        "path": "models/teapot.obj",
+        "position": [0, 0, 0],
+        "rotation": [1, 0, 0, 0],
+        "scale": 1.0,
+        "visible": true
+      }
+    ]
+  },
+  "render": {
+    "camera": { "yaw": -128.35, "pitch": -29.77, "distance": 3.526,
+                "target": [1, 0.55, 0.5], "fov": 42 },
+    "background": "#1F2638"
+  }
+}
+```
+
+`rotation` is a `[w, x, y, z]` quaternion and `scale` is a uniform number.
+Schema v1 files still load (models default to empty, camera/background to the
+defaults above); every new export is v2. A missing model file is reported
+before it can be rendered. Empty is intentionally screenshot-only: headless
+render accepts only `dam` and `inflow` and rejects `empty` with a clear error.
 
 ## Headless mode (offline video)
 Make sure that ffmpeg is installed on your computer.
@@ -254,6 +323,16 @@ changes only the output sampling rate, not the underlying physical trajectory.
 |---|---|
 | `dam` (default) | classic dam break in an **open-top** 2.0x1.2x1.0 m tank (no lid, splash may leave the tank); optional `--drop <N>[f|s]` spawns a water drop above the rim |
 | `inflow` | open-top 1.0 m cubic container with a continuous central jet falling 0.5 m from above (injects until `--particles` is reached, then stops - fixed volume) |
+| `empty` | GUI only: no tank, no fluid, models only. Rejected by headless rendering; use a screenshot instead |
+
+**Render dialog Camera / Events.** The Camera section is available for Dam and
+Inflow: presets Front / Back / Left / Right / Top / Iso / Current, editable yaw,
+pitch, distance, target XYZ and FOV, and **Use current view** to copy the live
+camera. It writes `render.camera` (`target` as `[x, y, z]`). Dam additionally
+supports one drop event with enable, time (seconds, frame count shown beside
+it), radius and XYZ; this is also written to `events`. The dialog estimates the
+drop particle count from the current spacing and adds it to the GPU budget
+warning. Inflow hides Events. No preview or orthographic projection yet.
 
 All scenes render their container/tank as a wireframe outline.
 
@@ -314,6 +393,39 @@ SPHFluidSim.exe --headless --seconds 20 --fps 120 -r 1920x1080 --particles 10000
 
 ---
 
+## Releasing (manual GitHub Actions)
+
+`VERSION` at the repository root is the single source of truth (currently
+`1.11.0`). CMake reads it, generates `version.h`, and `SPHFluidSim --version`
+prints the same string.
+
+1. Commit `.github/workflows/release.yml` and `VERSION` to the default branch.
+2. In **Settings → Actions → General → Workflow permissions**, allow
+   **Read and write** (the workflow also declares `permissions: contents: write`).
+3. Open **Actions → Release → Run workflow**. `version` may be left empty; if
+   supplied it must equal `VERSION`. `notes` may be empty. `force` only replaces
+   an existing **draft**; a published release is never overwritten.
+4. The workflow builds both packages with a hard `CUDA backend: enabled`
+   configure gate, smoke-tests `--version`, generates `SHA256SUMS`, and opens a
+   **draft** Release. Edit the notes and inspect the assets, then publish it
+   manually.
+
+The git tag, the release title and the asset names all carry the full version
+from `VERSION` (`v1.11.0`):
+
+- `SPHFluidSim-v1.11.0-win64.zip`
+- `SPHFluidSim-v1.11.0-linux-x86_64.tar.gz`
+- `SHA256SUMS`
+- `README.md`
+
+GitHub-hosted runners have no GPU, so CI compiles the CUDA backend but does not
+run CUDA parity or any kernel; `ctest` is also not run in CI. Local development
+still runs the targeted tests. End users still need an NVIDIA display driver
+(`nvcuda.dll` / `libcuda.so.1`); the packages include NVRTC but not the driver.
+Mac packaging is not part of this release line.
+
+---
+
 ## References
 
 Five papers this reproduction is built on. `[n]` is the citation index used in the IISPH paper.
@@ -330,3 +442,36 @@ Five papers this reproduction is built on. `[n]` is the citation index used in t
 The notes I took when I was working on this project are all on [my blog](https://emeeeemmmm.github.io/).
 
 Deepseek v4 Flash was used during this project.
+
+## STEP (CAD) import
+
+`File > Import 3D Model` and the Objects card accept `.step` / `.stp` in addition
+to the Assimp formats. STEP is not a triangle mesh, so it is not routed through
+Assimp: `src/StepImporter.cpp` parses the ISO 10303-21 exchange structure and
+tessellates the boundary representation itself.
+
+* Supported surfaces: faceted B-rep, plane, cylinder, cone, sphere and torus.
+  Boundary curves: line, circle, ellipse, polyline, composite and (rational)
+  B-spline curves, trimmed curves and `SURFACE_CURVE` / `SEAM_CURVE` wrappers.
+* Faces on B-spline or swept surfaces are skipped individually and reported in
+  the import message; the rest of the part still loads.
+* Length units are honoured (`SI_UNIT(.MILLI.,.METRE.)`, inch/foot conversion
+  units) and converted to metres, so a 35 mm bracket imports 0.035 m wide. The
+  import message reports the size in millimetres and the viewport frames the
+  new model, which keeps true-scale CAD parts readable.
+* CAD files are Z-up; the importer rotates them into the Y-up world
+  (`(x, y, z) -> (x, z, -y)`), so parts stand upright in the tank.
+* Shell orientation is normalised outwards, and the mesh is flat-shaded with
+  per-face normals so machined edges stay crisp.
+* The exact CAD boundary curves are uploaded as a line list and drawn as dark
+  feature edges, so hole rims and machined corners read the way they do in
+  SolidWorks. Every authored face is kept as-is, including the small coplanar
+  disk patches some exporters place over a bore: they are part of the design and
+  are what makes the circle pattern read as circles rather than as voids.
+* Planar faces are validated after triangulation (covered area vs trimmed
+  region); a face that cannot be triangulated exactly is skipped and reported
+  instead of being drawn as a stray wedge.
+
+Curved faces are trimmed in the surface's own (u, v) parameter plane: boundary
+loops are projected there, holes are bridged and ear-clipped, and the interior
+is densified on a grid whose spacing follows the local radius of curvature.

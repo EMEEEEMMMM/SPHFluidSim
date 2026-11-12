@@ -57,6 +57,7 @@ ThemeTokens MakeCupertinoDark() {
     t.shadowColor = Black(90);
     t.hud = Rgba(0x0A, 0x0B, 0x0E, 160);
     t.hudBorder = White(30);
+    t.viewportBackground = Rgba(0x1F, 0x26, 0x38);
     t.radiusLg = 12;
     t.radius = 10;
     t.radiusSm = 7;
@@ -99,6 +100,7 @@ ThemeTokens MakeCupertinoLight() {
     t.shadowColor = Black(36);
     t.hud = Rgba(0x0C, 0x0E, 0x12, 150);
     t.hudBorder = White(28);
+    t.viewportBackground = Rgba(0x1F, 0x26, 0x38);
     t.radiusLg = 12;
     t.radius = 10;
     t.radiusSm = 7;
@@ -141,6 +143,7 @@ ThemeTokens MakeLinearDark() {
     t.shadowColor = Black(120);
     t.hud = Rgba(0x0B, 0x0C, 0x0E, 168);
     t.hudBorder = White(24);
+    t.viewportBackground = Rgba(0x1F, 0x26, 0x38);
     t.radiusLg = 8;
     t.radius = 6;
     t.radiusSm = 4;
@@ -186,6 +189,7 @@ ThemeTokens MakeSwissLight() {
     t.shadowColor = Black(0);
     t.hud = Rgba(0x0C, 0x0E, 0x12, 150);
     t.hudBorder = White(24);
+    t.viewportBackground = Rgba(0x1F, 0x26, 0x38);
     t.radiusLg = 0;
     t.radius = 0;
     t.radiusSm = 0;
@@ -258,6 +262,15 @@ bool Theme::isDark() const { return tokens(m_index).dark; }
 
 const ThemeTokens& Theme::current() const { return tokens(m_index); }
 
+QColor Theme::viewportBackground() const { return m_viewportBackground; }
+
+void Theme::setViewportBackground(const QColor& color) {
+    if (!color.isValid()) return;
+    m_viewportBackground = color;
+    saveSettings();
+    Q_EMIT changed();
+}
+
 QVariantMap Theme::colors() const {
     const ThemeTokens& t = current();
     QVariantMap m;
@@ -287,6 +300,7 @@ QVariantMap Theme::colors() const {
     m.insert(QStringLiteral("shadow"), t.shadowColor);
     m.insert(QStringLiteral("hud"), t.hud);
     m.insert(QStringLiteral("hudBorder"), t.hudBorder);
+    m.insert(QStringLiteral("viewportBackground"), viewportBackground());
     return m;
 }
 
@@ -341,11 +355,19 @@ void Theme::loadSettings() {
     QSettings s;
     const int stored = s.value(QStringLiteral("ui/theme"), 0).toInt();
     m_index = (stored < 0 || stored >= count()) ? 0 : stored;
+
+    // Independent of the theme index: a user-chosen viewport background
+    // survives skin changes and application restarts. Fall back to the skin's
+    // #1F2638 factory default when the key is absent or malformed.
+    const QColor storedBg(s.value(QStringLiteral("ui/viewportBackground")).toString());
+    m_viewportBackground = storedBg.isValid() ? storedBg : tokens(m_index).viewportBackground;
 }
 
 void Theme::saveSettings() const {
     QSettings s;
     s.setValue(QStringLiteral("ui/theme"), m_index);
+    s.setValue(QStringLiteral("ui/viewportBackground"),
+               m_viewportBackground.name(QColor::HexRgb));
 }
 
 QString Theme::styleSheet() const {

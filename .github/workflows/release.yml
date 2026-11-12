@@ -1,0 +1,427 @@
+# Manual, on-demand release pipeline for SPHFluidSim.
+#
+# Jobs: prepare -> { windows, linux } -> release
+#   prepare : validate VERSION, derive tag/asset names, refuse collisions
+#   windows : MSYS2 UCRT64 (Qt6/assimp/ocl-icd) + CUDA toolkit, build + package
+#   linux   : Ubuntu 24.04 + Qt 6.8 (aqt) + apt assimp/ocl-icd + CUDA, build + package
+#   release : checksum both archives, open a DRAFT GitHub Release
+#
+# GitHub-hosted runners have NO GPU. This pipeline only COMPILES the CUDA
+# backend (it needs cuda.h / nvrtc.h; the driver/NVRTC libraries are loaded at
+# runtime via NVRTC) and runs a `--version` smoke test. It deliberately does
+# NOT run ctest and does NOT run CUDA parity tests or any CUDA kernel.
+#
+# Shells: `windows-latest` defaults to pwsh, so every cmake/build/smoke step
+# explicitly uses `shell: msys2 {0}` (MSYS2 UCRT64 bash) while the packaging
+# step switches back to pwsh for deploy/windows.ps1. All other jobs use bash.
+
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release. Leave empty to read the root VERSION; if set, it must equal VERSION.'
+        type: string
+        required: false
+        default: ''
+      notes:
+        description: 'Release notes. Leave empty for a placeholder you fill in on the web before publishing.'
+        type: string
+        required: false
+        default: ''
+      force:
+        description: 'Replace an existing DRAFT release. A published release can never be overwritten.'
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  # ---------------------------------------------------------------------------
+  prepare:
+    name: Prepare release metadata
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+      win_asset: ${{ steps.meta.outputs.win_asset }}
+      linux_asset: ${{ steps.meta.outputs.linux_asset }}
+      body: ${{ steps.meta.outputs.body }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve version, tag, asset names and collisions
+        id: meta
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_NOTES: ${{ inputs.notes }}
+          INPUT_FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+
+          # VERSION is the single source of truth: one line, no BOM, trailing \n.
+          VERSION="$(tr -d '\r\n' < VERSION)"
+          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::VERSION must be MAJOR.MINOR.PATCH, got '$VERSION'"
+            exit 1
+          fi
+
+          # A dispatcher-supplied version must match VERSION exactly.
+          if [ -n "$INPUT_VERSION" ] && [ "$INPUT_VERSION" != "$VERSION" ]; then
+            echo "::error::input version '$INPUT_VERSION' does not match VERSION '$VERSION'"
+            exit 1
+          fi
+
+          # Tag and asset names carry the full MAJOR.MINOR.PATCH version, so
+          # "v1.11.0" is exactly what users see in the release list, the tag
+          # and the archive names.
+          TAG="v${VERSION}"
+          WIN_ASSET="SPHFluidSim-v${VERSION}-win64.zip"
+          LINUX_ASSET="SPHFluidSim-v${VERSION}-linux-x86_64.tar.gz"
+          echo "VERSION=$VERSION  TAG=$TAG"
+          echo "  win  =$WIN_ASSET"
+          echo "  linux=$LINUX_ASSET"
+
+          # --- refuse to clobber an existing tag / release -------------------
+          TAG_EXISTS=0
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+            TAG_EXISTS=1
+          fi
+          RELEASE_EXISTS=0
+          RELEASE_DRAFT=false
+          if RELEASE_JSON="$(gh release view "$TAG" --json isDraft 2>/dev/null)"; then
+            RELEASE_EXISTS=1
+            RELEASE_DRAFT="$(printf '%s' "$RELEASE_JSON" | jq -r '.isDraft')"
+          fi
+
+          if [ "$TAG_EXISTS" -eq 1 ] || [ "$RELEASE_EXISTS" -eq 1 ]; then
+            if [ "$INPUT_FORCE" != "true" ]; then
+              echo "::error::tag/release '$TAG' already exists; re-run with force=true to replace a DRAFT."
+              exit 1
+            fi
+            # force may only replace a draft; a published release is final.
+            if [ "$RELEASE_EXISTS" -eq 1 ] && [ "$RELEASE_DRAFT" != "true" ]; then
+              echo "::error::release '$TAG' is already published; force cannot overwrite a published release."
+              exit 1
+            fi
+            echo "::warning::force=true: the existing draft '$TAG' will be replaced."
+          fi
+
+          # --- release body --------------------------------------------------
+          if [ -n "$INPUT_NOTES" ]; then
+            BODY="$INPUT_NOTES"
+          else
+            BODY="_Draft release for v${VERSION}. Please fill in the release notes in the GitHub web UI, then publish._"
+          fi
+
+          {
+            echo "version=$VERSION"
+            echo "tag=$TAG"
+            echo "win_asset=$WIN_ASSET"
+            echo "linux_asset=$LINUX_ASSET"
+            echo 'body<<__SPH_BODY_EOF__'
+            printf '%s\n' "$BODY"
+            echo '__SPH_BODY_EOF__'
+          } >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
+  windows:
+    name: Build + package (Windows x86_64 / UCRT64)
+    needs: prepare
+    runs-on: windows-latest
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      WIN_ASSET: ${{ needs.prepare.outputs.win_asset }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up MSYS2 (UCRT64)
+        id: msys2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          path-type: minimal
+          # qt6-base provides windeployqt; qt6-declarative provides Qt Quick /
+          # QuickControls2 / QML; ocl-icd provides OpenCL.dll.
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-qt6-base
+            mingw-w64-ucrt-x86_64-qt6-declarative
+            mingw-w64-ucrt-x86_64-qt6-tools
+            mingw-w64-ucrt-x86_64-assimp
+            mingw-w64-ucrt-x86_64-ocl-icd
+
+      # Jimver/cuda-toolkit installs the full toolkit: cuda.h, nvrtc.h and the
+      # NVRTC runtime DLLs, and writes CUDA_PATH into GITHUB_ENV. The action's
+      # own GitHub cache is enabled so the large download is reused.
+      - name: Install CUDA toolkit (headers + NVRTC runtime)
+        id: cuda
+        uses: Jimver/cuda-toolkit@v0.2.15
+        with:
+          cuda: '12.1.0'
+          method: network
+          use-github-cache: true
+
+      # windows-latest defaults to pwsh; cmake/build MUST run inside the MSYS2
+      # UCRT64 shell so gcc, ninja, Qt6 and assimp resolve correctly.
+      - name: Configure (MSYS2 bash) and enforce the CUDA gate
+        shell: msys2 {0}
+        env:
+          CUDA_PATH_WIN: ${{ steps.cuda.outputs.CUDA_PATH }}
+          CUDA_PATH_ENV: ${{ env.CUDA_PATH }}
+        run: |
+          set -euo pipefail
+
+          # Keep native Windows CUDA paths intact when MSYS2 launches cmake.exe.
+          export MSYS2_ENV_CONV_EXCL='CUDA_PATH;CUDA_HOME'
+          CUDA_ROOT="${CUDA_PATH_WIN:-${CUDA_PATH_ENV:-}}"
+          [ -n "$CUDA_ROOT" ] || CUDA_ROOT='C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.1'
+          CUDA_ROOT="${CUDA_ROOT//\\//}"          # backslashes -> forward slashes
+          export CUDA_PATH="$CUDA_ROOT"
+          export CUDA_HOME="$CUDA_ROOT"
+
+          test -f "$CUDA_ROOT/include/cuda.h"  || { echo "::error::cuda.h not found in $CUDA_ROOT/include"; exit 1; }
+          test -f "$CUDA_ROOT/include/nvrtc.h" || { echo "::error::nvrtc.h not found in $CUDA_ROOT/include"; exit 1; }
+
+          # Derive the Qt prefix from windeployqt instead of hard-coding C:/msys64.
+          QT_BIN="$(cd "$(dirname "$(command -v windeployqt)")" && pwd)"
+          QT_PREFIX="$(cygpath -m "$(dirname "$QT_BIN")")"
+
+          cmake -S . -B build -G Ninja \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DSPH_ENABLE_CUDA=ON \
+                -DCMAKE_PREFIX_PATH="$QT_PREFIX" \
+                2>&1 | tee configure.log
+
+          # Quality gate: never silently ship a CPU-only package.
+          # (Hosted runners have no GPU, so we only verify the backend compiled,
+          #  NOT that it runs - no ctest / CUDA parity here.)
+          if ! grep -q "CUDA backend: enabled" configure.log; then
+            echo "::error::'CUDA backend: enabled' missing from configure output - refusing to package."
+            exit 1
+          fi
+
+      - name: Build (MSYS2 bash)
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          cmake --build build --parallel
+
+      - name: 'Smoke test: SPHFluidSim.exe --version'
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          ./build/SPHFluidSim.exe --version | tee version.txt
+          grep -q "SPHFluidSim v" version.txt || {
+            echo "::error::--version did not print the version banner"
+            exit 1
+          }
+
+      - name: Package with deploy/windows.ps1 (pwsh)
+        shell: pwsh
+        env:
+          CUDA_PATH_WIN: ${{ steps.cuda.outputs.CUDA_PATH }}
+          MSYS2_LOCATION: ${{ steps.msys2.outputs.msys2-location }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $msysRoot = $env:MSYS2_LOCATION
+          if (-not $msysRoot -or -not (Test-Path -LiteralPath $msysRoot)) { $msysRoot = 'C:\msys64' }
+          $qtBin = Join-Path $msysRoot 'ucrt64\bin'
+          $cudaRoot = $env:CUDA_PATH_WIN
+          if (-not $cudaRoot) { $cudaRoot = $env:CUDA_PATH }
+          if (-not $cudaRoot) { $cudaRoot = "${env:ProgramFiles}\NVIDIA GPU Computing Toolkit\CUDA\v12.1" }
+          ./deploy/windows.ps1 `
+            -BuildDir 'build' `
+            -Output  "dist/$env:WIN_ASSET" `
+            -Version $env:VERSION `
+            -QtBin   $qtBin `
+            -Msys2Bin $qtBin `
+            -CudaBin (Join-Path $cudaRoot 'bin')
+
+      - name: Upload Windows package
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-package
+          path: dist/${{ needs.prepare.outputs.win_asset }}
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  linux:
+    name: Build + package (Linux x86_64)
+    needs: prepare
+    runs-on: ubuntu-24.04
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      LINUX_ASSET: ${{ needs.prepare.outputs.linux_asset }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build pkg-config \
+            libassimp-dev ocl-icd-opencl-dev opencl-headers \
+            libgl-dev libglu1-mesa-dev libegl-dev \
+            libxkbcommon-x11-0 libxcb-cursor0 libxcb-icccm4 libxcb-image0 \
+            libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 libxcb-shape0 \
+            libxcb-xinerama0 libxcb-xkb1 libxcb-xfixes0 libxcb-sync1 \
+            libdbus-1-3 libfontconfig1 libglib2.0-0
+
+      # aqtinstall via install-qt-action exports CMAKE_PREFIX_PATH / Qt6_DIR /
+      # QT_ROOT_DIR into the environment for the later cmake + packaging steps.
+      - name: Install Qt 6.8
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.8.3'
+          host: linux
+          target: desktop
+          modules: qtdeclarative qtshadertools
+          cache: true
+
+      # Full network install -> /usr/local/cuda/{include,lib64} with cuda.h,
+      # nvrtc.h and libnvrtc.so* (the latter is bundled by deploy/linux.sh).
+      - name: Install CUDA toolkit (headers + libnvrtc)
+        id: cuda
+        uses: Jimver/cuda-toolkit@v0.2.15
+        with:
+          cuda: '12.6.3'
+          method: network
+          use-github-cache: true
+
+      - name: Configure and enforce the CUDA gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f /usr/local/cuda/include/cuda.h  || { echo "::error::cuda.h missing"; exit 1; }
+          test -f /usr/local/cuda/include/nvrtc.h || { echo "::error::nvrtc.h missing"; exit 1; }
+          cmake -S . -B build -G Ninja \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DSPH_ENABLE_CUDA=ON \
+                2>&1 | tee configure.log
+          # Quality gate: hosted runners have no GPU, so we only verify the
+          # backend compiled; no ctest / CUDA parity is run in this pipeline.
+          if ! grep -q "CUDA backend: enabled" configure.log; then
+            echo "::error::'CUDA backend: enabled' missing from configure output - refusing to package."
+            exit 1
+          fi
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: 'Smoke test: SPHFluidSim --version'
+        run: |
+          set -euo pipefail
+          export LD_LIBRARY_PATH="${QT_ROOT_DIR:+$QT_ROOT_DIR/lib:}${LD_LIBRARY_PATH:-}"
+          ./build/SPHFluidSim --version | tee version.txt
+          grep -q "SPHFluidSim v" version.txt || {
+            echo "::error::--version did not print the version banner"
+            exit 1
+          }
+
+      - name: Fetch linuxdeploy and its Qt plugin
+        run: |
+          set -euo pipefail
+          mkdir -p tools
+          base=https://github.com/linuxdeploy
+          curl -fL --retry 3 -o tools/linuxdeploy \
+            "$base/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage"
+          curl -fL --retry 3 -o tools/linuxdeploy-plugin-qt \
+            "$base/linuxdeploy-plugin-qt/releases/download/continuous/linuxdeploy-plugin-qt-x86_64.AppImage"
+          chmod +x tools/linuxdeploy tools/linuxdeploy-plugin-qt
+          # linuxdeploy discovers its Qt plugin as a sibling on PATH.
+          echo "$PWD/tools" >> "$GITHUB_PATH"
+          "$PWD/tools/linuxdeploy" --version
+          "$PWD/tools/linuxdeploy-plugin-qt" --version || true
+
+      - name: Package with deploy/linux.sh
+        run: |
+          set -euo pipefail
+          chmod +x deploy/linux.sh
+          export PATH="$PWD/tools:$PATH"
+          export APPIMAGE_EXTRACT_AND_RUN=1
+          bash deploy/linux.sh \
+            --build-dir build \
+            --output "dist/$LINUX_ASSET" \
+            --version "$VERSION" \
+            --qt-root "${QT_ROOT_DIR:-}" \
+            --cuda-root /usr/local/cuda \
+            --linuxdeploy "$PWD/tools/linuxdeploy"
+
+      - name: Upload Linux package
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-package
+          path: dist/${{ needs.prepare.outputs.linux_asset }}
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  release:
+    name: Assemble draft GitHub Release
+    needs: [prepare, windows, linux]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download both packages
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS
+        env:
+          WIN_ASSET: ${{ needs.prepare.outputs.win_asset }}
+          LINUX_ASSET: ${{ needs.prepare.outputs.linux_asset }}
+        run: |
+          set -euo pipefail
+          cd artifacts
+          ls -l
+          sha256sum "$WIN_ASSET" "$LINUX_ASSET" > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create (or refresh) the DRAFT release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          WIN_ASSET: ${{ needs.prepare.outputs.win_asset }}
+          LINUX_ASSET: ${{ needs.prepare.outputs.linux_asset }}
+          BODY: ${{ needs.prepare.outputs.body }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          if [ "$FORCE" = "true" ]; then
+            # prepare already verified that only a DRAFT may be replaced.
+            # Remove the draft and its tag so the new release/tag points at the
+            # workflow's current commit; a missing/stale tag is harmless.
+            gh release delete "$TAG" --yes --cleanup-tag 2>/dev/null || true
+            git push origin ":refs/tags/$TAG" 2>/dev/null || true
+          fi
+          # Always create a DRAFT; the maintainer fills in notes/asset checks
+          # in the GitHub web UI and then presses "Publish release".
+          gh release create "$TAG" \
+            --draft \
+            --title "SPHFluidSim v$VERSION" \
+            --notes "$BODY" \
+            "artifacts/$WIN_ASSET" \
+            "artifacts/$LINUX_ASSET" \
+            artifacts/SHA256SUMS \
+            README.md

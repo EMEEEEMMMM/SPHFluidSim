@@ -70,6 +70,7 @@ float FluidSolver::WAdhesion(float r) const {
 
 // ---------------------------------------------------------------------------
 void FluidSolver::Init(float boxX, float boxY, float boxZ, float waterSize) {
+    m_Empty = false;   // any real scene clears the empty state
     m_BoxX = boxX; m_BoxY = boxY; m_BoxZ = boxZ; m_WaterSize = waterSize;
     m_UseFullInit = false;
     m_Inflow = false;   // CRITICAL: Reset() branches on this
@@ -104,6 +105,7 @@ void FluidSolver::Init(float boxX, float boxY, float boxZ, float waterSize) {
 
 // ---------------------------------------------------------------------------
 void FluidSolver::InitDamOpen(float boxX, float boxY, float boxZ, float waterSize) {
+    m_Empty = false;
     m_BoxX = boxX; m_BoxY = boxY; m_BoxZ = boxZ; m_WaterSize = waterSize;
     m_UseFullInit = false;
     m_Inflow = false;
@@ -158,6 +160,7 @@ void FluidSolver::SpawnDrop(float radius, float cx, float cy, float cz) {
 
 // ---------------------------------------------------------------------------
 void FluidSolver::InitFull(float boxX, float boxY, float boxZ, float waterHeight) {
+    m_Empty = false;
     m_BoxX = boxX; m_BoxY = boxY; m_BoxZ = boxZ; m_WaterSize = waterHeight;
     m_UseFullInit = true;
     m_Inflow = false;   // CRITICAL: Reset() branches on this
@@ -222,6 +225,7 @@ void FluidSolver::PushFluid(float x, float y, float z) {
 // Open-top cubic container + continuous central jet (inflow scene).
 void FluidSolver::InitInflow(float tankSize, float gap, int perStep, float radius,
                              float cx, float cz, int maxParticles) {
+    m_Empty = false;
     m_BoxX = tankSize; m_BoxY = tankSize; m_BoxZ = tankSize; m_WaterSize = 0.0f;
     m_Inflow = true; m_InflowGap = gap; m_InflowPerStep = perStep;
     m_InflowRadius = radius; m_InflowX = cx; m_InflowZ = cz;
@@ -270,6 +274,7 @@ void FluidSolver::InitInflow(float tankSize, float gap, int perStep, float radiu
 // Pre-filled pool + hovering drop falling into it (fixed pool:drop volume).
 void FluidSolver::InitDrop(float tankSize, float poolHeight, float dropRadius, float dropGap,
                            float cx, float cz, int maxParticles) {
+    m_Empty = false;
     m_BoxX = tankSize; m_BoxY = tankSize; m_BoxZ = tankSize; m_WaterSize = 0.0f;
     m_Inflow = false;                 // no jet; this scene is a one-shot drop
     m_Drop = true;
@@ -453,7 +458,33 @@ void FluidSolver::BuildBoundary(bool openTop) {
     }
 }
 
+// Empty scene (v2): leave no fluid and no boundary behind. Everything the
+// renderer reads (positions, colors, boundary positions, counts) becomes an
+// empty vector / zero. Step() then only advances time (see below).
+void FluidSolver::InitEmpty() {
+    m_Empty = true;
+    m_Inflow = false;
+    m_Drop = false;
+    m_UseFullInit = false;
+    m_UseDamOpen = false;
+    m_DropSpawned = false;
+
+    m_X.clear(); m_V.clear(); m_Vadv.clear();
+    m_dii.clear(); m_S.clear();
+    m_Rho.clear(); m_RhoAdv.clear(); m_P.clear(); m_Pprev.clear(); m_Pold.clear();
+    m_aii.clear(); m_deltaB.clear(); m_gradB.clear(); m_gradB2.clear();
+    m_FluidNb.clear(); m_BoundNb.clear(); m_Normals.clear(); m_Colors.clear();
+    m_Alpha.clear(); m_KappaV.clear(); m_KappaVPrev.clear(); m_KappaSeed.clear();
+    m_BoundX.clear(); m_BoundV.clear();
+    m_convTrace.clear();
+    m_N = 0;
+    m_Time = 0.0f;
+    m_AvgErr = 0.0f; m_AvgAbsErr = 0.0f; m_MaxErr = 0.0f;
+    m_LastIter = 0; m_LastIterV = 0; m_LastPressureMs = 0.0f;
+}
+
 void FluidSolver::Reset() {
+    if (m_Empty) { InitEmpty(); return; }   // stay in the empty scene
     if (m_Inflow)      InitInflow(m_BoxX, m_InflowGap, m_InflowPerStep, m_InflowRadius, m_InflowX, m_InflowZ, m_MaxParticles);
     else if (m_Drop)   InitDrop(m_BoxX, m_DropPool, m_DropSize, m_DropGap, m_InflowX, m_InflowZ, m_MaxParticles);
     else if (m_UseDamOpen) InitDamOpen(m_BoxX, m_BoxY, m_BoxZ, m_WaterSize);
@@ -1121,6 +1152,13 @@ void FluidSolver::UpdateColors() {
 }
 
 void FluidSolver::Step() {
+    if (m_Empty) {
+        // Empty scene: nothing to simulate, but SimTime() must still advance by
+        // dt. headless_timing::AdvanceTo loops `while (SimTime() < target)
+        // Step()`, so a static clock here would spin forever.
+        m_Time += params.dt;
+        return;
+    }
     // CFL condition (paper Sec.3.1): dt <= 0.4 * d / vmax with d = particle
     // diameter (= spacing). Keeps the particle displacement per step well
     // below the kernel support (helps when the water block slams into the

@@ -63,12 +63,15 @@ int RunQmlFrontend(QApplication& app, SimulationSession& session, bool autoplay,
             window->requestActivate();
             const QString path = QString::fromStdString(screenshotPath);
             QTimer::singleShot(screenshotDelayMs, window, [window, path] {
-                // QQuickWindow::grabWindow() can block the render thread when a
-                // custom framebuffer renderer is present, so grab the composed
-                // screen instead: the window is raised right before the shot.
-                QImage shot;
-                if (QScreen* screen = window->screen()) {
-                    shot = screen->grabWindow(window->winId()).toImage();
+                // Prefer Qt's own window grab: it is deterministic and does not
+                // depend on which external window happens to be foreground.
+                // Fall back to a screen grab only when the framebuffer item
+                // cannot be captured synchronously.
+                QImage shot = window->grabWindow();
+                if (shot.isNull()) {
+                    if (QScreen* screen = window->screen()) {
+                        shot = screen->grabWindow(window->winId()).toImage();
+                    }
                 }
                 if (!shot.isNull()) shot.save(path, "PNG");
                 QCoreApplication::quit();

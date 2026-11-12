@@ -7,6 +7,8 @@ import IISPH.View
 Flickable {
     id: panel
     property var session
+    // Bound by Main.qml (`isEmpty: root.isEmpty`).
+    property bool isEmpty: false
     signal sceneRequested(int scene)
     signal particleCountRequested(int count)
 
@@ -15,6 +17,8 @@ Flickable {
     contentHeight: Math.max(height, column.implicitHeight)
     boundsBehavior: Flickable.StopAtBounds
     ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+
+    Component.onCompleted: panel.refreshDropParams()
 
     readonly property var c: Theme.colors
     readonly property var m: Theme.metrics
@@ -82,26 +86,65 @@ Flickable {
         return out;
     }
 
+    // Drop parameters are shared with the session (used by export/render).
+    function applyDropParams() {
+        if (!panel.session || panel.session.setDropParams === undefined) return;
+        panel.session.setDropParams(dropRadiusField.value,
+                                    dropXField.value,
+                                    dropYField.value,
+                                    dropZField.value);
+    }
+
+    function refreshDropParams() {
+        if (!panel.session || panel.session.dropParams === undefined) return;
+        const d = panel.session.dropParams();
+        if (!d) return;
+        if (d.radius !== undefined) dropRadiusField.value = Number(d.radius);
+        if (d.x !== undefined) dropXField.value = Number(d.x);
+        if (d.y !== undefined) dropYField.value = Number(d.y);
+        if (d.z !== undefined) dropZField.value = Number(d.z);
+    }
+
     ColumnLayout {
         id: column
         width: panel.width
-        height: Math.max(panel.height, implicitHeight)
+        // The fluid layout stretches the Metrics card to fill the viewport.
+        // Empty has one compact Scene card: sizing the column to its implicit
+        // height keeps that card at the top instead of vertically centering it.
+        height: panel.isEmpty ? implicitHeight : Math.max(panel.height, implicitHeight)
         spacing: panel.m.cardGap
 
         Card {
             title: "Scene"
-            badge: "open tank"
+            // Empty has no fluid: the card collapses to a badge so the panel
+            // keeps its visual rhythm without exposing solver controls.
+            badge: panel.isEmpty ? "empty" : "open tank"
             Layout.fillWidth: true
 
             Segmented {
+                id: sceneField
                 Layout.fillWidth: true
+                visible: !panel.isEmpty
                 options: ["Dam break", "Inflow"]
-                currentIndex: panel.p.scene !== undefined ? panel.p.scene : 0
+                // Clamp: scene 2 (empty) is not a segment; the card hides the
+                // control there but currentIndex must still be 0..1.
+                currentIndex: panel.p.scene !== undefined && panel.p.scene === 1 ? 1 : 0
                 onActivated: (index) => panel.sceneRequested(index)
+            }
+
+            Text {
+                Layout.fillWidth: true
+                visible: panel.isEmpty
+                text: qsTr("No fluid simulation. Add 3D models in the Objects card; switch scenes from Option › Scene.")
+                color: panel.c.fg3
+                font.pixelSize: 10
+                wrapMode: Text.WordWrap
+                lineHeight: 1.2
             }
 
             RowLayout {
                 Layout.fillWidth: true
+                visible: !panel.isEmpty
                 spacing: 8
                 Text {
                     text: "Particles"
@@ -198,6 +241,7 @@ Flickable {
             // resolution presets' information without the vague labels.
             Text {
                 Layout.fillWidth: true
+                visible: !panel.isEmpty
                 text: "spacing " + Number(panel.st.spacing !== undefined ? panel.st.spacing : 0).toFixed(4)
                       + " m" + (panel.bytesPerParticle > 0
                                 ? "  ·  " + panel.formatBytes(panel.neededBytes)
@@ -211,7 +255,7 @@ Flickable {
 
             Text {
                 Layout.fillWidth: true
-                visible: panel.overBudget
+                visible: !panel.isEmpty && panel.overBudget
                 text: panel.particleBudgetMessage !== ""
                       ? panel.particleBudgetMessage
                       : "More particles than the GPU can hold — lower the count or the solver will refuse to build the scene."
@@ -222,6 +266,7 @@ Flickable {
 
             RowLayout {
                 Layout.fillWidth: true
+                visible: !panel.isEmpty
                 Text {
                     text: "Active"
                     color: panel.c.fg2
@@ -237,7 +282,8 @@ Flickable {
 
             Rectangle {
                 Layout.fillWidth: true
-                visible: (panel.p.scene !== undefined ? panel.p.scene : 0) === 0
+                // Hidden in the Empty scene and for Inflow (index 1).
+                visible: !panel.isEmpty && sceneField.currentIndex !== 1
                 implicitHeight: panel.m.controlH
                 radius: panel.m.square ? 0 : panel.m.radiusSm
                 color: dropArea.containsMouse && !panel.st.hasDrop
@@ -273,6 +319,57 @@ Flickable {
                     onClicked: panel.session.spawnDrop()
                 }
             }
+
+            Text {
+                Layout.fillWidth: true
+                visible: !panel.isEmpty && sceneField.currentIndex !== 1
+                Layout.topMargin: 2
+                text: qsTr("DROP PARAMETERS")
+                color: panel.c.fg3
+                font.pixelSize: 9
+                font.weight: Font.DemiBold
+            }
+
+            NumberField {
+                id: dropRadiusField
+                Layout.fillWidth: true
+                visible: !panel.isEmpty && sceneField.currentIndex !== 1
+                label: qsTr("Radius")
+                labelWidth: 54
+                value: 0.2
+                from: 0.001; to: 100; decimals: 3
+                onEdited: panel.applyDropParams()
+            }
+            NumberField {
+                id: dropXField
+                Layout.fillWidth: true
+                visible: !panel.isEmpty && sceneField.currentIndex !== 1
+                label: "X"
+                labelWidth: 54
+                value: 1.0
+                from: -100000; to: 100000; decimals: 3
+                onEdited: panel.applyDropParams()
+            }
+            NumberField {
+                id: dropYField
+                Layout.fillWidth: true
+                visible: !panel.isEmpty && sceneField.currentIndex !== 1
+                label: "Y"
+                labelWidth: 54
+                value: 1.6
+                from: -100000; to: 100000; decimals: 3
+                onEdited: panel.applyDropParams()
+            }
+            NumberField {
+                id: dropZField
+                Layout.fillWidth: true
+                visible: !panel.isEmpty && sceneField.currentIndex !== 1
+                label: "Z"
+                labelWidth: 54
+                value: 0.5
+                from: -100000; to: 100000; decimals: 3
+                onEdited: panel.applyDropParams()
+            }
         }
 
         Card {
@@ -280,6 +377,12 @@ Flickable {
             badge: panel.session && panel.session.running ? "running" : "paused"
             badgeLive: panel.session && panel.session.running
             Layout.fillWidth: true
+            visible: !panel.isEmpty
+            // Hidden cards must not reserve layout space: Qt Quick Layouts can
+            // keep a hidden item's preferred height, which pushed the Scene
+            // card to the middle of the panel in the Empty scene.
+            Layout.preferredHeight: panel.isEmpty ? 0 : implicitHeight
+            Layout.maximumHeight: panel.isEmpty ? 0 : 1000000
 
             SliderRow {
                 Layout.fillWidth: true
@@ -321,8 +424,10 @@ Flickable {
             title: "Metrics"
             badge: "live"
             Layout.fillWidth: true
-            Layout.fillHeight: true
-            Layout.minimumHeight: 300
+            Layout.fillHeight: !panel.isEmpty
+            visible: !panel.isEmpty
+            Layout.minimumHeight: panel.isEmpty ? 0 : 300
+            Layout.preferredHeight: panel.isEmpty ? 0 : implicitHeight
 
             MetricGrid {
                 Layout.fillWidth: true

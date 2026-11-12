@@ -1,7 +1,10 @@
 #include "Model.hpp"
 
+#include <QFile>
 #include <QFileInfo>
 #include <QString>
+
+#include "StepImporter.hpp"
 
 #include <assimp/Importer.hpp>
 #include <assimp/postprocess.h>
@@ -22,10 +25,33 @@ bool Finite(const aiVector3D& v) {
     return std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z);
 }
 
+// Derives the four bounds fields from the already-built vertex buffer. The
+// geometry itself is never scaled, fitted or re-centered.
+void ComputeBounds(ModelData& data) {
+    float lower[3] = {std::numeric_limits<float>::max(),
+                      std::numeric_limits<float>::max(),
+                      std::numeric_limits<float>::max()};
+    float upper[3] = {-std::numeric_limits<float>::max(),
+                      -std::numeric_limits<float>::max(),
+                      -std::numeric_limits<float>::max()};
+    for (size_t vertex = 0; vertex < data.vertexCount; ++vertex) {
+        const float* position = &data.vertices[vertex * 6u];
+        for (int axis = 0; axis < 3; ++axis) {
+            lower[axis] = std::min(lower[axis], position[axis]);
+            upper[axis] = std::max(upper[axis], position[axis]);
+        }
+    }
+    data.boundsMin = Math::Vector3(lower[0], lower[1], lower[2]);
+    data.boundsMax = Math::Vector3(upper[0], upper[1], upper[2]);
+    data.boundsCenter = (data.boundsMin + data.boundsMax) * 0.5f;
+    data.boundsExtent = data.boundsMax - data.boundsMin;
+}
+
 }  // namespace
 
-ModelDataPtr Model::Load(const QString& filePath, QString* errorMessage) {
+ModelDataPtr Model::Load(const QString& filePath, QString* errorMessage, QString* warningMessage) {
     if (errorMessage) errorMessage->clear();
+    if (warningMessage) warningMessage->clear();
     if (filePath.trimmed().isEmpty()) {
         return Fail(QStringLiteral("No model file was specified."), errorMessage);
     }
@@ -38,11 +64,58 @@ ModelDataPtr Model::Load(const QString& filePath, QString* errorMessage) {
     const QString extension = fileInfo.suffix().toLower();
     static const QStringList supported = {
         QStringLiteral("obj"), QStringLiteral("fbx"), QStringLiteral("stl"),
-        QStringLiteral("dae"), QStringLiteral("3ds")
+        QStringLiteral("dae"), QStringLiteral("3ds"), QStringLiteral("ply"),
+        QStringLiteral("off"), QStringLiteral("gltf"), QStringLiteral("glb"),
+        QStringLiteral("step"), QStringLiteral("stp")
     };
     if (!supported.contains(extension)) {
-        return Fail(QStringLiteral("Unsupported model format '.%1'. Supported formats: obj, fbx, stl, dae, 3ds.")
+        return Fail(QStringLiteral("Unsupported model format '.%1'. Supported formats: obj, fbx, stl, dae, 3ds, ply, off, gltf, glb, step, stp.")
                         .arg(extension), errorMessage);
+    }
+
+    // STEP is a CAD exchange format, not a triangle mesh: Assimp cannot read
+    // it, so it goes through the built-in B-rep tessellator instead.
+    if (extension == QLatin1String("step") || extension == QLatin1String("stp")) {
+        QFile file(filePath);
+        if (!file.open(QIODevice::ReadOnly)) {
+            return Fail(QStringLiteral("Could not open '%1': %2")
+                            .arg(filePath, file.errorString()), errorMessage);
+        }
+        const QByteArray bytes = file.readAll();
+        file.close();
+
+        Step::Mesh mesh;
+        std::string stepError;
+        if (!Step::Tessellate(std::string(bytes.constData(), static_cast<size_t>(bytes.size())),
+                              mesh, stepError)) {
+            return Fail(QStringLiteral("Could not import '%1': %2")
+                            .arg(filePath, QString::fromStdString(stepError)), errorMessage);
+        }
+        if (warningMessage) *warningMessage = QString::fromStdString(mesh.warning);
+
+        auto data = std::make_shared<ModelData>();
+        data->sourcePath = filePath.toUtf8().toStdString();
+        const size_t vertexCount = mesh.positions.size() / 3u;
+        if (mesh.normals.size() != mesh.positions.size() || vertexCount == 0 ||
+            mesh.indices.empty()) {
+            return Fail(QStringLiteral("The STEP importer produced an empty mesh."), errorMessage);
+        }
+        data->vertices.resize(vertexCount * 6u);
+        for (size_t v = 0; v < vertexCount; ++v) {
+            data->vertices[v * 6u + 0] = mesh.positions[v * 3u + 0];
+            data->vertices[v * 6u + 1] = mesh.positions[v * 3u + 1];
+            data->vertices[v * 6u + 2] = mesh.positions[v * 3u + 2];
+            data->vertices[v * 6u + 3] = mesh.normals[v * 3u + 0];
+            data->vertices[v * 6u + 4] = mesh.normals[v * 3u + 1];
+            data->vertices[v * 6u + 5] = mesh.normals[v * 3u + 2];
+        }
+        data->indices = std::move(mesh.indices);
+        data->edges = std::move(mesh.edges);
+        data->vertexCount = static_cast<uint32_t>(vertexCount);
+        data->triangleCount = static_cast<uint32_t>(data->indices.size() / 3u);
+        data->meshCount = static_cast<uint32_t>(mesh.faces);
+        ComputeBounds(*data);
+        return data;
     }
 
     Assimp::Importer importer;
@@ -182,53 +255,7 @@ ModelDataPtr Model::Load(const QString& filePath, QString* errorMessage) {
         }
     }
 
-    aiVector3D lower(std::numeric_limits<float>::max(),
-                     std::numeric_limits<float>::max(),
-                     std::numeric_limits<float>::max());
-    aiVector3D upper(-std::numeric_limits<float>::max(),
-                     -std::numeric_limits<float>::max(),
-                     -std::numeric_limits<float>::max());
-    for (size_t vertex = 0; vertex < data->vertexCount; ++vertex) {
-        const float* position = &data->vertices[vertex * 6u];
-        lower.x = std::min(lower.x, position[0]);
-        lower.y = std::min(lower.y, position[1]);
-        lower.z = std::min(lower.z, position[2]);
-        upper.x = std::max(upper.x, position[0]);
-        upper.y = std::max(upper.y, position[1]);
-        upper.z = std::max(upper.z, position[2]);
-    }
-
-    // Fit the visual asset into the default 2.0 x 1.2 x 1.0 tank, centred in
-    // X/Z and resting just above its floor. This is render geometry only; no
-    // solver positions or collision boundaries are changed.
-    const aiVector3D extent = upper - lower;
-    const aiVector3D center = (upper + lower) * 0.5f;
-    constexpr float targetWidth = 1.2f;
-    constexpr float targetHeight = 0.8f;
-    constexpr float targetDepth = 0.6f;
-    double scale = std::numeric_limits<double>::max();
-    if (extent.x > 1.0e-12f) scale = std::min(scale, static_cast<double>(targetWidth) / extent.x);
-    if (extent.y > 1.0e-12f) scale = std::min(scale, static_cast<double>(targetHeight) / extent.y);
-    if (extent.z > 1.0e-12f) scale = std::min(scale, static_cast<double>(targetDepth) / extent.z);
-    if (!std::isfinite(scale) || scale <= 0.0 || scale == std::numeric_limits<double>::max()) {
-        return Fail(QStringLiteral("The model has no usable spatial extent."), errorMessage);
-    }
-
-    for (size_t vertex = 0; vertex < data->vertexCount; ++vertex) {
-        float* position = &data->vertices[vertex * 6u];
-        const double x = (static_cast<double>(position[0]) - center.x) * scale;
-        const double y = (static_cast<double>(position[1]) - lower.y) * scale + 0.05;
-        const double z = (static_cast<double>(position[2]) - center.z) * scale;
-        if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z) ||
-            std::abs(x) > std::numeric_limits<float>::max() ||
-            std::abs(y) > std::numeric_limits<float>::max() ||
-            std::abs(z) > std::numeric_limits<float>::max()) {
-            return Fail(QStringLiteral("The model could not be normalized to a finite size."), errorMessage);
-        }
-        position[0] = static_cast<float>(x);
-        position[1] = static_cast<float>(y);
-        position[2] = static_cast<float>(z);
-    }
+    ComputeBounds(*data);
 
     return data;
 }

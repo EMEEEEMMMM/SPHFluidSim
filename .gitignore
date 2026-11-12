@@ -1,6 +1,7 @@
 build
 build-*
 out/
+dist/
 .reasonix
 reasonix.toml
 docs

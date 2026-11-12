@@ -8,6 +8,10 @@ Popup {
     id: dialog
     property var session
     property var job
+    property var cameraSource        // Main.qml viewportProbe (optional)
+    // Event state lives on the dialog so pullCurrentParams() can reset it per
+    // open without touching the session's live parameters.
+    property bool dropEnabled: false
 
     signal started()
 
@@ -17,6 +21,13 @@ Popup {
     property var validation: ({ valid: false, message: "Checking the output path…" })
     property string actionError: ""
     property bool syncingFrameTime: false
+    // Derived event warnings: property bindings so the estimate updates while
+    // the radius (or particle count) changes.
+    readonly property real dropCount: dialog.dropParticleCount()
+    readonly property string dropBudgetMessage: dialog.dropBudgetError()
+    // Defensive: Main keeps the dialog closed in Empty, but never map an empty
+    // scene onto a dam render if it is opened some other way.
+    readonly property bool emptyScene: session && session.isEmpty === true
 
     parent: Overlay.overlay
     anchors.centerIn: parent
@@ -49,6 +60,77 @@ Popup {
         syncingFrameTime = false;
     }
 
+    // QColor -> "#RRGGBB" for render.background.
+    function colorToHex(col) {
+        if (!col || col.r === undefined) return "#1F2638";
+        function byte(v) {
+            const n = Math.max(0, Math.min(255, Math.round(Number(v) * 255)));
+            return (n < 16 ? "0" : "") + n.toString(16).toUpperCase();
+        }
+        return "#" + byte(col.r) + byte(col.g) + byte(col.b);
+    }
+
+    // Models are exported by the session; Empty is the only scene that can
+    // hold them, and headless renders never run there. Keep exactly the schema
+    // v2 keys (the session also publishes transform/triangleCount for the
+    // renderer, which must not leak into the job config).
+    function modelConfigs() {
+        if (!(dialog.session && dialog.session.modelConfigs !== undefined)) return [];
+        const cfgs = dialog.session.modelConfigs();
+        if (!cfgs) return [];
+        const models = [];
+        for (let i = 0; i < cfgs.length; ++i) {
+            const m = cfgs[i];
+            models.push({
+                path: m.path,
+                position: m.position,
+                rotation: m.rotation,
+                scale: m.scale,
+                visible: m.visible
+            });
+        }
+        return models;
+    }
+
+    // Approximate particle count of the drop: sphere volume / spacing³.
+    function dropParticleCount() {
+        if (!dialog.dropEnabled) return 0;
+        const spacing = dialog.p ? Number(dialog.p.spacing) : 0;
+        if (!(spacing > 0)) return 0;
+        const r = Math.max(0, dropRadiusField.value);
+        const volume = 4.0 / 3.0 * Math.PI * r * r * r;
+        return Math.max(0, Math.round(volume / Math.pow(spacing, 3)));
+    }
+
+    function dropBudgetError() {
+        if (sceneField.currentIndex === 1 || !dialog.dropEnabled) return "";
+        const base = Math.max(128, Math.round(particleField.value));
+        if (!dialog.session || dialog.session.particleBudgetError === undefined) return "";
+        const total = Math.min(2147483647, base + dialog.dropParticleCount());
+        return dialog.session.particleBudgetError(total);
+    }
+
+    function formatCount(n) {
+        const raw = String(Math.max(0, Math.round(n)));
+        let out = "";
+        let count = 0;
+        for (let i = raw.length - 1; i >= 0; --i) {
+            out = raw[i] + out;
+            if (++count % 3 === 0 && i > 0) out = " " + out;
+        }
+        return out;
+    }
+
+    // Keep the live session's drop shape in sync with the event editor; the
+    // headless run uses the config, the live scene uses these parameters.
+    function syncDropParams() {
+        if (!session || session.setDropParams === undefined) return;
+        session.setDropParams(dropRadiusField.value,
+                              dropXField.value,
+                              dropYField.value,
+                              dropZField.value);
+    }
+
     function buildConfig() {
         const scene = sceneField.currentIndex === 1 ? "inflow" : "dam";
         const solver = solverField.currentIndex === 1 ? "DFSPH" : "IISPH";
@@ -58,9 +140,25 @@ Popup {
         const particles = Math.max(128, Math.round(particleField.value));
         const baseCount = inflow ? Math.max(1, particles - 8) : particles;
         const spacing = Math.cbrt(volume / baseCount);
+
+        const events = [];
+        // One drop event, Dam only; Inflow keeps its continuous source.
+        if (!inflow && dialog.dropEnabled) {
+            events.push({
+                type: "drop",
+                time: dropTimeField.value,
+                radius: dropRadiusField.value,
+                x: dropXField.value,
+                y: dropYField.value,
+                z: dropZField.value
+            });
+        }
+
+        const cam = cameraEditor.config();
+
         return {
             app: "IISPH",
-            schemaVersion: 1,
+            schemaVersion: 2,
             simulation: {
                 scene: scene,
                 solver: solver,
@@ -74,9 +172,10 @@ Popup {
                 maxIter: maxIterField.value,
                 viscosity: viscosityField.value,
                 surfaceTension: tensionField.value,
-                wallAdhesion: adhesionField.value
+                wallAdhesion: adhesionField.value,
+                models: dialog.modelConfigs()
             },
-            events: [],
+            events: events,
             render: {
                 mode: mode,
                 gridScale: gridField.value,
@@ -91,20 +190,48 @@ Popup {
                 exportParticles: exportPly.checked,
                 output: outputField.text.trim(),
                 keepFrames: keepFrames.checked,
-                noVideo: noVideo.checked
+                noVideo: noVideo.checked,
+                camera: {
+                    yaw: cam.yaw,
+                    pitch: cam.pitch,
+                    distance: cam.distance,
+                    target: [cam.targetX, cam.targetY, cam.targetZ],
+                    fov: cam.fov
+                },
+                background: dialog.colorToHex(dialog.c.viewportBackground)
             }
         };
     }
 
     function validateNow() {
         if (!session || !job) return;
+        if (dialog.emptyScene) {
+            validation = ({ valid: false,
+                            message: qsTr("The Empty scene supports screenshots, not offline renders.") });
+            return;
+        }
         const particles = Math.max(128, Math.round(particleField.value));
         const budgetError = session.particleBudgetError(particles);
         if (budgetError !== "") {
             validation = ({ valid: false, message: budgetError });
             return;
         }
+        const eventError = dialog.dropBudgetError();
+        if (eventError !== "") {
+            validation = ({ valid: false, message: eventError });
+            return;
+        }
         validation = job.validateOptions(buildConfig());
+    }
+
+    // When the user switches the scene inside the dialog, restore that scene's
+    // fixed target (Dam 0.55, Inflow 0.50) instead of carrying the old framing.
+    function resetCameraForScene(sceneIndex) {
+        if (!cameraEditor || !session) return;
+        const cfg = session.cameraState;
+        if (!cfg) return;
+        cfg.targetY = sceneIndex === 1 ? 0.5 : 0.55;
+        cameraEditor.applyConfig(cfg);
     }
 
     function pullCurrentParams() {
@@ -136,6 +263,26 @@ Popup {
         syncingFrameTime = false;
         outputField.text = job ? job.defaultOutputPath() : "";
         actionError = "";
+
+        // Camera defaults: the session's per-scene camera state (fixed headless
+        // views). The live viewport is only copied by "Use current view".
+        cameraEditor.refresh();
+
+        // Events: start disabled every time the dialog opens; shape/position
+        // come from the session's current drop parameters.
+        dialog.dropEnabled = false;
+        dropToggle.checked = false;
+        if (session.dropParams !== undefined) {
+            const dp = session.dropParams();
+            if (dp) {
+                if (dp.radius !== undefined) dropRadiusField.value = Number(dp.radius);
+                if (dp.x !== undefined) dropXField.value = Number(dp.x);
+                if (dp.y !== undefined) dropYField.value = Number(dp.y);
+                if (dp.z !== undefined) dropZField.value = Number(dp.z);
+            }
+        }
+        dropTimeField.value = 1.0;
+
         validateNow();
     }
 
@@ -205,7 +352,10 @@ Popup {
                             Layout.fillWidth: true
                             label: qsTr("Scene")
                             options: [qsTr("Dam break"), qsTr("Inflow")]
-                            onActivated: dialog.scheduleValidation()
+                            onActivated: {
+                                dialog.resetCameraForScene(sceneField.currentIndex);
+                                dialog.scheduleValidation();
+                            }
                         }
                         RenderSegmented {
                             id: solverField
@@ -375,6 +525,151 @@ Popup {
                             to: 100
                             integer: true
                             onEdited: dialog.scheduleValidation()
+                        }
+                    }
+                }
+
+                RenderSection {
+                    heading: qsTr("Events")
+                    // Dam break only: Inflow has a continuous source instead of
+                    // a timed drop.
+                    visible: sceneField.currentIndex === 0
+
+                    RenderToggle {
+                        id: dropToggle
+                        label: qsTr("Spawn a water drop")
+                        checked: false
+                        onToggled: {
+                            dialog.dropEnabled = checked;
+                            dialog.scheduleValidation();
+                        }
+                    }
+
+                    GridLayout {
+                        Layout.fillWidth: true
+                        columns: 2
+                        columnSpacing: 22
+                        rowSpacing: 8
+                        visible: dialog.dropEnabled
+
+                        ColumnLayout {
+                            Layout.fillWidth: true
+                            spacing: 2
+
+                            RenderField {
+                                id: dropTimeField
+                                Layout.fillWidth: true
+                                label: qsTr("Drop time")
+                                suffix: "s"
+                                value: 1
+                                from: 0
+                                to: 100000
+                                decimals: 3
+                                onEdited: dialog.scheduleValidation()
+                            }
+                            Text {
+                                Layout.fillWidth: true
+                                text: qsTr("frame ")
+                                      + Math.round(dropTimeField.value
+                                                   * Math.max(1, Math.round(fpsField.value)))
+                                color: dialog.c.fg3
+                                font.pixelSize: 10
+                                font.family: dialog.m.numberFamily
+                            }
+                        }
+                        RenderField {
+                            id: dropRadiusField
+                            Layout.fillWidth: true
+                            label: qsTr("Drop radius")
+                            value: 0.2
+                            from: 0.001
+                            to: 100
+                            decimals: 3
+                            onEdited: {
+                                dialog.syncDropParams();
+                                dialog.scheduleValidation();
+                            }
+                        }
+                        RenderField {
+                            id: dropXField
+                            Layout.fillWidth: true
+                            label: qsTr("Drop X")
+                            value: 1.0
+                            from: -100000
+                            to: 100000
+                            decimals: 3
+                            onEdited: {
+                                dialog.syncDropParams();
+                                dialog.scheduleValidation();
+                            }
+                        }
+                        RenderField {
+                            id: dropYField
+                            Layout.fillWidth: true
+                            label: qsTr("Drop Y")
+                            value: 1.6
+                            from: -100000
+                            to: 100000
+                            decimals: 3
+                            onEdited: {
+                                dialog.syncDropParams();
+                                dialog.scheduleValidation();
+                            }
+                        }
+                        RenderField {
+                            id: dropZField
+                            Layout.fillWidth: true
+                            label: qsTr("Drop Z")
+                            value: 0.5
+                            from: -100000
+                            to: 100000
+                            decimals: 3
+                            onEdited: {
+                                dialog.syncDropParams();
+                                dialog.scheduleValidation();
+                            }
+                        }
+                    }
+
+                    Text {
+                        Layout.fillWidth: true
+                        visible: dialog.dropEnabled
+                        text: dialog.dropBudgetMessage !== ""
+                              ? dialog.dropBudgetMessage
+                              : qsTr("Drop ≈ ") + dialog.formatCount(dialog.dropCount)
+                                + qsTr(" particles  ·  total ≈ ")
+                                + dialog.formatCount(Math.max(128, Math.round(particleField.value))
+                                                     + dialog.dropCount)
+                        color: dialog.dropBudgetMessage !== "" ? dialog.c.danger : dialog.c.fg3
+                        font.pixelSize: 11
+                        wrapMode: Text.WordWrap
+                    }
+                }
+
+                RenderSection {
+                    heading: qsTr("Camera")
+
+                    ColumnLayout {
+                        Layout.fillWidth: true
+                        spacing: 4
+
+                        Text {
+                            Layout.fillWidth: true
+                            text: qsTr("Fixed per-scene view by default. \"Use current view\" copies the live viewport.")
+                            color: dialog.c.fg3
+                            font.pixelSize: 11
+                            wrapMode: Text.WordWrap
+                        }
+
+                        CameraSection {
+                            id: cameraEditor
+                            Layout.fillWidth: true
+                            session: dialog.session
+                            cameraSource: dialog.cameraSource
+                            live: false
+                            showFields: true
+                            showActions: true
+                            onConfigChanged: dialog.scheduleValidation()
                         }
                     }
                 }
@@ -597,6 +892,7 @@ Popup {
                 text: qsTr("Start")
                 primary: true
                 enabled: dialog.validation.valid && dialog.job && !dialog.job.running
+                         && !dialog.emptyScene
                 onClicked: {
                     const config = dialog.buildConfig();
                     dialog.validation = dialog.job.validateOptions(config);

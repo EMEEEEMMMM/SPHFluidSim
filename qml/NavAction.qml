@@ -10,6 +10,9 @@ Button {
     property int themeIndex: -1
     property bool selected: false
     property bool danger: false
+    // Menu items that express a mutually exclusive choice (scene list) show a
+    // check mark instead of the theme-selection dot.
+    property bool showCheck: false
 
     signal selectedAction()
 
@@ -26,7 +29,7 @@ Button {
         radius: action.m.square ? 0 : action.m.radiusSm
         color: action.selected
                ? action.c.accentSoft
-               : (action.hovered ? action.c.chip : "transparent")
+               : (action.enabled && action.hovered ? action.c.chip : "transparent")
         border.width: action.selected ? 1 : 0
         border.color: action.c.accent
     }
@@ -47,7 +50,8 @@ Button {
             Text {
                 Layout.fillWidth: true
                 text: action.text
-                color: action.danger ? action.c.danger : action.c.fg
+                color: !action.enabled ? action.c.fg3
+                       : (action.danger ? action.c.danger : action.c.fg)
                 font.pixelSize: 11
                 font.weight: action.selected ? Font.DemiBold : Font.Normal
                 elide: Text.ElideRight
@@ -63,11 +67,19 @@ Button {
         }
 
         Rectangle {
-            visible: action.selected
-            width: 7
-            height: 7
+            visible: action.selected && !action.showCheck
+            Layout.preferredWidth: 7
+            Layout.preferredHeight: 7
             radius: action.m.square ? 0 : 3.5
             color: action.c.accent
+        }
+
+        Text {
+            visible: action.showCheck && action.selected
+            text: "✓"
+            color: action.c.accent
+            font.pixelSize: 11
+            font.weight: Font.DemiBold
         }
 
         Text {

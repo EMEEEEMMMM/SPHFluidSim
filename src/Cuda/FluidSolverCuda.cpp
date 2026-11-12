@@ -129,6 +129,7 @@ struct FluidSolverCuda::Impl {
     bool dropSpawned = false;
     bool inflow = false;
     bool drop = false;
+    bool empty = false;
 
     float boxX = 2.0f, boxY = 1.2f, boxZ = 1.0f, waterSize = 0.8f;
     float wallX0 = 0.0f, wallX1 = 2.0f, wallY1 = 1.2f, wallZ0 = 0.0f, wallZ1 = 1.0f;
@@ -1252,6 +1253,7 @@ FluidSolverCuda::~FluidSolverCuda() = default;
 void FluidSolverCuda::Init(float boxX, float boxY, float boxZ, float waterSize) {
     Impl& d = *m_impl;
     d.ClearParticles();
+    d.empty = false;
     d.boxX = boxX; d.boxY = boxY; d.boxZ = boxZ; d.waterSize = waterSize;
     d.useFullInit = false; d.useDamOpen = false; d.inflow = false; d.drop = false;
     d.dropSpawned = false;
@@ -1272,6 +1274,7 @@ void FluidSolverCuda::Init(float boxX, float boxY, float boxZ, float waterSize) 
 void FluidSolverCuda::InitDamOpen(float boxX, float boxY, float boxZ, float waterSize) {
     Impl& d = *m_impl;
     d.ClearParticles();
+    d.empty = false;
     d.boxX = boxX; d.boxY = boxY; d.boxZ = boxZ; d.waterSize = waterSize;
     d.useFullInit = false; d.useDamOpen = true; d.inflow = false; d.drop = false;
     d.dropSpawned = false;
@@ -1292,6 +1295,7 @@ void FluidSolverCuda::InitDamOpen(float boxX, float boxY, float boxZ, float wate
 void FluidSolverCuda::InitFull(float boxX, float boxY, float boxZ, float waterHeight) {
     Impl& d = *m_impl;
     d.ClearParticles();
+    d.empty = false;
     d.boxX = boxX; d.boxY = boxY; d.boxZ = boxZ; d.waterSize = waterHeight;
     d.useFullInit = true; d.useDamOpen = false; d.inflow = false; d.drop = false;
     d.dropSpawned = false;
@@ -1315,6 +1319,7 @@ void FluidSolverCuda::InitInflow(float tankSize, float gap, int perStep, float r
                                  float cx, float cz, int maxParticles) {
     Impl& d = *m_impl;
     d.ClearParticles();
+    d.empty = false;
     d.boxX = tankSize; d.boxY = tankSize; d.boxZ = tankSize; d.waterSize = 0;
     d.inflow = true; d.inflowGap = gap; d.inflowPerStep = perStep; d.inflowRadius = radius;
     d.inflowX = cx; d.inflowZ = cz;
@@ -1342,6 +1347,7 @@ void FluidSolverCuda::InitDrop(float tankSize, float poolHeight, float dropRadiu
                                float cx, float cz, int maxParticles) {
     Impl& d = *m_impl;
     d.ClearParticles();
+    d.empty = false;
     d.boxX = tankSize; d.boxY = tankSize; d.boxZ = tankSize; d.waterSize = 0;
     d.inflow = false; d.drop = true;
     d.dropPool = poolHeight; d.dropSize = dropRadius; d.dropGap = dropGap;
@@ -1384,6 +1390,20 @@ void FluidSolverCuda::InitDrop(float tankSize, float poolHeight, float dropRadiu
     d.UploadAll();
 }
 
+void FluidSolverCuda::InitEmpty() {
+    Impl& d = *m_impl;
+    d.ClearParticles();
+    d.empty = false;
+    d.empty = true;
+    d.inflow = false; d.drop = false;
+    d.useFullInit = false; d.useDamOpen = false;
+    d.dropSpawned = false;
+    d.time = 0.0f; d.avgErr = 0.0f; d.avgAbsErr = 0.0f; d.maxErr = 0.0f;
+    d.lastIter = 0; d.lastIterV = 0;
+    d.convTrace.clear();
+    d.UploadAll();
+}
+
 void FluidSolverCuda::SpawnDrop(float radius, float cx, float cy, float cz) {
     Impl& d = *m_impl;
     if (d.dropSpawned) return;
@@ -1405,7 +1425,8 @@ bool FluidSolverCuda::HasDrop() const { return m_impl->dropSpawned; }
 
 void FluidSolverCuda::Reset() {
     Impl& d = *m_impl;
-    if (d.inflow) InitInflow(d.boxX, d.inflowGap, d.inflowPerStep, d.inflowRadius, d.inflowX, d.inflowZ, d.maxParticles);
+    if (d.empty) InitEmpty();
+    else if (d.inflow) InitInflow(d.boxX, d.inflowGap, d.inflowPerStep, d.inflowRadius, d.inflowX, d.inflowZ, d.maxParticles);
     else if (d.drop) InitDrop(d.boxX, d.dropPool, d.dropSize, d.dropGap, d.inflowX, d.inflowZ, d.maxParticles);
     else if (d.useDamOpen) InitDamOpen(d.boxX, d.boxY, d.boxZ, d.waterSize);
     else if (d.useFullInit) InitFull(d.boxX, d.boxY, d.boxZ, d.waterSize);
@@ -1413,6 +1434,8 @@ void FluidSolverCuda::Reset() {
 }
 
 void FluidSolverCuda::Step() {
+    // Empty scene: no particles, no boundary, no device work.
+    if (m_impl->empty) return;
     const auto t0 = std::chrono::steady_clock::now();
     m_impl->RunStep();
     m_impl->lastPressureMs = std::chrono::duration<float, std::milli>(

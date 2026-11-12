@@ -1,0 +1,18 @@
+// Generated from cmake/Version.h.in by configure_file(... @ONLY).
+// Do not edit the generated header; edit the root VERSION file instead.
+//
+// The main CMakeLists.txt is expected to do:
+//   project(SPHFluidSim VERSION <contents of VERSION>)
+//   configure_file(cmake/Version.h.in generated/version.h @ONLY)
+//   target_include_directories(<app> PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
+// so that sources can simply #include "version.h".
+
+#ifndef SPH_GENERATED_VERSION_H
+#define SPH_GENERATED_VERSION_H
+
+#define SPH_VERSION        "@PROJECT_VERSION@"
+#define SPH_VERSION_MAJOR @PROJECT_VERSION_MAJOR@
+#define SPH_VERSION_MINOR @PROJECT_VERSION_MINOR@
+#define SPH_VERSION_PATCH @PROJECT_VERSION_PATCH@
+
+#endif // SPH_GENERATED_VERSION_H

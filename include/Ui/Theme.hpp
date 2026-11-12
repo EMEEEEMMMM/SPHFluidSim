@@ -58,6 +58,12 @@ struct ThemeTokens {
     QColor hud;
     QColor hudBorder;
 
+    // Factory default for the 3D viewport clear / letterbox colour. Every skin
+    // ships the same #1F2638; the live, user-overridable value lives on Theme
+    // (m_viewportBackground) and is persisted in QSettings, so it does NOT
+    // follow the theme index.
+    QColor viewportBackground;
+
     // geometry / typography
     qreal radiusLg = 14.0;
     qreal radius = 10.0;
@@ -83,6 +89,7 @@ class Theme : public QObject {
     Q_PROPERTY(QVariantList themes READ themes NOTIFY changed)
     Q_PROPERTY(QString name READ name NOTIFY changed)
     Q_PROPERTY(bool dark READ isDark NOTIFY changed)
+    Q_PROPERTY(QColor viewportBackground READ viewportBackground WRITE setViewportBackground NOTIFY changed)
 
 public:
     static Theme& instance();
@@ -96,6 +103,11 @@ public:
     Q_INVOKABLE void cycle();
     QString name() const;
     bool isDark() const;
+
+    // Live 3D viewport background (clear colour + letterbox bars). Stored on
+    // Theme, not on ThemeTokens, so switching skins never resets it.
+    QColor viewportBackground() const;
+    void setViewportBackground(const QColor& color);
 
     QVariantMap colors() const;
     QVariantMap metrics() const;
@@ -116,6 +128,7 @@ private:
     Theme();
 
     int m_index = 0;
+    QColor m_viewportBackground;
 };
 
 }  // namespace ui

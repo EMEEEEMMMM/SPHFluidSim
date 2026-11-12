@@ -1,6 +1,7 @@
 #ifndef MATH_MATRIX4_H
 #define MATH_MATRIX4_H
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 
@@ -17,27 +18,30 @@ struct Matrix4 {
         m[0][0] = m[1][1] = m[2][2] = m[3][3] = v;
     }
 
+    // Avoid `near` / `far` as parameter names: <windef.h> (pulled in by
+    // windows.h) defines them as empty macros on MinGW, which corrupts the
+    // declarations in any translation unit that includes both headers.
     static Matrix4 Ortho(float left, float right, float bottom, float top,
-                         float near, float far) {
+                         float zNear, float zFar) {
         Matrix4 matrix;
         matrix.m[0][0] = 2.0f / (right - left);
         matrix.m[1][1] = 2.0f / (top - bottom);
-        matrix.m[2][2] = -2.0f / (far - near);
+        matrix.m[2][2] = -2.0f / (zFar - zNear);
         matrix.m[3][0] = -(right + left) / (right - left);
         matrix.m[3][1] = -(top + bottom) / (top - bottom);
-        matrix.m[3][2] = -(far + near) / (far - near);
+        matrix.m[3][2] = -(zFar + zNear) / (zFar - zNear);
         return matrix;
     }
 
-    static Matrix4 Persp(float fovRad, float aspect, float near, float far) {
+    static Matrix4 Persp(float fovRad, float aspect, float zNear, float zFar) {
         Matrix4 matrix;
         std::memset(matrix.m, 0, sizeof(matrix.m));
         float tanHalfFov = std::tan(fovRad / 2.0f);
         matrix.m[0][0] = 1.0f / (aspect * tanHalfFov);
         matrix.m[1][1] = 1.0f / (tanHalfFov);
-        matrix.m[2][2] = -(far + near) / (far - near);
+        matrix.m[2][2] = -(zFar + zNear) / (zFar - zNear);
         matrix.m[2][3] = -1.0f;
-        matrix.m[3][2] = -(2.0f * far * near) / (far - near);
+        matrix.m[3][2] = -(2.0f * zFar * zNear) / (zFar - zNear);
         return matrix;
     }
 
@@ -104,6 +108,79 @@ struct Matrix4 {
 
         return ViewMatrix;
     }
+
+    // Column-major composition: (this * rhs).m[c][r] = sum_k this->m[k][r] * rhs.m[c][k].
+    Matrix4 operator*(const Matrix4& rhs) const {
+        Matrix4 result;
+        for (int c = 0; c < 4; ++c) {
+            for (int r = 0; r < 4; ++r) {
+                float sum = 0.0f;
+                for (int k = 0; k < 4; ++k) sum += m[k][r] * rhs.m[c][k];
+                result.m[c][r] = sum;
+            }
+        }
+        return result;
+    }
+
+    // General 4x4 inverse via Gauss-Jordan. Work in logical row-major
+    // a[row][col] = m[col][row], then write back as result.m[col][row].
+    // Singular matrices yield identity.
+    Matrix4 Inverse() const {
+        Matrix4 result;
+        double a[4][8];
+        for (int r = 0; r < 4; ++r) {
+            for (int c = 0; c < 4; ++c) {
+                a[r][c] = static_cast<double>(m[c][r]);
+                a[r][4 + c] = (r == c) ? 1.0 : 0.0;
+            }
+        }
+        for (int col = 0; col < 4; ++col) {
+            int pivot = col;
+            double best = std::abs(a[col][col]);
+            for (int r = col + 1; r < 4; ++r) {
+                const double v = std::abs(a[r][col]);
+                if (v > best) { best = v; pivot = r; }
+            }
+            if (best < 1.0e-12) return Matrix4();  // singular
+            if (pivot != col) {
+                for (int k = 0; k < 8; ++k) std::swap(a[pivot][k], a[col][k]);
+            }
+            const double inv = 1.0 / a[col][col];
+            for (int k = 0; k < 8; ++k) a[col][k] *= inv;
+            for (int r = 0; r < 4; ++r) {
+                if (r == col) continue;
+                const double factor = a[r][col];
+                if (factor == 0.0) continue;
+                for (int k = 0; k < 8; ++k) a[r][k] -= factor * a[col][k];
+            }
+        }
+        for (int r = 0; r < 4; ++r) {
+            for (int c = 0; c < 4; ++c) {
+                result.m[c][r] = static_cast<float>(a[r][4 + c]);
+            }
+        }
+        return result;
+    }
+
+    // Affine point transform: result[row] = sum_col m[col][row] * p[col] + m[3][row].
+    // (The bottom row is assumed (0,0,0,1); use MakeScreenRay for projective unprojection.)
+    Vector3 TransformPoint(const Vector3& p) const {
+        return Vector3(
+            m[0][0] * p.x + m[1][0] * p.y + m[2][0] * p.z + m[3][0],
+            m[0][1] * p.x + m[1][1] * p.y + m[2][1] * p.z + m[3][1],
+            m[0][2] * p.x + m[1][2] * p.y + m[2][2] * p.z + m[3][2]);
+    }
+
+    // Direction transform: linear 3x3 part only, no translation.
+    Vector3 TransformDirection(const Vector3& v) const {
+        return Vector3(
+            m[0][0] * v.x + m[1][0] * v.y + m[2][0] * v.z,
+            m[0][1] * v.x + m[1][1] * v.y + m[2][1] * v.z,
+            m[0][2] * v.x + m[1][2] * v.y + m[2][2] * v.z);
+    }
+
+    // Column-major data, ready for glUniformMatrix4fv(..., GL_FALSE, data()).
+    const float* data() const { return &m[0][0]; }
 };
 
 }  // namespace Math

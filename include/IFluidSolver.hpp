@@ -49,6 +49,10 @@ public:
                             float cx, float cz, int maxParticles) = 0;
     virtual void InitDrop(float tankSize, float poolHeight, float dropRadius, float dropGap,
                           float cx, float cz, int maxParticles) = 0;
+    // Empty scene (v2): no fluid, no boundary, no tank. The solver keeps no
+    // particles but Step() must still advance SimTime() by dt so that
+    // headless_timing::AdvanceTo (while (SimTime() < target) Step()) terminates.
+    virtual void InitEmpty() = 0;
     virtual void SpawnDrop(float radius, float cx, float cy, float cz) = 0;
     virtual bool HasDrop() const = 0;
     virtual void Reset() = 0;

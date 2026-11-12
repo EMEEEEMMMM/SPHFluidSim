@@ -1,8 +1,12 @@
 #include "Session/SimulationSession.hpp"
 
 #include <QDateTime>
+#include <QVector3D>
+#include <QDir>
+#include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QColor>
 #include <QFile>
 #include <QDebug>
 #include <QFileDialog>
@@ -14,6 +18,7 @@
 #include <cmath>
 
 #include "FluidSolver.hpp"
+#include "Render/CameraRig.hpp"
 #include "SolverFactory.hpp"
 #include "SurfaceReconstructor.hpp"
 
@@ -64,6 +69,12 @@ int CountForSpacing(int scene, float spacing) {
 }
 
 void SetupScene(IFluidSolver& solver, int scene, int particleCount) {
+    // Empty is a valid target for every backend and has no particle budget:
+    // there is nothing to allocate, so never ask for one.
+    if (scene == 2) {
+        solver.InitEmpty();
+        return;
+    }
     const int count = ClampParticleCount(particleCount);
     const float spacing = SpacingForCount(scene, count);
     // Refuse an impossible scene before touching the running one. CUDA checks
@@ -75,6 +86,79 @@ void SetupScene(IFluidSolver& solver, int scene, int particleCount) {
     } else {
         solver.InitInflow(1.0f, 0.3f, 100, 0.08f, 1.0f, 0.5f, count);
     }
+}
+
+// ---- v2 scene / object helpers -------------------------------------------
+
+constexpr int kSceneDam = 0;
+constexpr int kSceneInflow = 1;
+constexpr int kSceneEmpty = 2;
+
+int ClampScene(int scene) { return std::clamp(scene, kSceneDam, kSceneEmpty); }
+
+int SceneFromName(const QString& name) {
+    if (name.compare(QStringLiteral("inflow"), Qt::CaseInsensitive) == 0) return kSceneInflow;
+    if (name.compare(QStringLiteral("empty"), Qt::CaseInsensitive) == 0) return kSceneEmpty;
+    return kSceneDam;
+}
+
+QString SceneName(int scene) {
+    if (scene == kSceneInflow) return QStringLiteral("inflow");
+    if (scene == kSceneEmpty) return QStringLiteral("empty");
+    return QStringLiteral("dam");
+}
+
+// Default framing per scene. Empty keeps the dam target so a newly authored
+// object sits in front of the camera without any auto-fit.
+render::CameraState DefaultCameraForScene(int scene) {
+    render::CameraState cam;
+    cam.yawDeg = -128.35f;
+    cam.pitchDeg = -29.77f;
+    cam.distance = 3.526f;
+    cam.targetX = 1.0f;
+    cam.targetY = scene == kSceneInflow ? 0.5f : 0.55f;
+    cam.targetZ = 0.5f;
+    cam.fovDeg = 42.0f;
+    return cam;
+}
+
+bool Finite(double v) { return std::isfinite(v); }
+
+QVariantList ToList(const Math::Vector3& v) {
+    return QVariantList{v.x, v.y, v.z};
+}
+
+QVariantList ToList(const Math::Quaternions& q) {
+    return QVariantList{q.w, q.x, q.y, q.z};
+}
+
+// Wrap to [-180, 180] so Euler values round-trip readably and never grow.
+float WrapDegrees(double degrees) {
+    if (!Finite(degrees)) return 0.0f;
+    double wrapped = std::fmod(degrees + 180.0, 360.0);
+    if (wrapped < 0.0) wrapped += 360.0;
+    return static_cast<float>(wrapped - 180.0);
+}
+
+QString CanonicalHex(const QString& hex) {
+    const QColor color(hex);
+    if (!color.isValid()) return {};
+    return color.name(QColor::HexRgb).toUpper();
+}
+
+std::string UniqueModelName(const QString& stem,
+                            const std::vector<std::string>& existing) {
+    const auto taken = [&existing](const QString& candidate) {
+        return std::any_of(existing.begin(), existing.end(), [&](const std::string& n) {
+            return QString::fromStdString(n) == candidate;
+        });
+    };
+    if (!taken(stem)) return stem.toStdString();
+    for (int suffix = 2; suffix < 100000; ++suffix) {
+        const QString candidate = QStringLiteral("%1 (%2)").arg(stem).arg(suffix);
+        if (!taken(candidate)) return candidate.toStdString();
+    }
+    return stem.toStdString();
 }
 
 void ApplySingleParam(FluidParams& p, const QString& key, const QVariant& v) {
@@ -104,7 +188,8 @@ QVariantMap DefaultParams() {
     const FluidSolver::Params p = probe.GetParams();
     const int defaultCount = CountForSpacing(0, p.spacing);
     QVariantMap m;
-    m.insert(QStringLiteral("scene"), 0);
+    // v2 default scene is Empty; models can only be imported there.
+    m.insert(QStringLiteral("scene"), 2);
     m.insert(QStringLiteral("particleCount"), defaultCount);
     m.insert(QStringLiteral("spacing"), p.spacing);
     m.insert(QStringLiteral("solver"), p.solver);
@@ -123,6 +208,11 @@ QVariantMap DefaultParams() {
     m.insert(QStringLiteral("surfaceThreshold"), 0.8);
     m.insert(QStringLiteral("gridScale"), 0.5);
     m.insert(QStringLiteral("reconInterval"), 3);
+    m.insert(QStringLiteral("viewportBackground"), QStringLiteral("#1F2638"));
+    m.insert(QStringLiteral("dropRadius"), 0.2);
+    m.insert(QStringLiteral("dropX"), 1.0);
+    m.insert(QStringLiteral("dropY"), 1.6);
+    m.insert(QStringLiteral("dropZ"), 0.5);
     return m;
 }
 
@@ -157,7 +247,7 @@ struct SimulationSession::Impl {
     mutable std::mutex pubMutex;
     SimSnapshotPtr snapshot;
     SurfaceSnapshotPtr surface;
-    ModelDataPtr model;
+    ModelSnapshotPtr modelSnapshot;   // immutable, rebuilt on every object edit
     uint64_t surfaceVersion = 0;
 
     // ---- UI copies (read by bindings) -------------------------------------
@@ -173,8 +263,29 @@ struct SimulationSession::Impl {
     };
     std::deque<TraceEntry> traceRaw;
 
+    // ---- UI-thread object state (guarded by stateMutex) --------------------
+    struct ModelEntry {
+        int id = 0;
+        QString name;
+        QString path;            // always absolute
+        ModelDataPtr data;
+        Math::Vector3 position{0, 0, 0};
+        Math::Quaternions rotation;   // identity
+        float scale = 1.0f;
+        bool visible = true;
+    };
+    mutable std::mutex stateMutex;
+    std::vector<ModelEntry> modelEntries;
+    int nextModelId = 1;
+    int selectedId = -1;
+    render::CameraState camera = DefaultCameraForScene(kSceneEmpty);
+    QString backgroundHex = QStringLiteral("#1F2638");
+    // Directory of the parameter file currently being imported; relative model
+    // paths resolve against it. Empty => the process working directory.
+    QString importBaseDir;
+
     // ---- simulation-thread local ------------------------------------------
-    int scene = 0;
+    std::atomic<int> scene{kSceneEmpty};
     int particleCount = 32768;
     float spacing = 0.025f;
     std::atomic<int> reconInterval{3};
@@ -204,13 +315,18 @@ SimulationSession::SimulationSession(QObject* parent)
 
     m_impl->speed.store(m_impl->params.value(QStringLiteral("speed")).toInt());
     m_impl->viewMode.store(m_impl->params.value(QStringLiteral("viewMode")).toInt());
-    m_impl->scene = m_impl->params.value(QStringLiteral("scene")).toInt();
+    m_impl->scene.store(m_impl->params.value(QStringLiteral("scene")).toInt());
     m_impl->particleCount = m_impl->params.value(QStringLiteral("particleCount")).toInt();
-    m_impl->spacing = SpacingForCount(m_impl->scene, m_impl->particleCount);
+    m_impl->spacing = SpacingForCount(m_impl->scene.load(), m_impl->particleCount);
     m_impl->reconInterval.store(m_impl->params.value(QStringLiteral("reconInterval")).toInt());
     m_impl->reconThreshold.store(m_impl->params.value(QStringLiteral("surfaceThreshold")).toFloat());
     m_impl->reconGridScale.store(m_impl->params.value(QStringLiteral("gridScale")).toFloat());
     m_impl->reconSpacing.store(m_impl->spacing);
+    m_impl->camera = DefaultCameraForScene(m_impl->scene.load());
+    m_impl->backgroundHex =
+        CanonicalHex(m_impl->params.value(QStringLiteral("viewportBackground")).toString());
+    if (m_impl->backgroundHex.isEmpty()) m_impl->backgroundHex = QStringLiteral("#1F2638");
+    publishModels();
 }
 
 SimulationSession::~SimulationSession() { shutdown(); }
@@ -261,8 +377,102 @@ SurfaceSnapshotPtr SimulationSession::surface() const {
 }
 
 ModelDataPtr SimulationSession::model() const {
+    const ModelSnapshotPtr snap = models();
+    if (!snap) return nullptr;
+    for (const ModelInstancePtr& instance : *snap) {
+        if (instance && instance->visible && instance->data) return instance->data;
+    }
+    return nullptr;
+}
+
+ModelSnapshotPtr SimulationSession::models() const {
     std::lock_guard<std::mutex> lk(m_impl->pubMutex);
-    return m_impl->model;
+    return m_impl->modelSnapshot;
+}
+
+ModelSnapshotPtr SimulationSession::modelsForRender() const { return models(); }
+
+bool SimulationSession::isEmpty() const {
+    return m_impl->scene.load() == kSceneEmpty;
+}
+
+int SimulationSession::sceneIndex() const { return m_impl->scene.load(); }
+
+int SimulationSession::selectedModelId() const {
+    std::lock_guard<std::mutex> lk(m_impl->stateMutex);
+    return m_impl->selectedId;
+}
+
+QVariantMap SimulationSession::cameraState() const {
+    render::CameraState cam;
+    {
+        std::lock_guard<std::mutex> lk(m_impl->stateMutex);
+        cam = m_impl->camera;
+    }
+    QVariantMap map;
+    map.insert(QStringLiteral("yaw"), static_cast<double>(cam.yawDeg));
+    map.insert(QStringLiteral("pitch"), static_cast<double>(cam.pitchDeg));
+    map.insert(QStringLiteral("distance"), static_cast<double>(cam.distance));
+    map.insert(QStringLiteral("targetX"), static_cast<double>(cam.targetX));
+    map.insert(QStringLiteral("targetY"), static_cast<double>(cam.targetY));
+    map.insert(QStringLiteral("targetZ"), static_cast<double>(cam.targetZ));
+    map.insert(QStringLiteral("fov"), static_cast<double>(cam.fovDeg));
+    return map;
+}
+
+QVariantList SimulationSession::objects() const {
+    std::lock_guard<std::mutex> lk(m_impl->stateMutex);
+    QVariantList list;
+    list.reserve(static_cast<int>(m_impl->modelEntries.size()));
+    for (const Impl::ModelEntry& entry : m_impl->modelEntries) {
+        QVariantMap item;
+        item.insert(QStringLiteral("id"), entry.id);
+        item.insert(QStringLiteral("name"), entry.name);
+        item.insert(QStringLiteral("path"), entry.path);
+        item.insert(QStringLiteral("position"), ToList(entry.position));
+        item.insert(QStringLiteral("rotation"), ToList(entry.rotation));
+        item.insert(QStringLiteral("rotationEuler"),
+                    ToList(entry.rotation.ToEulerDegrees()));
+        item.insert(QStringLiteral("scale"), static_cast<double>(entry.scale));
+        item.insert(QStringLiteral("visible"), entry.visible);
+        item.insert(QStringLiteral("triangleCount"),
+                    entry.data ? static_cast<int>(entry.data->triangleCount) : 0);
+        list.append(item);
+    }
+    return list;
+}
+
+QVariantList SimulationSession::modelConfigs() const {
+    const ModelSnapshotPtr snap = models();
+    QVariantList list;
+    if (!snap) return list;
+    list.reserve(static_cast<int>(snap->size()));
+    for (const ModelInstancePtr& instance : *snap) {
+        if (!instance) continue;
+        QVariantMap item;
+        item.insert(QStringLiteral("id"), instance->id);
+        item.insert(QStringLiteral("name"), QString::fromStdString(instance->name));
+        item.insert(QStringLiteral("position"), ToList(instance->position));
+        item.insert(QStringLiteral("rotation"), ToList(instance->rotation));
+        item.insert(QStringLiteral("rotationEuler"),
+                    ToList(instance->rotation.ToEulerDegrees()));
+        item.insert(QStringLiteral("scale"), static_cast<double>(instance->scale));
+        item.insert(QStringLiteral("visible"), instance->visible);
+        if (instance->data) {
+            item.insert(QStringLiteral("path"),
+                        QString::fromStdString(instance->data->sourcePath));
+            item.insert(QStringLiteral("triangleCount"),
+                        static_cast<int>(instance->data->triangleCount));
+        }
+        const Math::Matrix4 matrix = instance->matrix();
+        const float* bytes = matrix.data();
+        QVariantList transform;
+        transform.reserve(16);
+        for (int i = 0; i < 16; ++i) transform.append(static_cast<double>(bytes[i]));
+        item.insert(QStringLiteral("transform"), transform);
+        list.append(item);
+    }
+    return list;
 }
 
 bool SimulationSession::running() const { return m_impl->running.load(); }
@@ -338,9 +548,16 @@ void SimulationSession::stepOnce() {
 }
 
 void SimulationSession::resetSimulation() {
-    postCommand([this](IFluidSolver& solver) {
-        SetupScene(solver, m_impl->scene, m_impl->particleCount);
+    // Restarting the fluid does not discard authored models: only an explicit
+    // scene switch clears them. Empty reset is therefore a no-op for geometry.
+    const int scene = m_impl->scene.load();
+    postCommand([this, scene](IFluidSolver& solver) {
+        SetupScene(solver, scene, m_impl->particleCount);
     });
+    resetSurfaceAndTrace();
+}
+
+void SimulationSession::resetSurfaceAndTrace() {
     {
         std::lock_guard<std::mutex> lk(m_impl->pubMutex);
         m_impl->surface.reset();
@@ -356,55 +573,569 @@ void SimulationSession::resetSimulation() {
 }
 
 void SimulationSession::importModel() {
+    // Legacy entry point used by the Qt Widgets front-end. The QML File menu
+    // hides it in fluid scenes; the widget front-end deliberately stays on the
+    // pre-v2 Dam workflow and keeps its single-model import.
     const QString filePath = QFileDialog::getOpenFileName(
         nullptr, QStringLiteral("Import 3D Model"), QDir::homePath(),
-        QStringLiteral("3D Model Files (*.obj *.fbx *.stl *.dae *.3ds);;All Files (*)"));
+        QStringLiteral("3D Model Files (*.obj *.fbx *.stl *.dae *.3ds *.ply *.off *.gltf *.glb *.step *.stp);;All Files (*)"));
     if (!filePath.isEmpty()) importModelFile(filePath);
 }
 
 bool SimulationSession::importModelFile(const QString& filePath) {
+    // Legacy single-file import (also used by the widgets front-end). QML only
+    // exposes this behind the Empty-scene gate; the session accepts it in any
+    // scene so the older widget UI keeps working.
     if (!QFileInfo::exists(filePath)) {
         Q_EMIT message(QStringLiteral("Model import failed: file does not exist"));
         return false;
     }
 
     QString error;
-    ModelDataPtr loaded = Model::Load(filePath, &error);
+    QString warning;
+    ModelDataPtr loaded = Model::Load(filePath, &error, &warning);
     if (!loaded) {
         Q_EMIT message(QStringLiteral("Model import failed: %1").arg(error));
         return false;
     }
 
     const qulonglong triangleCount = static_cast<qulonglong>(loaded->indices.size() / 3);
+    // Copy the bounds before `loaded` is moved into the object list below;
+    // dereferencing it afterwards is a null-pointer crash.
+    const Math::Vector3 extent = loaded->boundsExtent;
+    const QFileInfo info(filePath);
+    const QString absolutePath = info.absoluteFilePath();
+    int newId = 0;
     {
-        std::lock_guard<std::mutex> lk(m_impl->pubMutex);
-        m_impl->model = std::move(loaded);
+        std::lock_guard<std::mutex> lk(m_impl->stateMutex);
+        // Soft-merge into the object list: the legacy single-model import now
+        // adds one more entry instead of replacing the whole scene.
+        std::vector<std::string> existing;
+        existing.reserve(m_impl->modelEntries.size());
+        for (const Impl::ModelEntry& entry : m_impl->modelEntries) {
+            existing.push_back(entry.name.toStdString());
+        }
+        Impl::ModelEntry entry;
+        entry.id = m_impl->nextModelId++;
+        entry.name = QString::fromStdString(UniqueModelName(info.completeBaseName(), existing));
+        entry.path = absolutePath;
+        entry.data = std::move(loaded);
+        m_impl->modelEntries.push_back(entry);
+        newId = entry.id;
     }
-    Q_EMIT modelChanged();
-    Q_EMIT message(QStringLiteral("Imported %1 (%2 triangles)")
-                       .arg(QFileInfo(filePath).fileName())
-                       .arg(triangleCount));
+    publishModels();
+    selectModel(newId);
+    QString summary = QStringLiteral("Imported %1 (%2 triangles, %3 x %4 x %5 mm)")
+                          .arg(info.fileName())
+                          .arg(triangleCount)
+                          .arg(extent.x * 1000.0f, 0, 'f', 1)
+                          .arg(extent.y * 1000.0f, 0, 'f', 1)
+                          .arg(extent.z * 1000.0f, 0, 'f', 1);
+    if (!warning.isEmpty()) summary += QStringLiteral(" - ") + warning;
+    Q_EMIT message(summary);
     return true;
 }
 
 void SimulationSession::clearModel() {
+    // Legacy "clear the imported model" entry point: the object list is the
+    // single source of truth now, so this clears everything.
+    clearModelsInternal(true);
+}
+
+void SimulationSession::clearModels() { clearModelsInternal(true); }
+
+void SimulationSession::clearModelsInternal(bool announce) {
+    bool hadModels = false;
     {
-        std::lock_guard<std::mutex> lk(m_impl->pubMutex);
-        if (!m_impl->model) return;
-        m_impl->model.reset();
+        std::lock_guard<std::mutex> lk(m_impl->stateMutex);
+        hadModels = !m_impl->modelEntries.empty() || m_impl->selectedId != -1;
+        m_impl->modelEntries.clear();
+        m_impl->selectedId = -1;
     }
-    Q_EMIT modelChanged();
-    Q_EMIT message(QStringLiteral("Imported model cleared"));
+    publishModels();
+    Q_EMIT selectionChanged();
+    if (announce && hadModels) Q_EMIT message(QStringLiteral("All models cleared"));
+}
+
+void SimulationSession::selectModel(int id) {
+    bool changed = false;
+    {
+        std::lock_guard<std::mutex> lk(m_impl->stateMutex);
+        int resolved = -1;
+        if (id >= 0) {
+            for (const Impl::ModelEntry& entry : m_impl->modelEntries) {
+                if (entry.id == id) {
+                    resolved = id;
+                    break;
+                }
+            }
+        }
+        if (m_impl->selectedId != resolved) {
+            m_impl->selectedId = resolved;
+            changed = true;
+        }
+    }
+    if (changed) Q_EMIT selectionChanged();
+}
+
+void SimulationSession::removeModel(int id) {
+    bool removed = false;
+    {
+        std::lock_guard<std::mutex> lk(m_impl->stateMutex);
+        const auto it = std::find_if(m_impl->modelEntries.begin(), m_impl->modelEntries.end(),
+                                     [id](const Impl::ModelEntry& e) { return e.id == id; });
+        if (it != m_impl->modelEntries.end()) {
+            m_impl->modelEntries.erase(it);
+            removed = true;
+            if (m_impl->selectedId == id) m_impl->selectedId = -1;
+        }
+    }
+    if (!removed) return;
+    publishModels();
+    Q_EMIT selectionChanged();
+}
+
+// Runs `fn` on the object entry `id` on the UI thread, then republishes.
+void SimulationSession::setModelPosition(int id, double x, double y, double z) {
+    if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) {
+        Q_EMIT message(QStringLiteral("Position must be a finite number"));
+        return;
+    }
+    const Math::Vector3 position(static_cast<float>(x), static_cast<float>(y),
+                                 static_cast<float>(z));
+    bool changed = false;
+    {
+        std::lock_guard<std::mutex> lk(m_impl->stateMutex);
+        for (Impl::ModelEntry& entry : m_impl->modelEntries) {
+            if (entry.id != id) continue;
+            entry.position = position;
+            changed = true;
+            break;
+        }
+    }
+    if (changed) publishModels();
+}
+
+void SimulationSession::setModelRotationEuler(int id, double x, double y, double z) {
+    if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) {
+        Q_EMIT message(QStringLiteral("Rotation must be a finite number"));
+        return;
+    }
+    const Math::Vector3 euler(WrapDegrees(x), WrapDegrees(y), WrapDegrees(z));
+    const Math::Quaternions rotation = Math::Quaternions::FromEulerDegrees(euler);
+    bool changed = false;
+    {
+        std::lock_guard<std::mutex> lk(m_impl->stateMutex);
+        for (Impl::ModelEntry& entry : m_impl->modelEntries) {
+            if (entry.id != id) continue;
+            entry.rotation = rotation;
+            changed = true;
+            break;
+        }
+    }
+    if (changed) publishModels();
+}
+
+void SimulationSession::setModelRotationQuaternion(int id, double w, double x, double y,
+                                                   double z) {
+    if (!std::isfinite(w) || !std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) {
+        Q_EMIT message(QStringLiteral("Rotation must be a finite number"));
+        return;
+    }
+    Math::Quaternions rotation(static_cast<float>(w), static_cast<float>(x),
+                               static_cast<float>(y), static_cast<float>(z));
+    const double length = std::sqrt(static_cast<double>(rotation.w) * rotation.w +
+                                    static_cast<double>(rotation.x) * rotation.x +
+                                    static_cast<double>(rotation.y) * rotation.y +
+                                    static_cast<double>(rotation.z) * rotation.z);
+    if (!(length > 1.0e-12)) rotation = Math::Quaternions();   // identity
+    else rotation.normalize();
+    bool changed = false;
+    {
+        std::lock_guard<std::mutex> lk(m_impl->stateMutex);
+        for (Impl::ModelEntry& entry : m_impl->modelEntries) {
+            if (entry.id != id) continue;
+            entry.rotation = rotation;
+            changed = true;
+            break;
+        }
+    }
+    if (changed) publishModels();
+}
+
+void SimulationSession::setModelQuaternion(int id, double w, double x, double y, double z) {
+    setModelRotationQuaternion(id, w, x, y, z);
+}
+
+void SimulationSession::setModelScale(int id, double scale) {
+    if (!std::isfinite(scale)) {
+        Q_EMIT message(QStringLiteral("Scale must be a finite number"));
+        return;
+    }
+    const float clamped = static_cast<float>(std::clamp(scale, 0.001, 1000.0));
+    bool changed = false;
+    {
+        std::lock_guard<std::mutex> lk(m_impl->stateMutex);
+        for (Impl::ModelEntry& entry : m_impl->modelEntries) {
+            if (entry.id != id) continue;
+            entry.scale = clamped;
+            changed = true;
+            break;
+        }
+    }
+    if (changed) publishModels();
+}
+
+void SimulationSession::setModelVisible(int id, bool visible) {
+    bool changed = false;
+    {
+        std::lock_guard<std::mutex> lk(m_impl->stateMutex);
+        for (Impl::ModelEntry& entry : m_impl->modelEntries) {
+            if (entry.id != id) continue;
+            if (entry.visible != visible) {
+                entry.visible = visible;
+                changed = true;
+            }
+            break;
+        }
+    }
+    if (changed) publishModels();
+}
+
+void SimulationSession::resetModelTransform(int id) {
+    bool changed = false;
+    {
+        std::lock_guard<std::mutex> lk(m_impl->stateMutex);
+        for (Impl::ModelEntry& entry : m_impl->modelEntries) {
+            if (entry.id != id) continue;
+            entry.position = Math::Vector3(0, 0, 0);
+            entry.rotation = Math::Quaternions();
+            entry.scale = 1.0f;
+            changed = true;
+            break;
+        }
+    }
+    if (changed) publishModels();
+}
+
+QVariantMap SimulationSession::dropParams() const {
+    QVariantMap params;
+    {
+        std::lock_guard<std::mutex> lk(m_impl->uiMutex);
+        params = m_impl->params;
+    }
+    QVariantMap drop;
+    drop.insert(QStringLiteral("radius"), params.value(QStringLiteral("dropRadius"), 0.2));
+    drop.insert(QStringLiteral("x"), params.value(QStringLiteral("dropX"), 1.0));
+    drop.insert(QStringLiteral("y"), params.value(QStringLiteral("dropY"), 1.6));
+    drop.insert(QStringLiteral("z"), params.value(QStringLiteral("dropZ"), 0.5));
+    return drop;
+}
+
+void SimulationSession::setDropParams(double radius, double x, double y, double z) {
+    if (!std::isfinite(radius) || radius <= 0.0 || !std::isfinite(x) ||
+        !std::isfinite(y) || !std::isfinite(z)) {
+        Q_EMIT message(QStringLiteral("Drop parameters must be finite (radius > 0)"));
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lk(m_impl->uiMutex);
+        m_impl->params.insert(QStringLiteral("dropRadius"), radius);
+        m_impl->params.insert(QStringLiteral("dropX"), x);
+        m_impl->params.insert(QStringLiteral("dropY"), y);
+        m_impl->params.insert(QStringLiteral("dropZ"), z);
+    }
+    Q_EMIT paramsChanged();
+}
+
+void SimulationSession::setViewportBackgroundHex(const QString& hex) {
+    const QString canonical = CanonicalHex(hex);
+    if (canonical.isEmpty()) {
+        Q_EMIT message(QStringLiteral("Invalid background colour: %1").arg(hex));
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lk(m_impl->stateMutex);
+        if (m_impl->backgroundHex == canonical) return;
+        m_impl->backgroundHex = canonical;
+    }
+    {
+        std::lock_guard<std::mutex> lk(m_impl->uiMutex);
+        m_impl->params.insert(QStringLiteral("viewportBackground"), canonical);
+    }
+    Q_EMIT paramsChanged();
+}
+
+void SimulationSession::setCameraConfig(const QVariantMap& config) {
+    render::CameraState cam;
+    {
+        std::lock_guard<std::mutex> lk(m_impl->stateMutex);
+        cam = m_impl->camera;
+    }
+    const auto number = [&config](const char* key, float& out) {
+        const QVariant value = config.value(QLatin1String(key));
+        if (!value.isValid() || value.isNull()) return true;
+        bool ok = false;
+        const double d = value.toDouble(&ok);
+        if (!ok || !std::isfinite(d)) return false;
+        out = static_cast<float>(d);
+        return true;
+    };
+    render::CameraState next = cam;
+    if (!number("yaw", next.yawDeg) || !number("pitch", next.pitchDeg) ||
+        !number("distance", next.distance) || !number("targetX", next.targetX) ||
+        !number("targetY", next.targetY) || !number("targetZ", next.targetZ) ||
+        !number("fov", next.fovDeg)) {
+        Q_EMIT message(QStringLiteral("Camera values must be finite numbers"));
+        return;
+    }
+    // Alternative target array form: {target: [x, y, z]}.
+    const QVariant targetValue = config.value(QStringLiteral("target"));
+    if (targetValue.isValid() && !targetValue.isNull()) {
+        const QVariantList target = targetValue.toList();
+        if (target.size() != 3) {
+            Q_EMIT message(QStringLiteral("Camera target must be [x, y, z]"));
+            return;
+        }
+        for (int i = 0; i < 3; ++i) {
+            bool ok = false;
+            const double d = target.at(i).toDouble(&ok);
+            if (!ok || !std::isfinite(d)) {
+                Q_EMIT message(QStringLiteral("Camera target must be finite"));
+                return;
+            }
+        }
+        next.targetX = static_cast<float>(target.at(0).toDouble());
+        next.targetY = static_cast<float>(target.at(1).toDouble());
+        next.targetZ = static_cast<float>(target.at(2).toDouble());
+    }
+    next.pitchDeg = std::clamp(next.pitchDeg, -89.0f, 89.0f);
+    next.fovDeg = std::clamp(next.fovDeg, 20.0f, 75.0f);
+    if (!(next.distance > 0.0f) || !std::isfinite(next.distance)) {
+        Q_EMIT message(QStringLiteral("Camera distance must be positive"));
+        return;
+    }
+    next.yawDeg = WrapDegrees(next.yawDeg);
+
+    {
+        std::lock_guard<std::mutex> lk(m_impl->stateMutex);
+        m_impl->camera = next;
+    }
+    Q_EMIT cameraStateChanged();
+}
+
+void SimulationSession::applyCameraPreset(const QString& name) {
+    const render::ViewPreset preset = render::ViewPresetFromName(name.toStdString());
+    {
+        std::lock_guard<std::mutex> lk(m_impl->stateMutex);
+        m_impl->camera = render::ApplyViewPreset(preset, m_impl->camera);
+    }
+    Q_EMIT cameraStateChanged();
+}
+
+void SimulationSession::useCurrentViewCamera() {
+    // The session deliberately holds no viewport. Main.qml feeds the live
+    // camera through setCameraConfig(); this re-publishes what we already have
+    // so a binding refresh never leaves the fields stale.
+    Q_EMIT cameraStateChanged();
 }
 
 void SimulationSession::spawnDrop() {
-    postCommand([](IFluidSolver& solver) {
+    if (m_impl->scene.load() != kSceneDam) {
+        // A drop is a dam-break special effect; other scenes ignore it.
+        Q_EMIT message(QStringLiteral("Drop is only available in the Dam break scene"));
+        return;
+    }
+    const QVariantMap drop = dropParams();
+    const float radius = drop.value(QStringLiteral("radius")).toFloat();
+    const float x = drop.value(QStringLiteral("x")).toFloat();
+    const float y = drop.value(QStringLiteral("y")).toFloat();
+    const float z = drop.value(QStringLiteral("z")).toFloat();
+    postCommand([radius, x, y, z](IFluidSolver& solver) {
         if (solver.HasDrop()) return;
-        solver.SpawnDrop(0.2f, 1.0f, 1.6f, 0.5f);
+        solver.SpawnDrop(radius, x, y, z);
     });
 }
 
+void SimulationSession::setScene(int scene) {
+    scene = ClampScene(scene);
+    if (m_impl->scene.load() == scene) return;
+
+    const int previousScene = m_impl->scene.load();
+    int count = 0;
+    float spacing = 0.0f;
+    QVariantMap previousParams;
+    {
+        std::lock_guard<std::mutex> lk(m_impl->uiMutex);
+        previousParams = m_impl->params;
+        count = ClampParticleCount(m_impl->params.value(QStringLiteral("particleCount")).toInt());
+        spacing = SpacingForCount(scene, count);
+        m_impl->params.insert(QStringLiteral("scene"), scene);
+        m_impl->params.insert(QStringLiteral("particleCount"), count);
+        m_impl->params.insert(QStringLiteral("spacing"), spacing);
+    }
+
+    // Scene switches always discard the authored objects and reframe the view.
+    clearModelsInternal(false);
+    {
+        std::lock_guard<std::mutex> lk(m_impl->stateMutex);
+        m_impl->camera = DefaultCameraForScene(scene);
+    }
+    m_impl->scene.store(scene);
+    Q_EMIT cameraStateChanged();
+
+    const int previousCount = previousParams.value(QStringLiteral("particleCount")).toInt();
+    const float previousSpacing = previousParams.value(QStringLiteral("spacing")).toFloat();
+    postCommand([this, scene, count, spacing, previousScene, previousCount,
+                 previousSpacing, previousParams](IFluidSolver& solver) {
+        try {
+            SetupScene(solver, scene, count);
+        } catch (...) {
+            // The scene was refused (GPU budget): restore the previous view of
+            // the world so the UI keeps matching the still-running solver.
+            {
+                std::lock_guard<std::mutex> lk(m_impl->uiMutex);
+                m_impl->params = previousParams;
+            }
+            m_impl->scene.store(previousScene);
+            Q_EMIT sceneChanged();
+            Q_EMIT paramsChanged();
+            throw;
+        }
+        m_impl->particleCount = count;
+        m_impl->spacing = spacing;
+        m_impl->reconSpacing.store(spacing);
+        m_impl->solverBroken = false;
+    });
+
+    Q_EMIT sceneChanged();
+    Q_EMIT paramsChanged();
+    resetSurfaceAndTrace();
+}
+
+void SimulationSession::publishModels() {
+    auto snapshot = std::make_shared<ModelSnapshot>();
+    {
+        std::lock_guard<std::mutex> lk(m_impl->stateMutex);
+        snapshot->reserve(m_impl->modelEntries.size());
+        for (const Impl::ModelEntry& entry : m_impl->modelEntries) {
+            auto instance = std::make_shared<ModelInstance>();
+            instance->id = entry.id;
+            instance->name = entry.name.toStdString();
+            instance->data = entry.data;
+            instance->position = entry.position;
+            instance->rotation = entry.rotation;
+            instance->scale = entry.scale;
+            instance->visible = entry.visible;
+            snapshot->push_back(instance);
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lk(m_impl->pubMutex);
+        m_impl->modelSnapshot = snapshot;
+    }
+    Q_EMIT modelChanged();
+    Q_EMIT objectsChanged();
+}
+
+void SimulationSession::importModels(const QStringList& paths) {
+    if (!isEmpty()) {
+        Q_EMIT message(QStringLiteral("Import only in Empty scene"));
+        return;
+    }
+    int imported = 0;
+    QStringList failures;
+    QStringList notes;
+    bool haveExtent = false;
+    QVector3D lastExtent;
+    for (const QString& path : paths) {
+        if (path.trimmed().isEmpty()) continue;
+        const QFileInfo info(path);
+        if (!info.exists() || !info.isFile()) {
+            failures.append(QStringLiteral("%1 (not found)").arg(path));
+            continue;
+        }
+        QString error;
+        QString warning;
+        ModelDataPtr loaded = Model::Load(path, &error, &warning);
+        if (!loaded) {
+            failures.append(QStringLiteral("%1 (%2)").arg(info.fileName(), error));
+            continue;
+        }
+        if (!warning.isEmpty()) notes.append(warning);
+        lastExtent = QVector3D(loaded->boundsExtent.x, loaded->boundsExtent.y,
+                               loaded->boundsExtent.z);
+        haveExtent = true;
+        {
+            std::lock_guard<std::mutex> lk(m_impl->stateMutex);
+            std::vector<std::string> existing;
+            existing.reserve(m_impl->modelEntries.size());
+            for (const Impl::ModelEntry& entry : m_impl->modelEntries) {
+                existing.push_back(entry.name.toStdString());
+            }
+            Impl::ModelEntry entry;
+            entry.id = m_impl->nextModelId++;
+            entry.name = QString::fromStdString(UniqueModelName(info.completeBaseName(), existing));
+            entry.path = info.absoluteFilePath();
+            entry.data = std::move(loaded);
+            m_impl->modelEntries.push_back(entry);
+            m_impl->selectedId = entry.id;
+        }
+        ++imported;
+    }
+    if (imported > 0) {
+        publishModels();
+        Q_EMIT selectionChanged();
+    }
+    QString summary;
+    if (imported > 0) {
+        summary = QStringLiteral("Imported %1 model(s)").arg(imported);
+        if (haveExtent) {
+            summary += QStringLiteral(" · %1 x %2 x %3 mm")
+                           .arg(lastExtent.x() * 1000.0f, 0, 'f', 1)
+                           .arg(lastExtent.y() * 1000.0f, 0, 'f', 1)
+                           .arg(lastExtent.z() * 1000.0f, 0, 'f', 1);
+        }
+    }
+    if (!failures.isEmpty()) {
+        if (!summary.isEmpty()) summary += QStringLiteral(", ");
+        summary += QStringLiteral("%1 failed: %2")
+                       .arg(failures.size())
+                       .arg(failures.join(QStringLiteral("; ")));
+    }
+    if (!notes.isEmpty()) {
+        if (!summary.isEmpty()) summary += QStringLiteral(" · ");
+        summary += notes.join(QStringLiteral("; "));
+    }
+    if (!summary.isEmpty()) Q_EMIT message(summary);
+}
+
 void SimulationSession::setParam(const QString& key, const QVariant& value) {
+    if (key == QLatin1String("scene")) {
+        // Scene switches go through the v2 path so the object list, the camera
+        // and the sceneChanged/isEmpty notifications stay consistent.
+        setScene(value.toInt());
+        return;
+    }
+    if (key == QLatin1String("viewportBackground")) {
+        setViewportBackgroundHex(value.toString());
+        return;
+    }
+    if (key == QLatin1String("dropRadius") || key == QLatin1String("dropX") ||
+        key == QLatin1String("dropY") || key == QLatin1String("dropZ")) {
+        const QVariantMap current = dropParams();
+        double radius = current.value(QStringLiteral("radius")).toDouble();
+        double x = current.value(QStringLiteral("x")).toDouble();
+        double y = current.value(QStringLiteral("y")).toDouble();
+        double z = current.value(QStringLiteral("z")).toDouble();
+        if (key == QLatin1String("dropRadius")) radius = value.toDouble();
+        else if (key == QLatin1String("dropX")) x = value.toDouble();
+        else if (key == QLatin1String("dropY")) y = value.toDouble();
+        else z = value.toDouble();
+        setDropParams(radius, x, y, z);
+        return;
+    }
+
     QVariantMap snapshotParams;
     {
         std::lock_guard<std::mutex> lk(m_impl->uiMutex);
@@ -435,8 +1166,8 @@ void SimulationSession::setParam(const QString& key, const QVariant& value) {
         return;
     }
 
-    if (key == QLatin1String("scene") || key == QLatin1String("spacing") ||
-        key == QLatin1String("solver") || key == QLatin1String("particleCount")) {
+    if (key == QLatin1String("spacing") || key == QLatin1String("solver") ||
+        key == QLatin1String("particleCount")) {
         // These rebuild the solver state, so they run as one atomic command.
         // particleCount is the source of truth; spacing is derived from it (and
         // written back so the UI, the JSON export and the render jobs agree).
@@ -475,15 +1206,17 @@ void SimulationSession::setParam(const QString& key, const QVariant& value) {
                 Q_EMIT paramsChanged();
                 throw;
             }
-            m_impl->scene = scene;
+            m_impl->scene.store(scene);
             m_impl->particleCount = count;
             m_impl->spacing = spacing;
             m_impl->reconSpacing.store(spacing);
             m_impl->solverBroken = false;
         });
-        std::lock_guard<std::mutex> lk(m_impl->pubMutex);
-        m_impl->surface.reset();
-        ++m_impl->surfaceVersion;
+        {
+            std::lock_guard<std::mutex> lk(m_impl->pubMutex);
+            m_impl->surface.reset();
+            ++m_impl->surfaceVersion;
+        }
         Q_EMIT surfaceUpdated();
     } else {
         const QVariant v = value;
@@ -496,14 +1229,17 @@ void SimulationSession::setParam(const QString& key, const QVariant& value) {
 }
 
 QString SimulationSession::exportParamsJson() const {
+    return exportParamsJsonWithBase(QString());
+}
+
+QString SimulationSession::exportParamsJsonWithBase(const QString& baseDir) const {
     const QVariantMap p = params();
-    const bool inflow = p.value(QStringLiteral("scene")).toInt() == 1;
+    const int scene = p.value(QStringLiteral("scene"), kSceneEmpty).toInt();
     const double spacing = p.value(QStringLiteral("spacing"), 0.025).toDouble();
     const int particleCount = p.value(QStringLiteral("particleCount")).toInt();
 
     QVariantMap simulation;
-    simulation.insert(QStringLiteral("scene"), inflow ? QStringLiteral("inflow")
-                                                      : QStringLiteral("dam"));
+    simulation.insert(QStringLiteral("scene"), SceneName(scene));
     simulation.insert(QStringLiteral("solver"),
                       p.value(QStringLiteral("solver")).toInt() == 1 ? QStringLiteral("DFSPH")
                                                                      : QStringLiteral("IISPH"));
@@ -522,6 +1258,30 @@ QString SimulationSession::exportParamsJson() const {
     simulation.insert(QStringLiteral("viewMode"), p.value(QStringLiteral("viewMode")));
     simulation.insert(QStringLiteral("speed"), p.value(QStringLiteral("speed")));
 
+    // Model paths go in relative to the exported file when they live under it,
+    // so a config plus its meshes can be copied to another machine as a folder.
+    const QDir base(baseDir.isEmpty() ? QDir::currentPath() : baseDir);
+    QVariantList models;
+    {
+        std::lock_guard<std::mutex> lk(m_impl->stateMutex);
+        models.reserve(static_cast<int>(m_impl->modelEntries.size()));
+        for (const Impl::ModelEntry& entry : m_impl->modelEntries) {
+            QString path = entry.path;
+            if (!baseDir.isEmpty() && !path.isEmpty()) {
+                const QString relative = base.relativeFilePath(path);
+                if (!relative.startsWith(QLatin1String(".."))) path = relative;
+            }
+            QVariantMap item;
+            item.insert(QStringLiteral("path"), path);
+            item.insert(QStringLiteral("position"), ToList(entry.position));
+            item.insert(QStringLiteral("rotation"), ToList(entry.rotation));
+            item.insert(QStringLiteral("scale"), static_cast<double>(entry.scale));
+            item.insert(QStringLiteral("visible"), entry.visible);
+            models.append(item);
+        }
+    }
+    simulation.insert(QStringLiteral("models"), models);
+
     QVariantMap render;
     render.insert(QStringLiteral("mode"),
                   p.value(QStringLiteral("viewMode")).toInt() == 1 ? QStringLiteral("surface")
@@ -531,13 +1291,50 @@ QString SimulationSession::exportParamsJson() const {
                   p.value(QStringLiteral("surfaceThreshold")));
     render.insert(QStringLiteral("reconInterval"), p.value(QStringLiteral("reconInterval")));
 
+    const QVariantMap cam = cameraState();
+    QVariantMap camera;
+    camera.insert(QStringLiteral("yaw"), cam.value(QStringLiteral("yaw")));
+    camera.insert(QStringLiteral("pitch"), cam.value(QStringLiteral("pitch")));
+    camera.insert(QStringLiteral("distance"), cam.value(QStringLiteral("distance")));
+    camera.insert(QStringLiteral("target"),
+                  QVariantList{cam.value(QStringLiteral("targetX")),
+                               cam.value(QStringLiteral("targetY")),
+                               cam.value(QStringLiteral("targetZ"))});
+    // Older readers look for flat target keys; keep both forms in sync.
+    camera.insert(QStringLiteral("targetX"), cam.value(QStringLiteral("targetX")));
+    camera.insert(QStringLiteral("targetY"), cam.value(QStringLiteral("targetY")));
+    camera.insert(QStringLiteral("targetZ"), cam.value(QStringLiteral("targetZ")));
+    camera.insert(QStringLiteral("fov"), cam.value(QStringLiteral("fov")));
+    render.insert(QStringLiteral("camera"), camera);
+
+    QString background;
+    {
+        std::lock_guard<std::mutex> lk(m_impl->stateMutex);
+        background = m_impl->backgroundHex;
+    }
+    render.insert(QStringLiteral("background"), background);
+
+    // A drop is a single dam-break event; other scenes have nothing to emit.
+    QVariantList events;
+    if (scene == kSceneDam) {
+        const QVariantMap drop = dropParams();
+        QVariantMap event;
+        event.insert(QStringLiteral("type"), QStringLiteral("drop"));
+        event.insert(QStringLiteral("time"), 0.0);
+        event.insert(QStringLiteral("radius"), drop.value(QStringLiteral("radius")));
+        event.insert(QStringLiteral("x"), drop.value(QStringLiteral("x")));
+        event.insert(QStringLiteral("y"), drop.value(QStringLiteral("y")));
+        event.insert(QStringLiteral("z"), drop.value(QStringLiteral("z")));
+        events.append(event);
+    }
+
     QVariantMap root;
     root.insert(QStringLiteral("app"), QStringLiteral("IISPH"));
-    root.insert(QStringLiteral("schemaVersion"), 1);
+    root.insert(QStringLiteral("schemaVersion"), 2);
     root.insert(QStringLiteral("savedAt"),
                 QDateTime::currentDateTime().toString(Qt::ISODate));
     root.insert(QStringLiteral("simulation"), simulation);
-    root.insert(QStringLiteral("events"), QVariantList{});
+    root.insert(QStringLiteral("events"), events);
     root.insert(QStringLiteral("render"), render);
     const QJsonDocument doc(QJsonObject::fromVariantMap(root));
     return QString::fromUtf8(doc.toJson(QJsonDocument::Indented));
@@ -566,7 +1363,17 @@ bool SimulationSession::importParametersFile(const QString& filePath) {
         Q_EMIT message(QStringLiteral("Parameter import failed: cannot open %1").arg(filePath));
         return false;
     }
-    if (!importParamsJson(QString::fromUtf8(file.readAll()))) {
+    const QString directory = QFileInfo(filePath).absolutePath();
+    {
+        std::lock_guard<std::mutex> lk(m_impl->stateMutex);
+        m_impl->importBaseDir = directory;
+    }
+    const bool ok = importParamsJson(QString::fromUtf8(file.readAll()));
+    {
+        std::lock_guard<std::mutex> lk(m_impl->stateMutex);
+        m_impl->importBaseDir.clear();
+    }
+    if (!ok) {
         Q_EMIT message(QStringLiteral("Parameter import failed: invalid or incompatible JSON"));
         return false;
     }
@@ -580,7 +1387,8 @@ bool SimulationSession::exportParametersFile(const QString& filePath) {
         Q_EMIT message(QStringLiteral("Parameter export failed: cannot write %1").arg(filePath));
         return false;
     }
-    const QByteArray json = exportParamsJson().toUtf8();
+    const QByteArray json =
+        exportParamsJsonWithBase(QFileInfo(filePath).absolutePath()).toUtf8();
     if (file.write(json) != json.size() || !file.commit()) {
         Q_EMIT message(QStringLiteral("Parameter export failed: cannot write %1").arg(filePath));
         return false;
@@ -599,12 +1407,19 @@ bool SimulationSession::importParamsJson(const QString& json) {
         root.value(QStringLiteral("app")).toString() != QStringLiteral("IISPH")) {
         return false;
     }
-    if (root.value(QStringLiteral("schemaVersion")).isDouble() &&
-        root.value(QStringLiteral("schemaVersion")).toInt() != 1) {
-        return false;
+    // Accept both schema generations; exporting always writes version 2.
+    if (root.contains(QStringLiteral("schemaVersion"))) {
+        const QJsonValue versionValue = root.value(QStringLiteral("schemaVersion"));
+        if (!versionValue.isDouble()) return false;
+        const int version = versionValue.toInt();
+        if (version != 1 && version != 2) return false;
     }
 
     QVariantMap incoming;
+    QJsonArray modelsArray;
+    bool hasCamera = false;
+    QVariantMap cameraConfig;
+    QString background;
     const QJsonObject settings = root.value(QStringLiteral("settings")).toObject();
     if (!settings.isEmpty()) {
         // Legacy files written by the first parameter-JSON exporter.
@@ -630,12 +1445,9 @@ bool SimulationSession::importParamsJson(const QString& json) {
 
         const QJsonValue sceneValue = simulation.value(QStringLiteral("scene"));
         if (sceneValue.isString()) {
-            incoming.insert(QStringLiteral("scene"),
-                            sceneValue.toString().compare(QStringLiteral("inflow"),
-                                                         Qt::CaseInsensitive) == 0
-                                ? 1 : 0);
+            incoming.insert(QStringLiteral("scene"), SceneFromName(sceneValue.toString()));
         } else if (sceneValue.isDouble()) {
-            incoming.insert(QStringLiteral("scene"), sceneValue.toInt() == 1 ? 1 : 0);
+            incoming.insert(QStringLiteral("scene"), ClampScene(sceneValue.toInt()));
         }
 
         const QJsonValue solverValue = simulation.value(QStringLiteral("solver"));
@@ -674,28 +1486,105 @@ bool SimulationSession::importParamsJson(const QString& json) {
                             mode.compare(QStringLiteral("surface"), Qt::CaseInsensitive) == 0
                                 ? 1 : 0);
         }
+
+        if (simulation.value(QStringLiteral("models")).isArray())
+            modelsArray = simulation.value(QStringLiteral("models")).toArray();
+        const QJsonObject camera = render.value(QStringLiteral("camera")).toObject();
+        if (!camera.isEmpty()) {
+            hasCamera = true;
+            cameraConfig = camera.toVariantMap();
+        }
+        if (render.value(QStringLiteral("background")).isString())
+            background = render.value(QStringLiteral("background")).toString();
+
+        // schema v2 events: one optional drop.
+        const QJsonArray events = root.value(QStringLiteral("events")).toArray();
+        for (const QJsonValue& value : events) {
+            const QJsonObject event = value.toObject();
+            if (event.value(QStringLiteral("type")).toString() != QLatin1String("drop")) continue;
+            const auto number = [&event](const char* key, double fallback) {
+                const QJsonValue v = event.value(QLatin1String(key));
+                if (!v.isDouble() || !std::isfinite(v.toDouble())) return fallback;
+                return v.toDouble();
+            };
+            incoming.insert(QStringLiteral("dropRadius"), number("radius", 0.2));
+            incoming.insert(QStringLiteral("dropX"), number("x", 1.0));
+            incoming.insert(QStringLiteral("dropY"), number("y", 1.6));
+            incoming.insert(QStringLiteral("dropZ"), number("z", 0.5));
+            break;
+        }
     }
-    if (incoming.isEmpty()) return false;
+
+    // Resolve model paths against the config's directory (or the working dir
+    // when importParamsJson() was called directly).
+    QString baseDir;
+    {
+        std::lock_guard<std::mutex> lk(m_impl->stateMutex);
+        baseDir = m_impl->importBaseDir;
+    }
+    if (baseDir.isEmpty()) baseDir = QDir::currentPath();
+
+    struct IncomingModel {
+        QString path;
+        Math::Vector3 position{0, 0, 0};
+        Math::Quaternions rotation;
+        float scale = 1.0f;
+        bool visible = true;
+    };
+    std::vector<IncomingModel> importedModels;
+    importedModels.reserve(static_cast<size_t>(modelsArray.size()));
+    for (const QJsonValue& value : modelsArray) {
+        const QJsonObject object = value.toObject();
+        const QString rawPath = object.value(QStringLiteral("path")).toString();
+        if (rawPath.trimmed().isEmpty()) {
+            // A config that lost its model paths cannot be honoured.
+            Q_EMIT message(QStringLiteral("Parameter import failed: a model has no path"));
+            return false;
+        }
+        QFileInfo info(rawPath);
+        if (info.isRelative()) info = QFileInfo(QDir(baseDir).absoluteFilePath(rawPath));
+        IncomingModel model;
+        model.path = info.absoluteFilePath();
+        const QJsonArray position = object.value(QStringLiteral("position")).toArray();
+        if (position.size() == 3) {
+            model.position = Math::Vector3(static_cast<float>(position.at(0).toDouble()),
+                                           static_cast<float>(position.at(1).toDouble()),
+                                           static_cast<float>(position.at(2).toDouble()));
+        }
+        const QJsonArray rotation = object.value(QStringLiteral("rotation")).toArray();
+        if (rotation.size() == 4) {
+            Math::Quaternions q(static_cast<float>(rotation.at(0).toDouble()),
+                                static_cast<float>(rotation.at(1).toDouble()),
+                                static_cast<float>(rotation.at(2).toDouble()),
+                                static_cast<float>(rotation.at(3).toDouble()));
+            q.normalize();
+            model.rotation = q;
+        }
+        const QJsonValue scale = object.value(QStringLiteral("scale"));
+        if (scale.isDouble())
+            model.scale = static_cast<float>(std::clamp(scale.toDouble(), 0.001, 1000.0));
+        const QJsonValue visible = object.value(QStringLiteral("visible"));
+        if (visible.isBool()) model.visible = visible.toBool();
+        importedModels.push_back(model);
+    }
+
+    const bool cameraOnly = incoming.isEmpty() && importedModels.empty() && !hasCamera &&
+                            background.isEmpty();
+    if (cameraOnly) return false;
 
     QVariantMap merged;
     {
         std::lock_guard<std::mutex> lk(m_impl->uiMutex);
         merged = m_impl->params;
-        bool recognized = false;
-        for (auto it = incoming.constBegin(); it != incoming.constEnd(); ++it) {
-            if (merged.contains(it.key())) {
-                merged.insert(it.key(), it.value());
-                recognized = true;
-            }
-        }
-        if (!recognized) return false;
-        m_impl->params = merged;
+    }
+    for (auto it = incoming.constBegin(); it != incoming.constEnd(); ++it) {
+        if (merged.contains(it.key())) merged.insert(it.key(), it.value());
     }
 
     // Normalise the particle budget. A file that only carried `spacing` (all
     // files written before particleCount existed) is converted to a count, so
     // the scene afterwards holds exactly the requested number of particles.
-    const int scene = merged.value(QStringLiteral("scene")).toInt();
+    const int scene = ClampScene(merged.value(QStringLiteral("scene")).toInt());
     int count;
     if (incoming.contains(QStringLiteral("particleCount")))
         count = incoming.value(QStringLiteral("particleCount")).toInt();
@@ -705,6 +1594,7 @@ bool SimulationSession::importParamsJson(const QString& json) {
         count = merged.value(QStringLiteral("particleCount")).toInt();
     count = ClampParticleCount(count);
     const float spacing = SpacingForCount(scene, count);
+    merged.insert(QStringLiteral("scene"), scene);
     merged.insert(QStringLiteral("particleCount"), count);
     merged.insert(QStringLiteral("spacing"), spacing);
     {
@@ -719,10 +1609,77 @@ bool SimulationSession::importParamsJson(const QString& json) {
     m_impl->reconGridScale.store(merged.value(QStringLiteral("gridScale")).toFloat());
     m_impl->reconInterval.store(
         std::max(1, merged.value(QStringLiteral("reconInterval")).toInt()));
+    m_impl->scene.store(scene);
+
+    // Camera + background: v2 files carry them, v1 files fall back to the
+    // scene defaults.
+    if (hasCamera) {
+        setCameraConfig(cameraConfig);
+    } else {
+        {
+            std::lock_guard<std::mutex> lk(m_impl->stateMutex);
+            m_impl->camera = DefaultCameraForScene(scene);
+        }
+        Q_EMIT cameraStateChanged();
+    }
+    setViewportBackgroundHex(background.isEmpty() ? QStringLiteral("#1F2638") : background);
+
+    // Replace the object list. A file without `models` (schema v1) means no
+    // models, so anything authored in the session is dropped.
+    int failed = 0;
+    QStringList failures;
+    struct LoadedModel {
+        QString path;
+        ModelDataPtr data;
+        Math::Vector3 position;
+        Math::Quaternions rotation;
+        float scale = 1.0f;
+        bool visible = true;
+    };
+    std::vector<LoadedModel> loadedModels;
+    loadedModels.reserve(importedModels.size());
+    // Decode outside the state lock: assimp I/O must not stall the UI thread.
+    for (const IncomingModel& model : importedModels) {
+        QString loadError;
+        ModelDataPtr data = Model::Load(model.path, &loadError);
+        if (!data) {
+            ++failed;
+            failures.append(QStringLiteral("%1 (%2)")
+                                .arg(QFileInfo(model.path).fileName(), loadError));
+            continue;
+        }
+        loadedModels.push_back(LoadedModel{model.path, std::move(data), model.position,
+                                           model.rotation, model.scale, model.visible});
+    }
+    {
+        std::lock_guard<std::mutex> lk(m_impl->stateMutex);
+        m_impl->modelEntries.clear();
+        m_impl->selectedId = -1;
+        for (LoadedModel& model : loadedModels) {
+            std::vector<std::string> existing;
+            existing.reserve(m_impl->modelEntries.size());
+            for (const Impl::ModelEntry& entry : m_impl->modelEntries) {
+                existing.push_back(entry.name.toStdString());
+            }
+            Impl::ModelEntry entry;
+            entry.id = m_impl->nextModelId++;
+            entry.name = QString::fromStdString(
+                UniqueModelName(QFileInfo(model.path).completeBaseName(), existing));
+            entry.path = model.path;
+            entry.data = std::move(model.data);
+            entry.position = model.position;
+            entry.rotation = model.rotation;
+            entry.scale = model.scale;
+            entry.visible = model.visible;
+            m_impl->modelEntries.push_back(entry);
+            if (m_impl->selectedId < 0) m_impl->selectedId = entry.id;
+        }
+    }
+    publishModels();
+    Q_EMIT selectionChanged();
 
     postCommand([this, merged, scene, count, spacing](IFluidSolver& solver) {
         ApplyParamsToSolver(solver, merged);
-        m_impl->scene = scene;
         m_impl->particleCount = count;
         m_impl->spacing = spacing;
         m_impl->reconSpacing.store(spacing);
@@ -735,7 +1692,13 @@ bool SimulationSession::importParamsJson(const QString& json) {
         ++m_impl->surfaceVersion;
     }
     Q_EMIT surfaceUpdated();
+    Q_EMIT sceneChanged();
     Q_EMIT paramsChanged();
+    if (failed > 0) {
+        Q_EMIT message(QStringLiteral("Imported parameters, %1 model(s) failed: %2")
+                           .arg(failed)
+                           .arg(failures.join(QStringLiteral("; "))));
+    }
     return true;
 }
 
@@ -771,14 +1734,14 @@ void SimulationSession::workerLoop() {
     {
         std::lock_guard<std::mutex> lk(d.uiMutex);
         ApplyParamsToSolver(solver, d.params);
-        d.scene = d.params.value(QStringLiteral("scene")).toInt();
+        d.scene.store(ClampScene(d.params.value(QStringLiteral("scene")).toInt()));
         d.particleCount = d.params.value(QStringLiteral("particleCount")).toInt();
-        d.spacing = SpacingForCount(d.scene, d.particleCount);
+        d.spacing = SpacingForCount(d.scene.load(), d.particleCount);
         d.reconInterval.store(
             std::max(1, d.params.value(QStringLiteral("reconInterval")).toInt()));
     }
     try {
-        SetupScene(solver, d.scene, d.particleCount);
+        SetupScene(solver, d.scene.load(), d.particleCount);
     } catch (const std::exception& ex) {
         // A scene that does not fit never leaves a half-built solver behind;
         // report it and let the user pick a smaller particle count.
@@ -798,7 +1761,7 @@ void SimulationSession::workerLoop() {
         snap->positions = solver.Positions();
         snap->colors = solver.Colors();
         snap->simTime = solver.SimTime();
-        snap->scene = d.scene;
+        snap->scene = d.scene.load();
         snap->fluidCount = solver.FluidCount();
         snap->boundaryCount = solver.BoundaryCount();
         snap->avgDensityError = solver.AvgDensityError();
@@ -832,11 +1795,11 @@ void SimulationSession::workerLoop() {
         st.insert(QStringLiteral("hasDrop"), solver.HasDrop());
         st.insert(QStringLiteral("stepCount"), static_cast<qulonglong>(steps));
         st.insert(QStringLiteral("backend"), QString::fromLatin1(solver.BackendName()));
-        st.insert(QStringLiteral("scene"), d.scene);
+        st.insert(QStringLiteral("scene"), d.scene.load());
         st.insert(QStringLiteral("spacing"), static_cast<double>(d.spacing));
         st.insert(QStringLiteral("particleTarget"), d.particleCount);
         st.insert(QStringLiteral("waterVolume"),
-                  static_cast<double>(WaterVolumeForScene(d.scene)));
+                  static_cast<double>(WaterVolumeForScene(d.scene.load())));
         const GpuMemoryInfo mem = solver.GpuMemory();
         st.insert(QStringLiteral("vramFreeBytes"), static_cast<qlonglong>(mem.freeBytes));
         st.insert(QStringLiteral("vramTotalBytes"), static_cast<qlonglong>(mem.totalBytes));
@@ -876,6 +1839,18 @@ void SimulationSession::workerLoop() {
     };
 
     auto maybeRequestReconstruction = [&](bool force = false) {
+        // The Empty scene has no fluid: never spend a reconstruction pass on it
+        // and make sure a surface left over from the previous scene is gone.
+        if (d.scene.load() == kSceneEmpty) {
+            bool hadSurface = false;
+            {
+                std::lock_guard<std::mutex> lk(d.pubMutex);
+                hadSurface = static_cast<bool>(d.surface);
+                d.surface.reset();
+            }
+            if (hadSurface) Q_EMIT surfaceUpdated();
+            return;
+        }
         const int mode = d.viewMode.load();
         const int interval = std::max(1, d.reconInterval.load());
         if (mode <= 0) return;
@@ -1050,6 +2025,9 @@ void SimulationSession::reconLoop() {
             lastGrid = grid;
         }
         if (!rec.Reconstruct(input, spacing)) continue;
+        // The scene may have switched to Empty while this rebuild was running;
+        // publishing then would resurrect a stale surface.
+        if (d.scene.load() == kSceneEmpty) continue;
 
         auto surf = std::make_shared<SurfaceSnapshot>();
         surf->vertices = rec.Vertices();
