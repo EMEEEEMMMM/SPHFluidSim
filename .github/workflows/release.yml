@@ -496,7 +496,7 @@ jobs:
           # in the GitHub web UI and then presses "Publish release".
           gh release create "$TAG" \
             --draft \
-            --title "v$VERSION" \
+            --title "Version $VERSION" \
             --notes "$BODY" \
             "artifacts/$WIN_ASSET" \
             "artifacts/$LINUX_ASSET" \

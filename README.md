@@ -7,9 +7,9 @@ Repository: **https://github.com/EMEEEEMMMM/SPHFluidSim**
 ---
 
 <div align="center">
-  <img src="./assets/output.gif" alt="演示动画" width="700">
+  <img src="./assets/output.gif" alt="Demo" width="700">
   <br>
-  <small>SPHFluidSim.exe --headless --seconds 20 --output demo_dam --fps 120 -r 1920x1080 --scene dam --drop 5s --grid 0.5 --particles 64000 --solver DFSPH</small>
+  <small>SPHFluidSim.exe --headless --seconds 5 --output demo_dam --fps 120 -r 1920x1080 --scene dam --drop 5s --particles 10000000 --solver dfsph --time-scale 1 </small>
 </div>
 
 ## Features
